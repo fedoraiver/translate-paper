@@ -80,6 +80,7 @@ MATH_FONT_RE = re.compile(
     r"(?:^|[-+])(CMMI|CMSY|CMEX|MSAM|MSBM)|MATH|SYMBOL",
     re.IGNORECASE,
 )
+LIST_MARKER_RE = re.compile(r"^[•·▪●◦‣⁃–—\-]$")
 BOLD_FONT_RE = re.compile(r"(?:CMBX|BOLD|SEMIBOLD|DEMIBOLD)", re.IGNORECASE)
 ITALIC_FONT_RE = re.compile(r"(?:CMTI|ITALIC|OBLIQUE|SLANTED)", re.IGNORECASE)
 PROTECTED_RE = re.compile(
@@ -395,11 +396,14 @@ def build_rich_protection(
     math_runs = [
         run
         for run in located
-        if run.get("style") == "math"
-        or (
-            body_size > 0
-            and float(run.get("size") or 0.0) <= body_size * 0.82
-            and re.fullmatch(r"[\wΑ-ω]+", str(run.get("text") or ""))
+        if not LIST_MARKER_RE.fullmatch(str(run.get("text") or "").strip())
+        and (
+            run.get("style") == "math"
+            or (
+                body_size > 0
+                and float(run.get("size") or 0.0) <= body_size * 0.82
+                and re.fullmatch(r"[\wΑ-ω]+", str(run.get("text") or ""))
+            )
         )
     ]
     groups: list[list[dict[str, Any]]] = []
@@ -464,6 +468,12 @@ def build_rich_protection(
                     else ""
                 ),
                 "render_strategy": math_render_strategy(group, markdown),
+                "display": False,
+                "review_status": (
+                    "auto_validated"
+                    if math_render_strategy(group, markdown) == "tex-vector"
+                    else "unresolved"
+                ),
                 "source_bbox": source_bbox,
                 "runs": group,
             }
@@ -1464,6 +1474,99 @@ def render_source_previews(
         pixmap.save(preview_dir / f"page-{page_index + 1:04d}.png")
 
 
+def build_math_review(
+    elements: list[dict[str, Any]],
+    source_sha256: str,
+    existing: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Create a hash-bound native-math review gate without losing decisions."""
+    previous_entries = (
+        dict(existing.get("entries") or {})
+        if isinstance(existing, dict)
+        and existing.get("source_sha256") == source_sha256
+        else {}
+    )
+    entries: dict[str, dict[str, Any]] = {}
+
+    for element in elements:
+        for token, fragment in dict(
+            element.get("inline_fragments") or {}
+        ).items():
+            if fragment.get("kind") != "math":
+                continue
+            fragment["display"] = False
+            fragment["source_page"] = int(element.get("page") or 0)
+            status = str(fragment.get("review_status") or "unresolved")
+            if status != "unresolved":
+                continue
+            previous = dict(previous_entries.get(token) or {})
+            entries[token] = {
+                "kind": "inline",
+                "display": False,
+                "source_page": int(element.get("page") or 0),
+                "source_bbox": fragment.get("source_bbox"),
+                "source_text": str(fragment.get("text") or ""),
+                "tex": str(previous.get("tex") or fragment.get("tex") or ""),
+                "review_status": str(
+                    previous.get("review_status") or "unresolved"
+                ),
+            }
+
+    groups: list[list[dict[str, Any]]] = []
+    current: list[dict[str, Any]] = []
+    for element in sorted(elements, key=lambda item: int(item["order"])):
+        is_clip = element.get("render_mode") == "source_clip"
+        same_page = (
+            current
+            and int(current[-1]["page"]) == int(element.get("page") or 0)
+        )
+        if is_clip and (not current or same_page):
+            current.append(element)
+            continue
+        if current:
+            groups.append(current)
+            current = []
+        if is_clip:
+            current = [element]
+    if current:
+        groups.append(current)
+
+    for group in groups:
+        if not any(item.get("kind") == "equation" for item in group):
+            continue
+        entry_id = str(group[0]["id"])
+        source_box = pymupdf.Rect(group[0]["bbox"])
+        for item in group[1:]:
+            source_box |= pymupdf.Rect(item["bbox"])
+        previous = dict(previous_entries.get(entry_id) or {})
+        source_ids = [str(item["id"]) for item in group]
+        if previous and list(previous.get("source_ids") or []) != source_ids:
+            previous = {}
+        entries[entry_id] = {
+            "kind": "display",
+            "display": True,
+            "source_page": int(group[0]["page"]),
+            "source_bbox": rect_list(source_box),
+            "source_ids": source_ids,
+            "source_text": " ".join(
+                str(item.get("source_text") or "").strip()
+                for item in group
+                if str(item.get("source_text") or "").strip()
+            ),
+            "tex": str(previous.get("tex") or ""),
+            "review_status": str(
+                previous.get("review_status") or "unresolved"
+            ),
+        }
+
+    return {
+        "schema_version": 1,
+        "source_sha256": source_sha256,
+        "math_profile": "native-lualatex-v1",
+        "entries": entries,
+    }
+
+
 def main() -> int:
     args = parse_args()
     source = args.input.expanduser().resolve()
@@ -1570,6 +1673,23 @@ def main() -> int:
             review_path,
             make_boundary_review(all_elements, boundary, source_hash_before),
         )
+    math_review_path = work_dir / "math-review.json"
+    existing_math_review: dict[str, Any] | None = None
+    if math_review_path.exists():
+        try:
+            loaded_math_review = json.loads(
+                math_review_path.read_text(encoding="utf-8")
+            )
+        except (OSError, json.JSONDecodeError) as error:
+            raise SystemExit(f"Cannot read math review: {error}") from error
+        if isinstance(loaded_math_review, dict):
+            existing_math_review = loaded_math_review
+    math_review = build_math_review(
+        all_elements,
+        source_hash_before,
+        existing_math_review,
+    )
+    json_dump(math_review_path, math_review)
     units_path = work_dir / "translation-units.jsonl"
     template_path = work_dir / "translations.template.jsonl"
     write_jsonl(units_path, all_elements)
@@ -1599,7 +1719,7 @@ def main() -> int:
         raise RuntimeError("Source PDF hash changed during preparation.")
 
     manifest = {
-        "schema_version": 3,
+        "schema_version": 4,
         "created_by": "prepare_paper.py",
         "translation_engine": "active-codex-model-only",
         "source_pdf": str(source),
@@ -1623,6 +1743,7 @@ def main() -> int:
             "layout_text": "layout.txt",
             "source_preview": "source-preview",
             "boundary_review": str(review_path),
+            "math_review": math_review_path.name,
         },
         "tools": {
             "layout_extractor": layout_tool,
@@ -1647,9 +1768,17 @@ def main() -> int:
                     any(page["needs_visual_review"] for page in page_records),
                     "One or more OCR pages have confidence below 0.85.",
                 ),
+                (
+                    any(
+                        entry.get("review_status") == "unresolved"
+                        for entry in math_review["entries"].values()
+                    ),
+                    "One or more mathematical fragments require native-TeX review.",
+                ),
             )
             if condition
         ],
+        "rich_math_profile": "native-lualatex-v1",
     }
     json_dump(work_dir / "manifest.json", manifest)
     print(json.dumps(manifest, ensure_ascii=False, indent=2))

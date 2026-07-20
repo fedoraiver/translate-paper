@@ -12,6 +12,7 @@ from __future__ import annotations
 import sys
 import tempfile
 import unittest
+from collections import Counter
 from pathlib import Path
 from unittest import mock
 
@@ -20,6 +21,7 @@ import pymupdf
 import check_translation
 import check_summary
 import export_translation_markdown as export_markdown
+import native_latex
 import prepare_paper
 import quick_validate
 import render_translation
@@ -141,6 +143,38 @@ class PaperPipelineTests(unittest.TestCase):
         self.assertIn(" = ", html)
         self.assertIn("<sup>α</sup>", html)
         self.assertEqual(markdown, "$c = c^{α}$")
+
+    def test_symbol_font_bullet_is_not_protected_as_math(self) -> None:
+        source = "• Block version: validation rules."
+        spans = [
+            {
+                "text": "•",
+                "font": "Symbol",
+                "size": 10.0,
+                "flags": 0,
+                "style": "math",
+                "origin": [10.0, 20.0],
+                "bbox": [10.0, 10.0, 15.0, 20.0],
+                "line": 0,
+                "span": 0,
+            },
+            {
+                "text": " Block version: validation rules.",
+                "font": "Times-Roman",
+                "size": 10.0,
+                "flags": 0,
+                "style": "text",
+                "origin": [15.0, 20.0],
+                "bbox": [15.0, 10.0, 180.0, 20.0],
+                "line": 0,
+                "span": 1,
+            },
+        ]
+        protected, _, fragments, _ = prepare_paper.build_rich_protection(
+            source, spans
+        )
+        self.assertEqual(protected, source)
+        self.assertEqual(fragments, {})
 
     def test_table_narrative_is_body_not_caption(self) -> None:
         kind = prepare_paper.classify_text_kind(
@@ -340,6 +374,62 @@ class PaperPipelineTests(unittest.TestCase):
         self.assertEqual(list_node["flow_role"], "list-item")
         self.assertEqual(list_style["text_indent"], -11.5)
         self.assertEqual(list_style["padding_left"], 23.0)
+
+    def test_caption_continuation_merges_without_swallowing_table_text(
+        self,
+    ) -> None:
+        caption = {
+            **self.unit(
+                "caption",
+                1,
+                "caption",
+                "Figure 1 A diagram (see online",
+            ),
+            "page": 1,
+            "bbox": [100, 100, 480, 112],
+            "font_size": 9.0,
+            "translatable": False,
+        }
+        continuation = {
+            **self.unit(
+                "continuation",
+                2,
+                "figure-text",
+                "version for colours)",
+            ),
+            "page": 1,
+            "bbox": [100, 114, 220, 126],
+            "font_size": 9.0,
+            "render_mode": "source_clip",
+            "translatable": False,
+        }
+        table_text = {
+            **self.unit(
+                "table",
+                3,
+                "figure-text",
+                "Property Public blockchain",
+            ),
+            "page": 1,
+            "bbox": [100, 130, 480, 240],
+            "font_size": 9.0,
+            "render_mode": "source_clip",
+            "translatable": False,
+        }
+        nodes = render_translation.build_flow_nodes(
+            [caption, continuation, table_text],
+            {
+                "caption": caption["source_text"],
+                "continuation": continuation["source_text"],
+                "table": table_text["source_text"],
+            },
+        )
+        self.assertEqual(nodes[0]["ids"], ["caption", "continuation"])
+        self.assertEqual(
+            nodes[0]["text"],
+            "Figure 1 A diagram (see online version for colours)",
+        )
+        self.assertEqual(nodes[1]["render_mode"], "source_clip")
 
     def test_windows_academic_font_pair_is_selected(self) -> None:
         fonts = render_translation.find_typography_fonts()
@@ -547,6 +637,176 @@ class PaperPipelineTests(unittest.TestCase):
         )
         renderer.document.close()
         source.close()
+
+    def test_native_composite_clip_includes_disconnected_content_edge(
+        self,
+    ) -> None:
+        source = pymupdf.open()
+        page = source.new_page(width=595.28, height=841.89)
+        node = {
+            "id": "figure",
+            "element": {
+                "page": 1,
+                "bbox": [120.0, 400.0, 440.0, 500.0],
+            },
+            "composite_parts": 2,
+        }
+        clip = native_latex._source_clip_rect(page, node)
+        self.assertLessEqual(clip.x0, 120.0)
+        self.assertGreaterEqual(clip.x1, 595.28 * 0.805)
+        source.close()
+
+    def test_native_inline_math_never_uses_an_image_asset(self) -> None:
+        token = "[[Fp1_0001]]"
+        node = {
+            "id": "p1",
+            "text": f"变量{token}。",
+            "element": {
+                "kind": "body",
+                "inline_fragments": {
+                    token: {
+                        "token": token,
+                        "kind": "math",
+                        "tex": "a_i",
+                        "asset_path": "forbidden.svg",
+                        "review_status": "manually_reviewed",
+                    }
+                },
+                "style_tokens": {},
+            },
+        }
+        statuses = Counter()
+        rendered = native_latex.rich_text_to_latex(node, {}, statuses)
+        self.assertIn(r"\(a_i\)", rendered)
+        self.assertNotIn("forbidden.svg", rendered)
+        self.assertEqual(statuses["manually_reviewed"], 1)
+
+    def test_native_prose_does_not_guess_english_words_are_math(self) -> None:
+        node = {
+            "id": "caption",
+            "text": "Digital signature used in blockchain.",
+            "element": {
+                "kind": "caption",
+                "inline_fragments": {},
+                "style_tokens": {},
+            },
+        }
+        rendered = native_latex.rich_text_to_latex(node, {}, Counter())
+        self.assertEqual(rendered, "Digital signature used in blockchain.")
+        self.assertNotIn(r"\(in\)", rendered)
+
+    def test_math_font_is_optional_when_paper_has_no_math(self) -> None:
+        self.assertEqual(
+            check_translation.expected_native_math_count(
+                {
+                    "rich_text": {
+                        "math_render_strategies": {
+                            "native-font": 0,
+                            "native-display-font": 0,
+                        }
+                    }
+                }
+            ),
+            0,
+        )
+        self.assertEqual(
+            check_translation.expected_native_math_count(
+                {
+                    "rich_text": {
+                        "math_render_strategies": {
+                            "native-font": 3,
+                            "native-display-font": 2,
+                        }
+                    }
+                }
+            ),
+            5,
+        )
+
+    def test_native_display_math_requires_manual_review(self) -> None:
+        node = {
+            "id": "eq1",
+            "elements": [{"kind": "equation"}],
+            "element": {"kind": "equation"},
+        }
+        with self.assertRaises(native_latex.MathReviewError):
+            native_latex.resolve_display_math(
+                node,
+                {
+                    "eq1": {
+                        "tex": r"\sum_i a_i",
+                        "review_status": "unresolved",
+                    }
+                },
+            )
+
+    def test_math_review_groups_display_equation_and_flags_ambiguous_inline(
+        self,
+    ) -> None:
+        inline = {
+            **self.unit("p1", 1, "body", "x"),
+            "inline_fragments": {
+                "[[Fp1_0001]]": {
+                    "kind": "math",
+                    "token": "[[Fp1_0001]]",
+                    "text": "x",
+                    "tex": "x",
+                    "review_status": "unresolved",
+                    "source_bbox": [0, 0, 10, 10],
+                }
+            },
+        }
+        equation = {
+            **self.unit("eq1", 2, "equation", "a = b"),
+            "render_mode": "source_clip",
+            "page": 1,
+            "bbox": [10, 20, 100, 40],
+        }
+        review = prepare_paper.build_math_review(
+            [inline, equation],
+            "hash",
+        )
+        self.assertEqual(review["source_sha256"], "hash")
+        self.assertEqual(
+            review["entries"]["[[Fp1_0001]]"]["review_status"],
+            "unresolved",
+        )
+        self.assertEqual(review["entries"]["eq1"]["kind"], "display")
+
+    def test_markdown_exports_reviewed_display_math(self) -> None:
+        units = [
+            {
+                **self.unit("intro", 1, "heading", "1 Introduction"),
+                "translatable": True,
+            },
+            {
+                **self.unit("eq1", 2, "equation", "a = b"),
+                "render_mode": "source_clip",
+                "translatable": False,
+            },
+        ]
+        output = export_markdown.export_markdown(
+            {
+                "source_title": "Paper",
+                "boundary": {
+                    "introduction_id": "intro",
+                    "post_body_stop_id": None,
+                },
+            },
+            units,
+            [{"id": "intro", "translated_text": "1 引言"}],
+            {
+                "entries": {
+                    "eq1": {
+                        "kind": "display",
+                        "source_ids": ["eq1"],
+                        "tex": r"\sum_i a_i=b",
+                        "review_status": "manually_reviewed",
+                    }
+                }
+            },
+        )
+        self.assertIn("$$\n\\sum_i a_i=b\n$$", output)
 
     def test_legacy_plain_text_unit_renders_without_rich_fields(self) -> None:
         fonts = render_translation.find_typography_fonts()

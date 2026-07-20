@@ -86,7 +86,8 @@ def rich_text_to_markdown(unit: dict[str, Any], text: str) -> str:
                     output[-1] = re.sub(r"\s+$", "", output[-1])
                 output.append(f"<sup>{value}</sup>")
             elif kind == "math":
-                output.append(str(fragment.get("markdown") or f"${value}$"))
+                tex = str(fragment.get("tex") or "").strip()
+                output.append(f"${tex}$" if tex else f"${value}$")
             elif kind == "footnote-marker":
                 output.append(f"<sup>{value}</sup>")
             else:
@@ -113,6 +114,7 @@ def export_markdown(
     manifest: dict[str, Any],
     units: list[dict[str, Any]],
     translations: list[dict[str, Any]],
+    math_review: dict[str, Any] | None = None,
 ) -> str:
     translation_map: dict[str, dict[str, Any]] = {}
     for record in translations:
@@ -134,10 +136,39 @@ def export_markdown(
     title = str(manifest.get("source_title") or "Paper")
     lines = [f"# {title}", "", "> 中文翻译正文（仅含经复核的可翻译正文范围）", ""]
     footnotes: list[str] = []
-    for unit in sorted(units, key=lambda item: int(item["order"])):
+    ordered_units = sorted(units, key=lambda item: int(item["order"]))
+    positions = {
+        str(unit["id"]): index for index, unit in enumerate(ordered_units)
+    }
+    boundary = dict(manifest.get("boundary") or {})
+    start = positions.get(str(boundary.get("introduction_id") or ""), 0)
+    stop = positions.get(
+        str(boundary.get("post_body_stop_id") or ""),
+        len(ordered_units),
+    )
+    review_entries = dict((math_review or {}).get("entries") or {})
+    consumed_display_ids: set[str] = set()
+    for unit in ordered_units[start:stop]:
+        unit_id = str(unit["id"])
+        if unit_id in consumed_display_ids:
+            continue
+        display = dict(review_entries.get(unit_id) or {})
+        if display.get("kind") == "display":
+            if display.get("review_status") != "manually_reviewed":
+                raise ValueError(
+                    f"{unit_id}: display math review is incomplete"
+                )
+            tex = str(display.get("tex") or "").strip()
+            if not tex:
+                raise ValueError(f"{unit_id}: display math TeX is empty")
+            lines.extend(("$$", tex, "$$", ""))
+            consumed_display_ids.update(
+                str(value) for value in display.get("source_ids") or [unit_id]
+            )
+            continue
         if not unit.get("translatable"):
             continue
-        record = translation_map[str(unit["id"])]
+        record = translation_map[unit_id]
         translated = str(record.get("translated_text") or "").strip()
         if not translated:
             raise ValueError(f"{unit['id']}: translated_text is empty")
@@ -177,10 +208,23 @@ def main() -> int:
     if manifest.get("boundary", {}).get("needs_boundary_review"):
         raise SystemExit("Translation boundary review is incomplete.")
     units_path = manifest_path.parent / manifest["paths"]["translation_units"]
+    math_review: dict[str, Any] | None = None
+    math_review_name = str(
+        (manifest.get("paths") or {}).get("math_review") or ""
+    )
+    if math_review_name:
+        math_review_path = manifest_path.parent / math_review_name
+        if not math_review_path.exists():
+            raise SystemExit(f"Math review file is missing: {math_review_path}")
+        loaded = json.loads(math_review_path.read_text(encoding="utf-8"))
+        if loaded.get("source_sha256") != manifest.get("source_sha256"):
+            raise SystemExit("Math review does not match the source PDF.")
+        math_review = loaded
     markdown = export_markdown(
         manifest,
         read_jsonl(units_path),
         read_jsonl(translations_path),
+        math_review,
     )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(markdown, encoding="utf-8", newline="\n")

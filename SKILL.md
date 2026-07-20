@@ -45,6 +45,12 @@ Inspect `manifest.json`, `translation-units.jsonl`, `layout.txt`, and all source
 previews. Verify reading order, the Introduction start, the last main-section
 end, and the first excluded heading.
 
+Inspect `math-review.json`. Every inline mathematical fragment must contain
+valid TeX and a review status. Reconstruct each display equation as one logical
+TeX block, set `review_status` to `manually_reviewed`, and compare it with the
+source preview. Do not translate or export while any mathematical entry is
+`unresolved`.
+
 If `manifest.json` says `needs_boundary_review: true`, edit
 `boundary-review.json`, not the manifest:
 
@@ -101,17 +107,20 @@ Use the default `zh-academic-v1` general Chinese academic typography profile:
   faces while retaining SimSun/SimHei for Chinese;
 - definition items: render a semantic paragraph start with the normal 23pt
   first-line indent, never a bare HTML line break;
-- inline mathematics: cluster recorded runs spatially, render atomic variables
-  directly with Latin Modern Math, render losslessly reconstructed expressions
-  as LuaLaTeX vectors converted by Poppler or dvisvgm, and retain ambiguous or
-  complex mathematics as scaled vector source clips;
+- all inline and display mathematics: render as embedded LuaLaTeX text with
+  Latin Modern Math. Never use raster images, SVG, HTML images, source-PDF
+  equation clips, or PDF image/Form fallbacks for mathematical content;
+- native-TeX review gate: abort export when TeX is missing, unbalanced,
+  unreviewed, fails LuaLaTeX compilation, or reports a missing glyph. Never
+  weaken this gate by falling back to a visual copy of the formula;
 - numeric body citations: render as superscripts; never superscript bibliography
   entries or mathematical intervals;
 - body footnotes: place below a separator at the anchored translated-page
   bottom, or move the complete note to an end-of-body footnote area when it
   cannot fit;
-- figures, tables, and equations: scale proportionally within the content box
-  without clipping or distortion.
+- figures and tables: scale proportionally within the content box without
+  clipping or distortion. Only non-mathematical visual objects may use source
+  vector clips;
 - draw translated text directly into its final page box; never re-embed the
   4096pt measurement page because the final PDF must expose one unambiguous
   text coordinate system.
@@ -150,13 +159,15 @@ readable resolution every page containing figures, tables, equations, mixed
 one/two-column layout, or multiple source clips. A passing automated report
 does not prove that a composite figure stayed together. Fix clipping, overlap,
 fragmented visuals, missing glyphs, malformed citations, or untranslated body
-before continuing. Confirm that the layout report names `zh-academic-v1`,
-SimSun, SimHei, Latin Modern Roman, and Latin Modern Math; do not accept
-Microsoft YaHei for translated Chinese text or SimSun for translated English
-prose. Confirm
+before continuing. Confirm that the layout report names
+`native-lualatex-v1`, `zh-academic-v1`, SimSun, SimHei, Latin Modern Roman,
+and Latin Modern Math; do not accept Microsoft YaHei for translated Chinese
+text or SimSun for translated English prose. Require `native-font` for every
+inline fragment, `native-display-font` for every display equation, zero
+unresolved math, and zero mathematical image fallbacks. Confirm
 that `boundary_layout` records contiguous original front segments, translated
 body pages, and original tail segments with no shared output page.
-Require `direct-htmlbox` text embedding, zero 4096pt measurement forms, and no
+Require `native-lualatex` text embedding, zero 4096pt measurement forms, and no
 unexpected intrinsic PDF link annotations on translated-body pages.
 Run `scripts/quick_validate.py` as the final fast structural smoke test before
 publishing or replacing a Zotero attachment.

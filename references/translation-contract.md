@@ -62,6 +62,8 @@ deterministically.
 - `boundary-review.json`: hash-bound manual review gate and candidates;
 - `translation-units.jsonl`: ordered source elements and protected text;
 - `translations.template.jsonl`: empty translation checkpoints;
+- `math-review.json`: hash-bound native TeX and review status for ambiguous
+  inline fragments and every logical display equation;
 - `glossary.json`: persistent terminology map;
 - source previews and layout-aware extracted text.
 
@@ -75,8 +77,8 @@ Review every page before translation when it is scanned, OCR confidence is low,
 boundaries are uncertain, columns mix with full-width content, or equations and
 captions are misclassified.
 
-Use `source_clip` for equations, figures, complex tables, captions, and damaged
-OCR regions that must remain visually identical. Treat a multi-fragment vector
+Use `source_clip` for figures, complex tables, captions, and damaged
+non-mathematical OCR regions that must remain visually identical. Treat a multi-fragment vector
 figure and its internal labels as one visual envelope. After rendering, inspect
 the contact sheet plus high-resolution pages containing source clips; automated
 text checks cannot detect every fragmented or split figure.
@@ -84,14 +86,14 @@ text checks cannot detect every fragmented or split figure.
 Retain source span typography in translatable prose. Render source bold and
 italic emphasis on the translated equivalent. Detect numeric bracket citations
 before generic protected values and render body citations as superscripts;
-exclude bibliography entries and mathematical intervals. Reconstruct simple
-inline mathematics from recorded font, size, baseline, and spatially adjacent
-runs, including runs split across overlapping PDF text blocks. Render atomic
-variables directly with Latin Modern Math. Render a lossless structured
-reconstruction through LuaLaTeX and convert it to vector SVG with Poppler or
-dvisvgm, retaining real super/subscripts. If reconstruction is not lossless,
-preserve the formula as a vector source clip rather than flattening it into
-ordinary text.
+exclude bibliography entries and mathematical intervals. Reconstruct inline
+mathematics from recorded font, size, baseline, and spatially adjacent runs,
+including runs split across overlapping PDF text blocks. Merge display-equation
+spans into logical formulas. Render all mathematics as embedded LuaLaTeX text
+with Latin Modern Math, retaining real super/subscripts. SVG, raster, HTML
+image, source equation clip, and PDF image/Form fallback are forbidden for
+mathematical content. If reconstruction is not lossless, leave the review
+unresolved and abort export.
 
 Treat a long sentence beginning with “Table N gives/shows/compares...” as
 narrative body, not a caption. A caption must be a compact label attached to its
@@ -128,8 +130,9 @@ Use the general `zh-academic-v1` profile for translated PDFs:
 Place body footnotes at the bottom of the translated page that contains their
 anchor, below a visible horizontal rule and in smaller SimSun text. If reserving
 that area would collide with body text, move the complete footnote to a ruled
-end-of-body footnote area. Scale figures, tables, and equations proportionally
-to fit the content box; never stretch or crop them.
+end-of-body footnote area. Scale figures and tables proportionally to fit the
+content box; never stretch or crop them. Use a width-constrained TeX box for
+long equations so mathematical glyphs remain embedded text.
 
 Treat extraction blocks as layout units, not automatically as paragraphs.
 Merge only consecutive translated body units in the same section when the

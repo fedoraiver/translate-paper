@@ -97,6 +97,16 @@ def normalize_font_name(value: str) -> str:
     return re.sub(r"[^a-z0-9]", "", value.casefold())
 
 
+def expected_native_math_count(layout: dict[str, Any]) -> int:
+    strategies = (
+        (layout.get("rich_text") or {}).get("math_render_strategies") or {}
+    )
+    return sum(
+        int(strategies.get(name) or 0)
+        for name in ("native-font", "native-display-font")
+    )
+
+
 def is_expected_latin_font(value: str) -> bool:
     normalized = normalize_font_name(value)
     return (
@@ -389,7 +399,10 @@ def validate_typography(
         return errors, warnings, metrics
     flow = layout.get("flow") or {}
     metrics["text_embedding"] = flow.get("text_embedding")
-    if flow.get("text_embedding") != "direct-htmlbox":
+    if flow.get("text_embedding") not in {
+        "direct-htmlbox",
+        "native-lualatex",
+    }:
         errors.append(
             "Translated text is not directly embedded into final PDF pages."
         )
@@ -466,6 +479,86 @@ def validate_typography(
             "Translatable IDs missing from layout placements: "
             + ", ".join(missing_ids[:20])
         )
+
+    if flow.get("text_embedding") == "native-lualatex":
+        boundary = dict(layout.get("boundary_layout") or {})
+        translation_start = int(boundary.get("translation_page_start") or 0)
+        translation_end = int(boundary.get("translation_page_end") or 0)
+        if not (
+            1 <= translation_start <= translation_end <= len(document)
+        ):
+            errors.append("Native LuaLaTeX body page range is invalid.")
+            return errors, warnings, metrics
+        han_fonts: Counter[str] = Counter()
+        latin_fonts: Counter[str] = Counter()
+        math_fonts: Counter[str] = Counter()
+        body_sizes: list[float] = []
+        for page_index in range(translation_start - 1, translation_end):
+            page = document[page_index]
+            for block in page.get_text("dict", sort=True).get("blocks", []):
+                for line in block.get("lines", []):
+                    for span in line.get("spans", []):
+                        text = str(span.get("text") or "")
+                        font = str(span.get("font") or "")
+                        if HAN_RE.search(text):
+                            han_fonts[font] += len(HAN_RE.findall(text))
+                            if "simhei" not in font.casefold():
+                                body_sizes.append(float(span.get("size") or 0.0))
+                        if LATIN_RE.search(text):
+                            latin_fonts[font] += len(LATIN_RE.findall(text))
+                        if "math" in font.casefold():
+                            math_fonts[font] += max(1, len(text))
+        metrics["han_fonts"] = dict(han_fonts)
+        metrics["latin_fonts"] = dict(latin_fonts)
+        metrics["math_fonts"] = dict(math_fonts)
+        metrics["paragraphs_checked"] = sum(
+            placement.get("flow_role") in {"paragraph-start", "list-item"}
+            for placement in placements
+        )
+        metrics["headings_checked"] = sum(
+            placement.get("flow_role") == "heading"
+            for placement in placements
+        )
+        metrics["joined_continuations"] = int(
+            (layout.get("flow") or {}).get("joined_continuations") or 0
+        )
+        if body_sizes:
+            metrics["body_font_size_median"] = round(
+                statistics.median(body_sizes), 3
+            )
+        if not any("simsun" in name.casefold() for name in han_fonts):
+            errors.append("Native LuaLaTeX body does not embed SimSun text.")
+        if not any("simhei" in name.casefold() for name in han_fonts):
+            errors.append("Native LuaLaTeX headings do not embed SimHei text.")
+        if not any(
+            "lmroman" in normalize_font_name(name)
+            or "latinmodernroman" in normalize_font_name(name)
+            for name in latin_fonts
+        ):
+            errors.append(
+                "Native LuaLaTeX Latin prose does not use Latin Modern Roman."
+            )
+        if expected_native_math_count(layout) and not math_fonts:
+            errors.append(
+                "Native LuaLaTeX body exposes no embedded mathematical font."
+            )
+        if metrics["paragraphs_checked"] == 0:
+            errors.append("No translated paragraphs were checked for typography.")
+        if metrics["headings_checked"] == 0:
+            errors.append("No translated headings were checked for typography.")
+        reader_metrics = analyze_reader_compatibility(
+            document, translation_start, translation_end
+        )
+        metrics.update(reader_metrics)
+        if reader_metrics["oversized_text_forms"]:
+            errors.append(
+                "Native LuaLaTeX pages contain oversized measurement forms."
+            )
+        if reader_metrics["pdf_native_links"]:
+            errors.append(
+                "Native LuaLaTeX pages contain unexpected PDF link annotations."
+            )
+        return errors, warnings, metrics
 
     global_fonts: Counter[str] = Counter()
     global_latin_fonts: Counter[str] = Counter()
@@ -978,7 +1071,36 @@ def main() -> int:
                     f"Math font is unavailable or unexpected: {math_font or 'missing'}"
                 )
             strategies = dict(rich.get("math_render_strategies") or {})
-            if not any(
+            if layout.get("render_backend") == "native-lualatex-v1":
+                if int(strategies.get("native-font") or 0) != int(
+                    expected_inline.get("math") or 0
+                ):
+                    errors.append(
+                        "Not every inline mathematical fragment used the "
+                        "native math font."
+                    )
+                forbidden = {
+                    name: count
+                    for name, count in strategies.items()
+                    if name in {
+                        "tex-vector",
+                        "source-vector",
+                        "font-vector",
+                        "image",
+                    }
+                    and int(count or 0) > 0
+                }
+                review_metrics = dict(rich.get("math_review") or {})
+                if forbidden or int(
+                    review_metrics.get("image_fallbacks") or 0
+                ):
+                    errors.append(
+                        "Native mathematical export contains an image/vector "
+                        f"fallback: {forbidden}"
+                    )
+                if int(review_metrics.get("unresolved") or 0):
+                    errors.append("Native mathematical review is unresolved.")
+            elif not any(
                 strategies.get(name, 0)
                 for name in ("tex-vector", "source-vector")
             ):

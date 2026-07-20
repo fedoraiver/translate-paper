@@ -675,6 +675,30 @@ def join_continuation(left: str, right: str) -> str:
     return left + " " + right
 
 
+def is_caption_continuation(
+    previous_node: dict[str, Any], element: dict[str, Any]
+) -> bool:
+    if previous_node.get("element", {}).get("kind") != "caption":
+        return False
+    if str(element.get("kind") or "") != "figure-text":
+        return False
+    if int(previous_node["element"].get("page") or 0) != int(
+        element.get("page") or 0
+    ):
+        return False
+    text = str(element.get("source_text") or "").strip()
+    if not text or len(text) > 180 or not re.match(r"^[a-z]", text):
+        return False
+    previous_rect = pymupdf.Rect(previous_node["element"].get("bbox") or [])
+    current_rect = pymupdf.Rect(element.get("bbox") or [])
+    font_size = max(
+        float(previous_node["element"].get("font_size") or 9.0),
+        float(element.get("font_size") or 9.0),
+    )
+    gap = current_rect.y0 - previous_rect.y1
+    return -font_size * 0.5 <= gap <= font_size * 2.5
+
+
 def build_flow_nodes(
     elements: list[dict[str, Any]], rendered_text: dict[str, str]
 ) -> list[dict[str, Any]]:
@@ -683,6 +707,24 @@ def build_flow_nodes(
         if element.get("kind") in {"header", "footer"}:
             continue
         if element.get("render_mode") == "source_clip":
+            if nodes and is_caption_continuation(nodes[-1], element):
+                previous = nodes[-1]
+                continuation = normalize_body_text(
+                    str(rendered_text[element["id"]])
+                )
+                previous["text"] = join_continuation(
+                    previous["text"], continuation
+                )
+                previous["ids"].append(element["id"])
+                previous["elements"].append(element)
+                previous["joined_continuations"] = len(previous["ids"]) - 1
+                union = pymupdf.Rect(previous["element"]["bbox"])
+                union |= pymupdf.Rect(element["bbox"])
+                previous["element"]["bbox"] = [
+                    round(float(value), 3)
+                    for value in (union.x0, union.y0, union.x1, union.y1)
+                ]
+                continue
             if (
                 nodes
                 and nodes[-1].get("render_mode") == "source_clip"
@@ -1848,11 +1890,6 @@ def main() -> int:
     source = pymupdf.open(source_path)
     source_hash_before = sha256_file(source_path)
     fonts = find_typography_fonts()
-    math_asset_strategies = prepare_math_assets(
-        source,
-        elements,
-        manifest_path.parent / "math-assets",
-    )
     try:
         body_elements, front_segments, tail_segments = partition_translation_body(
             elements, manifest
@@ -1861,6 +1898,40 @@ def main() -> int:
         source.close()
         raise SystemExit(str(error)) from error
     nodes = build_flow_nodes(body_elements, rendered_text)
+    from native_latex import MathReviewError, render_native_latex
+
+    try:
+        render_native_latex(
+            manifest=manifest,
+            manifest_path=manifest_path,
+            source=source,
+            source_path=source_path,
+            output=output,
+            elements=elements,
+            nodes=nodes,
+            front_segments=front_segments,
+            tail_segments=tail_segments,
+            fonts=fonts,
+            profile=PROFILE,
+            typography_profile=TYPOGRAPHY_PROFILE,
+            columns=columns,
+        )
+    except (MathReviewError, RuntimeError, ValueError) as error:
+        source.close()
+        raise SystemExit(str(error)) from error
+    source.close()
+    if source_hash_before != sha256_file(source_path):
+        output.unlink(missing_ok=True)
+        output.with_suffix(".layout.json").unlink(missing_ok=True)
+        raise SystemExit("Source PDF changed while rendering; output removed.")
+    print(output)
+    return 0
+
+    math_asset_strategies = prepare_math_assets(
+        source,
+        elements,
+        manifest_path.parent / "math-assets",
+    )
     renderer = FlowRenderer(
         source=source,
         width=float(first_page["width"]),
