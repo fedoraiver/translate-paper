@@ -778,6 +778,20 @@ class PaperPipelineTests(unittest.TestCase):
         self.assertNotIn("forbidden.svg", rendered)
         self.assertEqual(statuses["manually_reviewed"], 1)
 
+    def test_native_math_rejects_unicode_radical_glyph(self) -> None:
+        token = "[[Fp1_0001]]"
+        fragment = {
+            "token": token,
+            "kind": "math",
+            "tex": "O(√p)",
+            "review_status": "manually_reviewed",
+        }
+        with self.assertRaisesRegex(
+            native_latex.MathReviewError,
+            r"use \\sqrt\{\.\.\.\}",
+        ):
+            native_latex.resolve_inline_math(fragment, {})
+
     def test_native_prose_does_not_guess_english_words_are_math(self) -> None:
         node = {
             "id": "caption",

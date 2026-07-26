@@ -126,6 +126,12 @@ Use the default `zh-academic-v1` general Chinese academic typography profile:
 - native-TeX review gate: abort export when TeX is missing, unbalanced,
   unreviewed, fails LuaLaTeX compilation, or reports a missing glyph. Never
   weaken this gate by falling back to a visual copy of the formula;
+- mathematical fragments: protect the complete atomic expression, including
+  adjacent function names and delimiters such as `O(\sqrt{p})`. Reject a
+  literal Unicode `√`; it must be represented by complete `\sqrt{...}` TeX.
+- style consistency: math-font or symbol-font runs enter math review before
+  prose styling. Never emit bold body text without a source bold span; preserve
+  genuine source bold and italic spans exactly;
 - numeric body citations: render as superscripts; never superscript bibliography
   entries or mathematical intervals;
 - body footnotes: place below a separator at the anchored translated-page

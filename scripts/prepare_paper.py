@@ -519,6 +519,44 @@ def math_render_strategy(runs: list[dict[str, Any]], markdown: str) -> str:
     return "tex-vector"
 
 
+def looks_like_math_run(run: dict[str, Any]) -> bool:
+    """Recognize symbol-heavy expressions even when PDF font flags say bold."""
+    value = str(run.get("text") or "").strip()
+    if not value or len(value) > 120:
+        return False
+    if not re.search(r"[=<>≤≥≈≠+\-*/^√∑∏∫(){}\[\]0-9]", value):
+        return False
+    prose_words = [
+        word
+        for word in re.findall(r"[A-Za-z]{3,}", value)
+        if word.casefold() not in {"mod", "log", "exp", "sin", "cos", "tan"}
+    ]
+    return not prose_words
+
+
+def expand_math_fragment_bounds(
+    source_text: str, start: int, end: int
+) -> tuple[int, int]:
+    """Keep function-style delimiters such as ``O(√p)`` in one fragment."""
+    prefix = source_text[:start]
+    function_open = re.search(r"[A-Za-z][A-Za-z0-9]*\(\s*$", prefix)
+    if function_open:
+        start = function_open.start()
+    fragment = source_text[start:end]
+    open_parentheses = fragment.count("(") - fragment.count(")")
+    while open_parentheses > 0 and end < len(source_text):
+        character = source_text[end]
+        if character.isspace():
+            end += 1
+            continue
+        if character == ")":
+            end += 1
+            open_parentheses -= 1
+            continue
+        break
+    return start, end
+
+
 def build_rich_protection(
     source_text: str,
     span_runs: list[dict[str, Any]] | None = None,
@@ -553,6 +591,7 @@ def build_rich_protection(
         if not LIST_MARKER_RE.fullmatch(str(run.get("text") or "").strip())
         and (
             run.get("style") == "math"
+            or looks_like_math_run(run)
             or (
                 body_size > 0
                 and float(run.get("size") or 0.0) <= body_size * 0.82
@@ -581,6 +620,7 @@ def build_rich_protection(
     for group in groups:
         start = int(group[0]["start"])
         end = int(group[-1]["end"])
+        start, end = expand_math_fragment_bounds(source_text, start, end)
         if end <= start:
             continue
         fragment_text = source_text[start:end]

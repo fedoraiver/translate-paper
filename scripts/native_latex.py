@@ -187,6 +187,11 @@ def resolve_inline_math(
         raise MathReviewError(
             f"{token or '<unnamed math fragment>'}: native TeX is unresolved."
         )
+    if "√" in tex:
+        raise MathReviewError(
+            f"{token}: Unicode radical glyph is not native TeX; "
+            r"use \sqrt{...}."
+        )
     if not tex or not _tex_balanced(tex):
         raise MathReviewError(f"{token}: invalid or unbalanced TeX: {tex!r}")
     return tex, status
@@ -202,6 +207,11 @@ def resolve_display_math(
     if status != "manually_reviewed":
         raise MathReviewError(
             f"{node['id']}: display equation requires manual review."
+        )
+    if "√" in tex:
+        raise MathReviewError(
+            f"{node['id']}: Unicode radical glyph is not native TeX; "
+            r"use \sqrt{...}."
         )
     if not tex or not _tex_balanced(tex):
         raise MathReviewError(

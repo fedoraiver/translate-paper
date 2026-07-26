@@ -116,6 +116,14 @@ image, source equation clip, and PDF image/Form fallback are forbidden for
 mathematical content. If reconstruction is not lossless, leave the review
 unresolved and abort export.
 
+Classify mathematical expressions before interpreting PDF bold flags. A
+symbol-heavy or math-font run must enter the math fragment/review path and must
+not create prose bold markers. Ordinary body text may be bold only when its
+source span is genuinely bold; genuine bold and italic emphasis must remain.
+Expand fragment boundaries to include adjacent function names and balanced
+delimiters, so `O(\sqrt{p})` is one atom. Literal Unicode `√` is forbidden in
+native TeX; use a complete `\sqrt{...}` command.
+
 Treat a long sentence beginning with “Table N gives/shows/compares...” as
 narrative body, not a caption. A caption must be a compact label attached to its
 visual.
