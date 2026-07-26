@@ -317,11 +317,19 @@ def rich_text_to_latex(
                     + "}"
                 )
             elif kind == "footnote-marker":
-                output.append(
-                    r"\textsuperscript{"
-                    + latex_escape_text(str(fragment.get("text") or ""))
-                    + "}"
-                )
+                footnote_id = str(fragment.get("footnote_id") or "")
+                if footnote_id and footnote_id in (footnotes_by_id or {}):
+                    output.append(
+                        r"\footnote{\fontsize{8.5pt}{11pt}\selectfont "
+                        + str((footnotes_by_id or {})[footnote_id])
+                        + "}"
+                    )
+                elif not suppress_footnote_markers:
+                    output.append(
+                        r"\textsuperscript{"
+                        + latex_escape_text(str(fragment.get("text") or ""))
+                        + "}"
+                    )
             elif kind == "math":
                 tex, status = resolve_inline_math(fragment, reviews)
                 math_statuses[status] += 1
@@ -556,9 +564,18 @@ def _node_to_latex(
             "source_clip",
         )
 
-    content = rich_text_to_latex(node, reviews, math_statuses)
     role = str(node.get("flow_role") or "")
     kind = str(node["element"].get("kind") or "")
+    if (role == "footnote" or kind == "footnote") and node.get(
+        "element", {}
+    ).get("anchor_id"):
+        return "", "anchored-footnote"
+    content = rich_text_to_latex(
+        node,
+        reviews,
+        math_statuses,
+        footnotes_by_id=footnotes_by_id,
+    )
     if role == "heading":
         level_text = re.match(r"^\s*(\d+(?:\.\d+)*)", str(node.get("text") or ""))
         level = 1 if not level_text else level_text.group(1).count(".") + 1
@@ -910,6 +927,18 @@ def locate_placements(
                 "bbox": bbox,
             }
         )
+    by_id = {
+        str(item["id"]): item
+        for item in located
+    }
+    for item in located:
+        anchor_id = str(item.get("anchor_id") or "")
+        if not anchor_id or anchor_id not in by_id:
+            continue
+        anchor_page = int(by_id[anchor_id]["output_page"])
+        item["output_page"] = anchor_page
+        item["anchor_output_page"] = anchor_page
+        item["footnote_location"] = "page-bottom"
     document.close()
     return located
 
@@ -995,7 +1024,9 @@ def render_native_latex(
     footnote_placements = [
         {
             "id": placement["id"],
-            "location": "page-bottom",
+            "anchor_id": placement.get("anchor_id"),
+            "anchor_output_page": placement.get("anchor_output_page"),
+            "location": placement.get("footnote_location") or "page-bottom",
             "output_page": placement["output_page"],
             "separator_y": None,
         }

@@ -156,12 +156,16 @@ Use the general `zh-academic-v1` profile for translated PDFs:
 - translated text drawn directly into the final page box so its PDF text-layer
   coordinates match its visible location in the PDF.
 
-Place body footnotes at the bottom of the translated page that contains their
-anchor, below a visible horizontal rule and in smaller SimSun text. If reserving
-that area would collide with body text, move the complete footnote to a ruled
-end-of-body footnote area. Scale figures and tables proportionally to fit the
-content box; never stretch or crop them. Use a width-constrained TeX box for
-long equations so mathematical glyphs remain embedded text.
+Record an explicit relationship between each footnote number, source anchor,
+and note body. Insert the translated note at the anchor and let TeX repaginate
+the body so the complete note remains at the bottom of the same translated
+page, below a visible horizontal rule and in smaller SimSun text. Do not render
+the note again as body text. `end-of-body` is permitted only when the note
+itself is taller than the usable page, and that condition must be recorded as
+`oversized_footnote: true`. Scale figures and tables proportionally to fit the
+content box; never stretch or crop them. Keep every visual with its caption on
+one page. Use a width-constrained TeX box for long equations so mathematical
+glyphs remain embedded text.
 
 Treat extraction blocks as layout units, not automatically as paragraphs.
 Merge only consecutive translated body units in the same section when the
@@ -171,6 +175,13 @@ layout report so validation can distinguish real paragraphs from continuations.
 Use tall temporary pages only for measurement. Never copy those pages into the
 final PDF as Form XObjects; reject 4096pt measurement forms and unexpected link
 annotations during validation.
+
+`中文翻译.layout.json` must report actual visual dimensions, applied scale,
+source and target internal font size, aspect ratio, visual page, caption page,
+footnote anchor page, and style-consistency metrics. Validation compares this
+report with `visual-layout.json`; inventory mismatches, out-of-bounds geometry,
+aspect-ratio changes, caption-page changes, footnote-page changes, or
+unexpected bold body text fail the run.
 
 ## Reader scope
 

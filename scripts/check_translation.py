@@ -1217,7 +1217,18 @@ def main() -> int:
         placed_footnotes = {
             str(item.get("id"))
             for item in footnote_placements
-            if item.get("location") in {"page-bottom", "end-of-body"}
+            if item.get("location") == "page-bottom"
+            or (
+                item.get("location") == "end-of-body"
+                and next(
+                    (
+                        bool(unit.get("oversized_footnote"))
+                        for unit in units
+                        if str(unit.get("id")) == str(item.get("id"))
+                    ),
+                    False,
+                )
+            )
         }
         missing_footnotes = sorted(expected_footnote_ids - placed_footnotes)
         if missing_footnotes:
@@ -1225,6 +1236,28 @@ def main() -> int:
                 "Footnotes lack a bottom/end placement: "
                 + ", ".join(missing_footnotes)
             )
+        unit_by_id = {str(unit["id"]): unit for unit in units}
+        placement_by_id = {
+            str(item.get("id")): item
+            for item in list(layout.get("placements") or [])
+        }
+        for item in footnote_placements:
+            unit = unit_by_id.get(str(item.get("id"))) or {}
+            anchor_id = str(unit.get("anchor_id") or "")
+            if not anchor_id:
+                continue
+            anchor = placement_by_id.get(anchor_id)
+            if not anchor:
+                errors.append(f"{item.get('id')}: footnote anchor is missing.")
+            elif int(item.get("output_page") or 0) != int(
+                anchor.get("output_page") or 0
+            ):
+                errors.append(
+                    f"{item.get('id')}: footnote is not on its anchor page."
+                )
+        style_consistency = dict(rich.get("style_consistency") or {})
+        if int(style_consistency.get("unexpected_bold_body_units") or 0):
+            errors.append("Layout reports unexpected bold body text.")
     if translated.exists():
         try:
             output_document = pymupdf.open(translated)

@@ -134,12 +134,14 @@ Use the default `zh-academic-v1` general Chinese academic typography profile:
   genuine source bold and italic spans exactly;
 - numeric body citations: render as superscripts; never superscript bibliography
   entries or mathematical intervals;
-- body footnotes: place below a separator at the anchored translated-page
-  bottom, or move the complete note to an end-of-body footnote area when it
-  cannot fit;
-- figures and tables: scale proportionally within the content box without
-  clipping or distortion. Only non-mathematical visual objects may use source
-  vector clips;
+- body footnotes: maintain an explicit note-number/anchor/body link and insert
+  the note at that anchor so TeX repaginates it onto the same page bottom. Use
+  `end-of-body` only when the complete note is taller than the usable page;
+- figures and tables: keep one complete vector object, centered and
+  proportional. Use its calibrated target width, never unconditional
+  `width=\linewidth`; shrink only when it exceeds the content box. Keep the
+  visual and caption on one page and keep adjacent display equations separate.
+  Only non-mathematical visual objects may use source vector clips;
 - draw translated text directly into its final page box; never re-embed the
   4096pt measurement page because the final PDF must expose one unambiguous
   text coordinate system.
@@ -189,6 +191,9 @@ that `boundary_layout` records contiguous original front segments, translated
 body pages, and original tail segments with no shared output page.
 Require `native-lualatex` text embedding, zero 4096pt measurement forms, and no
 unexpected intrinsic PDF link annotations on translated-body pages.
+Require every visual exactly once with matching target size/aspect ratio,
+caption page, and internal-font calibration. Require every anchored footnote on
+its anchor page and zero unexpected bold body units.
 Run `scripts/quick_validate.py` as the final fast structural smoke test before
 publishing or replacing a Zotero attachment.
 

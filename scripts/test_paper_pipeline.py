@@ -1161,6 +1161,175 @@ class PaperPipelineTests(unittest.TestCase):
         self.assertEqual(front[0]["source_page"], 1)
         self.assertEqual(tail, [])
 
+    def test_visual_layout_keeps_narrow_table_at_typographic_scale(self) -> None:
+        document = pymupdf.open()
+        page = document.new_page(width=595.276, height=841.89)
+        page.insert_text((75, 90), "Body prose", fontsize=10)
+        page.insert_text((220, 250), "x  y  z", fontsize=8)
+        elements = [
+            {
+                **self.unit("body", 1, "body", "Body prose"),
+                "page": 1,
+                "bbox": [72, 78, 520, 95],
+                "font_size": 10.0,
+            },
+            {
+                **self.unit("table", 2, "table", ""),
+                "page": 1,
+                "bbox": [200, 220, 320, 280],
+                "render_mode": "source_clip",
+                "font_size": 8.0,
+            },
+            {
+                **self.unit("caption", 3, "caption", "Table 6.2: Values"),
+                "page": 1,
+                "bbox": [210, 290, 350, 305],
+                "font_size": 8.0,
+            },
+        ]
+        layout = prepare_paper.build_visual_layout(
+            document,
+            elements,
+            [{"page": 1, "width": 595.276, "height": 841.89}],
+            "hash",
+        )
+        visual = layout["visuals"][0]
+        self.assertEqual(layout["status"], "pass")
+        self.assertEqual(visual["scale_basis"], "internal-font-ratio")
+        self.assertAlmostEqual(visual["target_internal_font_pt"], 9.2, places=1)
+        self.assertAlmostEqual(visual["target_width_pt"], 138.0, places=1)
+        self.assertLess(visual["target_width_pt"], 489.0 * 0.5)
+        document.close()
+
+    def test_visual_layout_falls_back_to_source_width_ratio_with_warning(
+        self,
+    ) -> None:
+        document = pymupdf.open()
+        document.new_page(width=600, height=800)
+        elements = [
+            {
+                **self.unit("body", 1, "body", "Body"),
+                "page": 1,
+                "bbox": [50, 80, 550, 100],
+                "font_size": 10.0,
+            },
+            {
+                **self.unit("figure", 2, "figure", ""),
+                "page": 1,
+                "bbox": [150, 200, 350, 300],
+                "render_mode": "source_clip",
+            },
+            {
+                **self.unit("caption", 3, "caption", "Figure 6.1: Curve"),
+                "page": 1,
+                "bbox": [150, 310, 350, 325],
+            },
+        ]
+        layout = prepare_paper.build_visual_layout(
+            document,
+            elements,
+            [{"page": 1, "width": 600, "height": 800}],
+            "hash",
+        )
+        self.assertEqual(
+            layout["visuals"][0]["scale_basis"], "source-width-ratio"
+        )
+        self.assertTrue(layout["visuals"][0]["automatic_fallback"])
+        self.assertEqual(len(layout["warnings"]), 1)
+        document.close()
+
+    def test_visual_inventory_rejects_missing_and_duplicate_visuals(self) -> None:
+        document = pymupdf.open()
+        document.new_page(width=600, height=800)
+        elements = [
+            {
+                **self.unit(f"caption-{index}", index, "caption", "Table 6.3"),
+                "page": 1,
+                "bbox": [100, 100 + index * 20, 250, 115 + index * 20],
+            }
+            for index in (1, 2)
+        ]
+        layout = prepare_paper.build_visual_layout(
+            document,
+            elements,
+            [{"page": 1, "width": 600, "height": 800}],
+            "hash",
+        )
+        self.assertEqual(layout["status"], "fail")
+        self.assertTrue(any("occurs 2 times" in item for item in layout["errors"]))
+        self.assertTrue(any("no source visual" in item for item in layout["errors"]))
+        document.close()
+
+    def test_math_fragment_includes_big_o_parentheses_and_is_not_bold(self) -> None:
+        source = "Runtime is O(√p)."
+        spans = [
+            {
+                "text": "Runtime is ",
+                "font": "Times-Roman",
+                "size": 10.0,
+                "flags": 0,
+                "style": "text",
+                "origin": [0, 10],
+                "bbox": [0, 0, 55, 12],
+                "line": 0,
+                "span": 0,
+            },
+            {
+                "text": "√p",
+                "font": "CMBX10",
+                "size": 10.0,
+                "flags": 16,
+                "style": "bold",
+                "origin": [70, 10],
+                "bbox": [70, 0, 82, 12],
+                "line": 0,
+                "span": 1,
+            },
+        ]
+        _, _, fragments, styles = prepare_paper.build_rich_protection(
+            source, spans
+        )
+        self.assertEqual(
+            [item["text"] for item in fragments.values()], ["O(√p)"]
+        )
+        self.assertEqual(styles, {})
+
+    def test_footnote_anchor_is_linked_and_rendered_at_marker(self) -> None:
+        anchor = {
+            **self.unit("body", 1, "body", "Claim 1"),
+            "page": 1,
+            "translatable": True,
+            "inline_fragments": {
+                "[[Fbody_0001]]": {
+                    "kind": "footnote-marker",
+                    "text": "1",
+                    "token": "[[Fbody_0001]]",
+                }
+            },
+        }
+        footnote = {
+            **self.unit("fn", 2, "footnote", "1 Note"),
+            "page": 1,
+            "translatable": True,
+            "inline_fragments": {},
+        }
+        result = prepare_paper.link_footnote_anchors([anchor, footnote])
+        self.assertEqual(result["linked"], 1)
+        self.assertEqual(footnote["anchor_id"], "body")
+        node = {
+            "id": "body",
+            "text": "论断[[Fbody_0001]]。",
+            "element": anchor,
+        }
+        rendered = native_latex.rich_text_to_latex(
+            node,
+            {},
+            Counter(),
+            footnotes_by_id={"fn": "页底注"},
+        )
+        self.assertIn(r"\footnote{\fontsize{8.5pt}{11pt}\selectfont 页底注}", rendered)
+        self.assertNotIn(r"\textsuperscript", rendered)
+
     @staticmethod
     def unit(
         unit_id: str, order: int, kind: str, source_text: str
