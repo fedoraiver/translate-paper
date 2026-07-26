@@ -28,10 +28,12 @@ import statistics
 import subprocess
 import sys
 import unicodedata
+from collections import Counter
 from pathlib import Path
 from typing import Any, Iterable
 
 import pymupdf
+from typography import ZH_ACADEMIC_V1
 
 
 INTRO_RE = re.compile(
@@ -51,7 +53,8 @@ STOP_RE = re.compile(
     re.IGNORECASE,
 )
 CAPTION_RE = re.compile(
-    r"^\s*(?:figure|fig\.?|table|algorithm|listing|图|表|算法)\s*[A-Z]?\d+",
+    r"^\s*(?:figure|fig\.?|table|algorithm|listing|图|表|算法)"
+    r"\s*[A-Z]?\d+(?:\.\d+)*",
     re.IGNORECASE,
 )
 CAPTION_NARRATIVE_RE = re.compile(
@@ -94,6 +97,13 @@ PROTECTED_RE = re.compile(
     r"kHz|MHz|GHz|B|KB|MB|GB|TB|m|cm|mm|km|kg|g|mg|USD|USDC|"
     r"bps|bp|dB|°C|K))?(?![A-Za-z])"
 )
+VISUAL_LABEL_RE = re.compile(
+    r"(?:(?:\b(?P<latin_kind>figure|fig\.?|table))|"
+    r"(?P<cjk_kind>图|表))\s*"
+    r"(?P<number>[A-Z]?\d+(?:\.\d+)*)",
+    re.IGNORECASE,
+)
+FOOTNOTE_PREFIX_RE = re.compile(r"^\s*(?P<number>\d{1,2}|[*⋆†‡])(?=\s|\D)")
 
 
 def parse_args() -> argparse.Namespace:
@@ -181,6 +191,150 @@ def intersection_ratio(a: pymupdf.Rect, b: pymupdf.Rect) -> float:
     if intersection.is_empty or a.get_area() <= 0:
         return 0.0
     return intersection.get_area() / a.get_area()
+
+
+def page_drawing_rects(page: pymupdf.Page) -> list[pymupdf.Rect]:
+    rects: list[pymupdf.Rect] = []
+    for drawing in page.get_drawings():
+        rect = pymupdf.Rect(drawing.get("rect") or [])
+        if not rect.is_empty and rect.width > 0 and rect.height >= 0:
+            rects.append(rect & page.rect)
+    return [rect for rect in rects if not rect.is_empty]
+
+
+def mark_page_footnotes(
+    elements: list[dict[str, Any]],
+    drawing_rects: list[pymupdf.Rect],
+    page_rect: pymupdf.Rect,
+    body_size: float,
+) -> None:
+    separators = [
+        rect
+        for rect in drawing_rects
+        if rect.y0 >= page_rect.height * 0.52
+        and rect.height <= 2.0
+        and 18.0 <= rect.width <= page_rect.width * 0.65
+    ]
+    separator_y = min((rect.y0 for rect in separators), default=None)
+    for element in elements:
+        if element.get("kind") not in {"body", "footnote"}:
+            continue
+        rect = pymupdf.Rect(element["bbox"])
+        text = str(element.get("source_text") or "")
+        below_rule = separator_y is not None and rect.y0 >= separator_y - 1.0
+        marker_like = bool(FOOTNOTE_PREFIX_RE.match(text))
+        at_page_foot = rect.y0 >= page_rect.height * 0.70
+        small_enough = float(element.get("font_size") or body_size) <= body_size * 1.05
+        if small_enough and (below_rule or (at_page_foot and marker_like)):
+            element["kind"] = "footnote"
+            element["render_mode"] = "text"
+            if separator_y is not None:
+                element["source_footnote_separator_y"] = round(
+                    float(separator_y), 3
+                )
+
+
+def add_vector_figure_candidates(
+    elements: list[dict[str, Any]],
+    drawing_rects: list[pymupdf.Rect],
+    page_rect: pymupdf.Rect,
+    page_number: int,
+    body_size: float,
+) -> None:
+    """Recover vector-only figures that expose no raster image block."""
+    captions = [
+        element
+        for element in elements
+        if element.get("kind") == "caption"
+        and re.match(
+            r"^\s*(?:(?:figure|fig\.?)\b|图)",
+            str(element.get("source_text") or ""),
+            re.IGNORECASE,
+        )
+    ]
+    existing = [
+        pymupdf.Rect(element["bbox"])
+        for element in elements
+        if element.get("kind") == "figure"
+    ]
+    components = [
+        rect
+        for rect in drawing_rects
+        if rect.width >= 4.0
+        and rect.height >= 4.0
+        and rect.get_area() >= 20.0
+    ]
+    for caption_index, caption in enumerate(captions, start=1):
+        caption_rect = pymupdf.Rect(caption["bbox"])
+        if any(
+            candidate.y0 <= caption_rect.y0
+            and caption_rect.y0 - candidate.y1 <= page_rect.height * 0.12
+            for candidate in existing
+        ):
+            continue
+        window_top = max(page_rect.y0, caption_rect.y0 - page_rect.height * 0.48)
+        candidates = [
+            rect
+            for rect in components
+            if rect.y0 >= window_top
+            and rect.y1 <= caption_rect.y0 + 2.0
+            and rect.x1 >= page_rect.x0 + page_rect.width * 0.04
+            and rect.x0 <= page_rect.x1 - page_rect.width * 0.04
+        ]
+        if not candidates:
+            continue
+        visual = pymupdf.Rect(candidates[0])
+        for rect in candidates[1:]:
+            visual |= rect
+        label_window = pymupdf.Rect(
+            max(page_rect.x0, visual.x0 - body_size * 2.0),
+            max(window_top, visual.y0 - body_size * 2.0),
+            min(page_rect.x1, visual.x1 + body_size * 2.0),
+            min(caption_rect.y0, visual.y1 + body_size * 2.0),
+        )
+        internal_labels = [
+            element
+            for element in elements
+            if element is not caption
+            and element.get("kind") in {"body", "figure-text"}
+            and float(element.get("font_size") or body_size)
+            <= body_size * 1.05
+            and pymupdf.Point(
+                (
+                    pymupdf.Rect(element["bbox"]).x0
+                    + pymupdf.Rect(element["bbox"]).x1
+                )
+                / 2,
+                (
+                    pymupdf.Rect(element["bbox"]).y0
+                    + pymupdf.Rect(element["bbox"]).y1
+                )
+                / 2,
+            )
+            in label_window
+        ]
+        for label in internal_labels:
+            visual |= pymupdf.Rect(label["bbox"])
+            label["kind"] = "figure-text"
+            label["render_mode"] = "source_clip"
+        if visual.get_area() < page_rect.get_area() * 0.003:
+            continue
+        elements.append(
+            {
+                "page": page_number,
+                "bbox": rect_list(visual),
+                "kind": "figure",
+                "render_mode": "source_clip",
+                "source_text": "",
+                "font_size": body_size,
+                "font_names": [],
+                "confidence": 1.0,
+                "source_ref": (
+                    f"vector-figure-{page_number}-{caption_index}"
+                ),
+            }
+        )
+        existing.append(visual)
 
 
 def normalized_heading(text: str) -> str:
@@ -789,6 +943,7 @@ def extract_text_page(
         if block.get("type") == 1
         and pymupdf.Rect(block["bbox"]).get_area() >= page.rect.get_area() * 0.002
     ]
+    drawing_rects = page_drawing_rects(page)
 
     elements: list[dict[str, Any]] = []
     for index, table_rect in enumerate(table_rects, start=1):
@@ -853,6 +1008,15 @@ def extract_text_page(
                 "confidence": 1.0,
             }
         )
+
+    mark_page_footnotes(elements, drawing_rects, page.rect, body_size)
+    add_vector_figure_candidates(
+        elements,
+        drawing_rects,
+        page.rect,
+        page_number,
+        body_size,
+    )
 
     # A composite vector figure may be represented by several small image
     # blocks, leaving a central label outside every individual rectangle.
@@ -1189,7 +1353,7 @@ def apply_translation_boundary(
         translatable = (
             active
             and element["render_mode"] == "text"
-            and element["kind"] in {"heading", "body"}
+            and element["kind"] in {"heading", "body", "footnote"}
         )
         element["translatable"] = translatable
         element["section"] = current_section
@@ -1567,6 +1731,292 @@ def build_math_review(
     }
 
 
+def link_footnote_anchors(
+    elements: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Link each page-bottom footnote to the nearest matching superscript."""
+    anchors: dict[tuple[int, str], list[tuple[int, dict[str, Any], str]]] = {}
+    for element in elements:
+        if not element.get("translatable"):
+            continue
+        for token, fragment in dict(
+            element.get("inline_fragments") or {}
+        ).items():
+            if fragment.get("kind") != "footnote-marker":
+                continue
+            number = str(fragment.get("text") or "").strip()
+            anchors.setdefault((int(element["page"]), number), []).append(
+                (int(element["order"]), element, token)
+            )
+
+    linked = 0
+    warnings: list[str] = []
+    used: set[tuple[str, str]] = set()
+    for footnote in elements:
+        if footnote.get("kind") != "footnote":
+            continue
+        text = str(footnote.get("source_text") or "")
+        prefix = FOOTNOTE_PREFIX_RE.match(text)
+        number = prefix.group("number") if prefix else ""
+        footnote["footnote_number"] = number or None
+        candidates = [
+            candidate
+            for candidate in anchors.get((int(footnote["page"]), number), [])
+            if candidate[0] < int(footnote["order"])
+            and (str(candidate[1]["id"]), candidate[2]) not in used
+        ]
+        if not candidates:
+            warnings.append(
+                f"{footnote['id']}: no same-page footnote anchor was found."
+            )
+            continue
+        _, anchor, token = max(candidates, key=lambda item: item[0])
+        footnote["anchor_id"] = str(anchor["id"])
+        footnote["anchor_token"] = token
+        fragment = dict(anchor["inline_fragments"][token])
+        fragment["footnote_id"] = str(footnote["id"])
+        anchor["inline_fragments"][token] = fragment
+        used.add((str(anchor["id"]), token))
+        linked += 1
+    return {
+        "footnotes": sum(
+            element.get("kind") == "footnote" for element in elements
+        ),
+        "linked": linked,
+        "warnings": warnings,
+    }
+
+
+def visual_label(text: str) -> tuple[str, str] | None:
+    match = VISUAL_LABEL_RE.search(text)
+    if not match:
+        return None
+    raw_kind = str(
+        match.group("latin_kind") or match.group("cjk_kind") or ""
+    ).casefold()
+    kind = "table" if raw_kind in {"table", "表"} else "figure"
+    number = str(match.group("number")).upper()
+    return kind, f"{kind}-{number}"
+
+
+def source_body_font_size(elements: list[dict[str, Any]]) -> float:
+    sizes = [
+        float(element.get("font_size") or 0.0)
+        for element in elements
+        if element.get("kind") == "body"
+        and float(element.get("font_size") or 0.0) > 0
+        and element.get("render_mode") == "text"
+    ]
+    return statistics.median(sizes) if sizes else 10.0
+
+
+def visual_internal_font_size(
+    document: pymupdf.Document,
+    page_number: int,
+    visual_rect: pymupdf.Rect,
+) -> float | None:
+    """Return the character-weighted dominant font size inside a visual."""
+    weighted: dict[float, int] = {}
+    raw = document[page_number - 1].get_text(
+        "dict", clip=visual_rect, sort=True
+    )
+    for block in raw.get("blocks", []):
+        if block.get("type") != 0:
+            continue
+        for line in block.get("lines", []):
+            for span in line.get("spans", []):
+                text = re.sub(r"\s+", "", str(span.get("text") or ""))
+                size = round(float(span.get("size") or 0.0), 2)
+                if text and size > 0:
+                    weighted[size] = weighted.get(size, 0) + len(text)
+    if not weighted:
+        return None
+    return max(weighted.items(), key=lambda item: (item[1], item[0]))[0]
+
+
+def _source_content_width(
+    page_record: dict[str, Any],
+    elements: list[dict[str, Any]],
+) -> float:
+    page_number = int(page_record["page"])
+    widths = [
+        pymupdf.Rect(element["bbox"]).width
+        for element in elements
+        if int(element["page"]) == page_number
+        and element.get("render_mode") == "text"
+        and element.get("kind") in {"body", "heading", "caption"}
+        and pymupdf.Rect(element["bbox"]).width > 0
+    ]
+    return max(widths) if widths else float(page_record["width"]) * 0.86
+
+
+def build_visual_layout(
+    document: pymupdf.Document,
+    elements: list[dict[str, Any]],
+    page_records: list[dict[str, Any]],
+    source_sha256: str,
+) -> dict[str, Any]:
+    """Build a hash-bound figure/table inventory and calibrated target sizes."""
+    page_map = {int(record["page"]): record for record in page_records}
+    body_size = source_body_font_size(elements)
+    output_width = (
+        595.276 - ZH_ACADEMIC_V1.margin_left - ZH_ACADEMIC_V1.margin_right
+    )
+    output_height = (
+        841.89 - ZH_ACADEMIC_V1.margin_top - ZH_ACADEMIC_V1.margin_bottom
+    )
+    captions = [
+        element
+        for element in elements
+        if element.get("kind") == "caption"
+        and visual_label(str(element.get("source_text") or ""))
+    ]
+    candidates = [
+        element
+        for element in elements
+        if element.get("kind") in {"figure", "table"}
+        and element.get("render_mode") == "source_clip"
+    ]
+    warnings: list[str] = []
+    errors: list[str] = []
+    label_counts = Counter(
+        visual_label(str(caption.get("source_text") or ""))[1]
+        for caption in captions
+    )
+    for label, count in sorted(label_counts.items()):
+        if count != 1:
+            errors.append(f"{label}: source caption occurs {count} times.")
+
+    used: set[str] = set()
+    visuals: list[dict[str, Any]] = []
+    for caption in captions:
+        caption_kind, label = visual_label(
+            str(caption.get("source_text") or "")
+        ) or ("figure", "")
+        page_number = int(caption["page"])
+        caption_rect = pymupdf.Rect(caption["bbox"])
+        same_page = [
+            candidate
+            for candidate in candidates
+            if str(candidate["id"]) not in used
+            and int(candidate["page"]) == page_number
+            and (
+                candidate.get("kind") == caption_kind
+                or caption_kind == "figure"
+            )
+        ]
+        if not same_page:
+            errors.append(f"{label}: caption has no source visual object.")
+            continue
+        visual = min(
+            same_page,
+            key=lambda item: min(
+                abs(pymupdf.Rect(item["bbox"]).y1 - caption_rect.y0),
+                abs(pymupdf.Rect(item["bbox"]).y0 - caption_rect.y1),
+            ),
+        )
+        used.add(str(visual["id"]))
+        visual_rect = pymupdf.Rect(visual["bbox"])
+        visual_parts = [
+            element
+            for element in elements
+            if int(element["page"]) == page_number
+            and element.get("render_mode") == "source_clip"
+            and element.get("kind") != "equation"
+            and (
+                element is visual
+                or intersection_ratio(
+                    pymupdf.Rect(element["bbox"]), visual_rect
+                )
+                >= 0.5
+            )
+        ]
+        for part in visual_parts:
+            visual_rect |= pymupdf.Rect(part["bbox"])
+            if part in candidates:
+                used.add(str(part["id"]))
+        visual["bbox"] = rect_list(visual_rect)
+        internal_size = visual_internal_font_size(
+            document, page_number, visual_rect
+        )
+        source_width = _source_content_width(page_map[page_number], elements)
+        if internal_size is not None:
+            scale = ZH_ACADEMIC_V1.body_font_size / body_size
+            target_internal = internal_size * scale
+            basis = "internal-font-ratio"
+            fallback = False
+        else:
+            scale = output_width / max(source_width, 1.0)
+            target_internal = None
+            basis = "source-width-ratio"
+            fallback = True
+            warnings.append(
+                f"{label}: internal font size was unavailable; "
+                "used source visual/content width ratio."
+            )
+        target_width = min(output_width, visual_rect.width * scale)
+        target_height = target_width * visual_rect.height / max(
+            visual_rect.width, 1.0
+        )
+        if target_height > output_height * 0.72:
+            height_scale = output_height * 0.72 / target_height
+            target_width *= height_scale
+            target_height *= height_scale
+            scale *= height_scale
+            if target_internal is not None:
+                target_internal *= height_scale
+        visual_id = label
+        entry = {
+            "visual_id": visual_id,
+            "label": label,
+            "kind": caption_kind,
+            "page": page_number,
+            "source_ids": [str(part["id"]) for part in visual_parts],
+            "caption_id": str(caption["id"]),
+            "source_bbox": rect_list(visual_rect),
+            "source_body_font_pt": round(body_size, 3),
+            "source_internal_font_pt": (
+                round(internal_size, 3) if internal_size is not None else None
+            ),
+            "target_internal_font_pt": (
+                round(target_internal, 3)
+                if target_internal is not None
+                else None
+            ),
+            "target_width_pt": round(target_width, 3),
+            "target_height_pt": round(target_height, 3),
+            "target_scale": round(scale, 6),
+            "aspect_ratio": round(
+                visual_rect.width / max(visual_rect.height, 1.0), 6
+            ),
+            "scale_basis": basis,
+            "automatic_fallback": fallback,
+        }
+        visuals.append(entry)
+        for element in [*visual_parts, caption]:
+            element["visual_id"] = visual_id
+        visual["visual_layout"] = entry
+
+    for candidate in candidates:
+        if str(candidate["id"]) in used:
+            continue
+        candidate["visual_id"] = f"unlabelled-{candidate['id']}"
+        errors.append(
+            f"{candidate['id']}: source visual has no unique numbered caption."
+        )
+    return {
+        "schema_version": 1,
+        "source_sha256": source_sha256,
+        "typography_profile": ZH_ACADEMIC_V1.name,
+        "source_body_font_pt": round(body_size, 3),
+        "output_body_font_pt": ZH_ACADEMIC_V1.body_font_size,
+        "status": "pass" if not errors else "fail",
+        "warnings": warnings,
+        "errors": errors,
+        "visuals": visuals,
+    }
+
+
 def main() -> int:
     args = parse_args()
     source = args.input.expanduser().resolve()
@@ -1690,6 +2140,15 @@ def main() -> int:
         existing_math_review,
     )
     json_dump(math_review_path, math_review)
+    footnote_links = link_footnote_anchors(all_elements)
+    visual_layout = build_visual_layout(
+        document,
+        all_elements,
+        page_records,
+        source_hash_before,
+    )
+    visual_layout_path = work_dir / "visual-layout.json"
+    json_dump(visual_layout_path, visual_layout)
     units_path = work_dir / "translation-units.jsonl"
     template_path = work_dir / "translations.template.jsonl"
     write_jsonl(units_path, all_elements)
@@ -1719,7 +2178,7 @@ def main() -> int:
         raise RuntimeError("Source PDF hash changed during preparation.")
 
     manifest = {
-        "schema_version": 4,
+        "schema_version": 5,
         "created_by": "prepare_paper.py",
         "translation_engine": "active-codex-model-only",
         "source_pdf": str(source),
@@ -1744,6 +2203,7 @@ def main() -> int:
             "source_preview": "source-preview",
             "boundary_review": str(review_path),
             "math_review": math_review_path.name,
+            "visual_layout": visual_layout_path.name,
         },
         "tools": {
             "layout_extractor": layout_tool,
@@ -1775,10 +2235,29 @@ def main() -> int:
                     ),
                     "One or more mathematical fragments require native-TeX review.",
                 ),
+                (
+                    bool(footnote_links["warnings"]),
+                    "One or more footnotes lack a same-page source anchor.",
+                ),
+                (
+                    bool(visual_layout["warnings"]),
+                    "One or more visuals used source-width fallback sizing.",
+                ),
+                (
+                    visual_layout["status"] != "pass",
+                    "The source visual inventory has blocking errors.",
+                ),
             )
             if condition
         ],
         "rich_math_profile": "native-lualatex-v1",
+        "visual_inventory": {
+            "status": visual_layout["status"],
+            "count": len(visual_layout["visuals"]),
+            "warnings": len(visual_layout["warnings"]),
+            "errors": len(visual_layout["errors"]),
+        },
+        "footnotes": footnote_links,
     }
     json_dump(work_dir / "manifest.json", manifest)
     print(json.dumps(manifest, ensure_ascii=False, indent=2))

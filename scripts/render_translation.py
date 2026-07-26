@@ -729,6 +729,24 @@ def build_flow_nodes(
                 nodes
                 and nodes[-1].get("render_mode") == "source_clip"
                 and int(nodes[-1]["element"]["page"]) == int(element["page"])
+                and (
+                    (
+                        element.get("visual_id")
+                        and element.get("visual_id")
+                        == nodes[-1]["element"].get("visual_id")
+                    )
+                    or (
+                        not element.get("visual_id")
+                        and not nodes[-1]["element"].get("visual_id")
+                    )
+                )
+                and (
+                    any(
+                        str(part.get("kind") or "") == "equation"
+                        for part in nodes[-1].get("elements", [])
+                    )
+                )
+                == (str(element.get("kind") or "") == "equation")
             ):
                 previous = nodes[-1]
                 union = pymupdf.Rect(previous["element"]["bbox"])
@@ -1759,7 +1777,9 @@ class FlowRenderer:
             self.place_text(node)
             self.placements[-1]["footnote_location"] = "end-of-body"
 
-    def place_source_clip(self, node: dict[str, Any]) -> None:
+    def place_source_clip(
+        self, node: dict[str, Any], keep_with_height: float = 0.0
+    ) -> None:
         element = node["element"]
         clip, target_width, target_height, full_width = (
             self.source_clip_geometry(node)
@@ -1771,7 +1791,11 @@ class FlowRenderer:
                 self.column != 0 or self.y > self.margin_top + 1
             ):
                 self.new_page()
-        self.ensure_space(target_height)
+        self.ensure_space(
+            target_height
+            + keep_with_height
+            + (2.0 if keep_with_height else 0.0)
+        )
         assert self.page is not None
         target = pymupdf.Rect(
             self.column_x(),
@@ -1949,7 +1973,17 @@ def main() -> int:
         translation_page_start = renderer.page.number + 1
         for index, node in enumerate(nodes):
             if node["render_mode"] == "source_clip":
-                renderer.place_source_clip(node)
+                keep_with_height = 0.0
+                if index + 1 < len(nodes):
+                    next_node = nodes[index + 1]
+                    if (
+                        next_node["render_mode"] == "text"
+                        and next_node["element"]["kind"] == "caption"
+                    ):
+                        keep_with_height = renderer.measure_text_height(
+                            next_node
+                        )
+                renderer.place_source_clip(node, keep_with_height)
             elif node["flow_role"] == "footnote":
                 renderer.place_footnote(node)
             else:

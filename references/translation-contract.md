@@ -64,6 +64,9 @@ deterministically.
 - `translations.template.jsonl`: empty translation checkpoints;
 - `math-review.json`: hash-bound native TeX and review status for ambiguous
   inline fragments and every logical display equation;
+- `visual-layout.json`: source-hash-bound figure/table inventory, complete
+  source visual bounds, caption association, source and target typography,
+  target dimensions, aspect ratio, scale basis, and automatic fallback state;
 - `glossary.json`: persistent terminology map;
 - source previews and layout-aware extracted text.
 
@@ -78,10 +81,28 @@ boundaries are uncertain, columns mix with full-width content, or equations and
 captions are misclassified.
 
 Use `source_clip` for figures, complex tables, captions, and damaged
-non-mathematical OCR regions that must remain visually identical. Treat a multi-fragment vector
-figure and its internal labels as one visual envelope. After rendering, inspect
-the contact sheet plus high-resolution pages containing source clips; automated
-text checks cannot detect every fragmented or split figure.
+non-mathematical OCR regions that must remain visually identical. Treat a
+multi-fragment vector figure, its drawing primitives, and its internal labels
+as one visual envelope, with its caption associated but not absorbed into an
+adjacent formula. Every numbered source figure/table must have one unique
+inventory entry and exactly one rendered placement. A missing, duplicate,
+cropped, distorted, or split visual is a blocking error.
+
+Calibrate visual size from the type inside the object:
+
+`target internal font = source internal font / source body font × 11.5pt`.
+
+Apply the resulting scale to both dimensions, center the vector object, and
+shrink it only when it exceeds the content box. Never expand every visual to
+`\linewidth`. If internal font size cannot be measured, preserve the source
+visual/content-width ratio in the target content area, record
+`automatic_fallback: true`, and emit a warning. This fallback does not permit a
+missing or duplicate object.
+
+After rendering, perform two visual reviews: first inspect the full contact
+sheet for global pagination, then inspect at high resolution every page with a
+figure, table, footnote, equation, mixed columns, or multiple source clips.
+Compare the source and output inventories during the second pass.
 
 Retain source span typography in translatable prose. Render source bold and
 italic emphasis on the translated equivalent. Detect numeric bracket citations

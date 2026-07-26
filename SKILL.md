@@ -41,9 +41,22 @@ uv run --script <skill-dir>\scripts\prepare_paper.py `
   --ocr auto
 ```
 
-Inspect `manifest.json`, `translation-units.jsonl`, `layout.txt`, and all source
-previews. Verify reading order, the Introduction start, the last main-section
-end, and the first excluded heading.
+Inspect `manifest.json`, `visual-layout.json`, `translation-units.jsonl`,
+`layout.txt`, and all source previews. Verify reading order, the Introduction
+start, the last main-section end, and the first excluded heading. Require one
+unique inventory entry for every numbered figure and table. Missing, duplicate,
+cropped, or malformed visual objects are blocking errors.
+
+For each visual, verify that `visual-layout.json` records the complete vector
+envelope (drawing, internal labels, and caption association), source hash,
+source body/internal font sizes, target dimensions, aspect ratio, and scale
+basis. Size by typography:
+
+`target internal font = source internal font / source body font × 11.5pt`.
+
+When internal font size cannot be measured, automatically continue using the
+source visual/content-width ratio and retain the generated warning. This is the
+only sizing fallback; a missing or duplicate visual never falls back.
 
 Inspect `math-review.json`. Every inline mathematical fragment must contain
 valid TeX and a review status. Reconstruct each display equation as one logical
@@ -154,12 +167,13 @@ uv run --script <skill-dir>\scripts\check_translation.py `
   --preview-dir <work-dir>\translated-preview
 ```
 
-Require a passing report, then inspect the full contact sheet. Also inspect at
-readable resolution every page containing figures, tables, equations, mixed
-one/two-column layout, or multiple source clips. A passing automated report
-does not prove that a composite figure stayed together. Fix clipping, overlap,
-fragmented visuals, missing glyphs, malformed citations, or untranslated body
-before continuing. Confirm that the layout report names
+Require a passing report, then conduct two visual passes: inspect the full
+contact sheet for global pagination and inspect at readable resolution every
+page containing figures, tables, footnotes, equations, mixed one/two-column
+layout, or multiple source clips. Compare the source and output visual
+inventories in the second pass. Fix clipping, overlap, fragmentation,
+distortion, caption splitting, missing glyphs, malformed citations, or
+untranslated body before continuing. Confirm that the layout report names
 `native-lualatex-v1`, `zh-academic-v1`, SimSun, SimHei, Latin Modern Roman,
 and Latin Modern Math; do not accept Microsoft YaHei for translated Chinese
 text or SimSun for translated English prose. Require `native-font` for every

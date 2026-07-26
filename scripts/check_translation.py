@@ -905,6 +905,111 @@ def validate_boundary_layout(
     return errors, metrics
 
 
+def validate_visual_layout(
+    manifest: dict[str, Any],
+    manifest_path: Path,
+    layout: dict[str, Any] | None,
+    output_document: pymupdf.Document,
+) -> tuple[list[str], list[str], dict[str, Any]]:
+    """Compare the hash-bound source inventory with rendered visual geometry."""
+    errors: list[str] = []
+    warnings: list[str] = []
+    path_name = str((manifest.get("paths") or {}).get("visual_layout") or "")
+    if not path_name:
+        if int(manifest.get("schema_version") or 0) >= 5:
+            errors.append("Schema-v5 manifest has no paths.visual_layout.")
+        return errors, warnings, {"status": "not-available"}
+    path = manifest_path.parent / path_name
+    if not path.exists():
+        return [f"Visual layout inventory is missing: {path}"], warnings, {}
+    try:
+        inventory = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        return [f"Visual layout inventory could not be read: {error}"], warnings, {}
+    if inventory.get("source_sha256") != manifest.get("source_sha256"):
+        errors.append("Visual layout inventory source hash differs from manifest.")
+    errors.extend(str(item) for item in inventory.get("errors") or [])
+    warnings.extend(str(item) for item in inventory.get("warnings") or [])
+    expected = {
+        str(item["visual_id"]): dict(item)
+        for item in inventory.get("visuals") or []
+        if isinstance(item, dict) and item.get("visual_id")
+    }
+    visual_report = dict((layout or {}).get("visual_layout") or {})
+    actual_items = list(visual_report.get("placements") or [])
+    actual: dict[str, list[dict[str, Any]]] = {}
+    for item in actual_items:
+        actual.setdefault(str(item.get("visual_id") or ""), []).append(item)
+    placements = {
+        str(unit_id): item
+        for item in (layout or {}).get("placements") or []
+        for unit_id in item.get("ids") or [item.get("id")]
+        if unit_id
+    }
+    checked = 0
+    fallback_count = 0
+    for visual_id, source_item in expected.items():
+        rendered = actual.get(visual_id, [])
+        if len(rendered) != 1:
+            errors.append(
+                f"{visual_id}: expected one rendered visual, found {len(rendered)}."
+            )
+            continue
+        item = rendered[0]
+        checked += 1
+        fallback_count += int(bool(source_item.get("automatic_fallback")))
+        width = float(item.get("target_width_pt") or 0.0)
+        height = float(item.get("target_height_pt") or 0.0)
+        expected_width = float(source_item.get("target_width_pt") or 0.0)
+        if expected_width and abs(width - expected_width) > 0.6:
+            errors.append(
+                f"{visual_id}: rendered width {width:.2f}pt differs from "
+                f"target {expected_width:.2f}pt."
+            )
+        expected_ratio = float(source_item.get("aspect_ratio") or 0.0)
+        actual_ratio = width / height if height > 0 else 0.0
+        if expected_ratio and abs(actual_ratio - expected_ratio) > 0.003:
+            errors.append(f"{visual_id}: rendered aspect ratio changed.")
+        bbox = pymupdf.Rect(item.get("bbox") or [])
+        page_number = int(item.get("output_page") or 0)
+        if page_number < 1 or page_number > len(output_document):
+            errors.append(f"{visual_id}: output page is invalid.")
+        elif (
+            bbox.x0 < ZH_ACADEMIC_V1.margin_left - 0.6
+            or bbox.x1
+            > output_document[page_number - 1].rect.width
+            - ZH_ACADEMIC_V1.margin_right
+            + 0.6
+        ):
+            errors.append(f"{visual_id}: rendered visual exceeds content width.")
+        caption = placements.get(str(source_item.get("caption_id") or ""))
+        if not caption:
+            errors.append(f"{visual_id}: caption placement is missing.")
+        elif int(caption.get("output_page") or 0) != page_number:
+            errors.append(f"{visual_id}: visual and caption are on different pages.")
+        source_internal = source_item.get("source_internal_font_pt")
+        target_internal = source_item.get("target_internal_font_pt")
+        if source_internal is not None and target_internal is not None:
+            actual_internal = float(source_internal) * float(
+                item.get("actual_scale") or 0.0
+            )
+            if abs(actual_internal - float(target_internal)) > 0.2:
+                errors.append(
+                    f"{visual_id}: internal font calibration differs by "
+                    f"{abs(actual_internal - float(target_internal)):.2f}pt."
+                )
+    extra = sorted(set(actual) - set(expected) - {""})
+    if extra:
+        errors.append("Unexpected rendered visuals: " + ", ".join(extra))
+    return errors, warnings, {
+        "status": "pass" if not errors else "fail",
+        "inventory_path": str(path),
+        "expected": len(expected),
+        "checked": checked,
+        "automatic_fallbacks": fallback_count,
+    }
+
+
 def main() -> int:
     args = parse_args()
     source = args.source.expanduser().resolve()
@@ -1038,6 +1143,7 @@ def main() -> int:
     output_page_count = 0
     typography_metrics: dict[str, Any] = {}
     boundary_metrics: dict[str, Any] = {}
+    visual_metrics: dict[str, Any] = {}
     layout_path = translated.with_suffix(".layout.json")
     layout: dict[str, Any] | None = None
     if layout_path.exists():
@@ -1157,6 +1263,16 @@ def main() -> int:
                     source_document, output_document, layout
                 )
                 errors.extend(boundary_errors)
+                visual_errors, visual_warnings, visual_metrics = (
+                    validate_visual_layout(
+                        manifest,
+                        manifest_path,
+                        layout,
+                        output_document,
+                    )
+                )
+                errors.extend(visual_errors)
+                warnings.extend(visual_warnings)
             finally:
                 source_document.close()
             output_document.close()
@@ -1207,6 +1323,7 @@ def main() -> int:
             "contact_sheet": str(contact_sheet) if contact_sheet.exists() else None,
             "typography": typography_metrics,
             "boundary_layout": boundary_metrics,
+            "visual_layout": visual_metrics,
             "rich_text": {
                 "inline_fragments": dict(expected_inline),
                 "styles": dict(expected_styles),

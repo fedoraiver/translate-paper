@@ -638,6 +638,44 @@ class PaperPipelineTests(unittest.TestCase):
         renderer.document.close()
         source.close()
 
+    def test_source_clip_stays_with_following_caption(self) -> None:
+        source = pymupdf.open()
+        source.new_page(width=595.28, height=841.89)
+        fonts = render_translation.find_typography_fonts()
+        renderer = render_translation.FlowRenderer(
+            source,
+            595.28,
+            841.89,
+            1,
+            18.0,
+            fonts,
+            render_translation.PROFILE,
+        )
+        element = {
+            "kind": "table",
+            "page": 1,
+            "bbox": [40.0, 40.0, 555.0, 340.0],
+            "translatable": False,
+        }
+        node = {
+            "id": "table",
+            "ids": ["table"],
+            "element": element,
+            "elements": [element],
+            "composite_parts": 1,
+        }
+        clip_height = renderer.measure_source_clip_height(node) - 4.0
+        renderer.y = renderer.bottom - clip_height - 1.0
+        renderer.place_source_clip(node, keep_with_height=20.0)
+        self.assertEqual(renderer.page.number, 1)
+        self.assertAlmostEqual(
+            renderer.placements[-1]["bbox"][1],
+            renderer.margin_top,
+            places=3,
+        )
+        renderer.document.close()
+        source.close()
+
     def test_native_composite_clip_includes_disconnected_content_edge(
         self,
     ) -> None:
@@ -654,6 +692,65 @@ class PaperPipelineTests(unittest.TestCase):
         clip = native_latex._source_clip_rect(page, node)
         self.assertLessEqual(clip.x0, 120.0)
         self.assertGreaterEqual(clip.x1, 595.28 * 0.805)
+        source.close()
+
+    def test_native_source_clip_reserves_space_for_following_caption(
+        self,
+    ) -> None:
+        source = pymupdf.open()
+        source.new_page(width=439.36, height=666.14)
+        table_element = {
+            "kind": "table",
+            "page": 1,
+            "bbox": [7.0, 65.0, 432.0, 303.0],
+            "translatable": False,
+        }
+        table = {
+            "id": "table",
+            "ids": ["table"],
+            "element": table_element,
+            "elements": [table_element],
+            "render_mode": "source_clip",
+            "flow_role": "source-clip",
+            "composite_parts": 1,
+        }
+        caption_element = {
+            "kind": "caption",
+            "page": 1,
+            "bbox": [70.0, 323.0, 369.0, 334.0],
+            "translatable": False,
+            "inline_fragments": {},
+            "style_tokens": {},
+        }
+        caption = {
+            "id": "caption",
+            "ids": ["caption"],
+            "element": caption_element,
+            "elements": [caption_element],
+            "render_mode": "text",
+            "flow_role": "invariant-text",
+            "text": "Table 1: Caption",
+            "joined_continuations": 0,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            tex, _, _ = native_latex.build_body_tex(
+                [table, caption],
+                {},
+                render_translation.PROFILE,
+                source,
+                Path(directory),
+            )
+        table_chunk = tex.split("% TP-NODE table\n", 1)[1].split(
+            "% TP-NODE caption\n", 1
+        )[0]
+        self.assertRegex(
+            table_chunk,
+            r"\\Needspace\{\d+\.\d{2}pt\}\s+\\par\\smallskip",
+        )
+        needspace = native_latex._caption_clip_needspace(
+            source, table, render_translation.PROFILE
+        )
+        self.assertGreater(needspace, 340.0)
         source.close()
 
     def test_native_inline_math_never_uses_an_image_asset(self) -> None:
@@ -926,6 +1023,26 @@ class PaperPipelineTests(unittest.TestCase):
         self.assertEqual(
             nodes[0]["element"]["bbox"], [100.0, 400.0, 300.0, 500.0]
         )
+
+    def test_figure_clip_and_display_equation_do_not_merge(self) -> None:
+        figure = {
+            **self.unit("figure", 1, "figure", ""),
+            "page": 4,
+            "bbox": [80, 80, 360, 250],
+            "render_mode": "source_clip",
+        }
+        equation = {
+            **self.unit("equation", 2, "equation", ""),
+            "page": 4,
+            "bbox": [140, 270, 300, 290],
+            "render_mode": "source_clip",
+        }
+        nodes = render_translation.build_flow_nodes(
+            [figure, equation], {"figure": "", "equation": ""}
+        )
+        self.assertEqual(len(nodes), 2)
+        self.assertEqual(nodes[0]["ids"], ["figure"])
+        self.assertEqual(nodes[1]["ids"], ["equation"])
 
     def test_composite_clip_expands_to_overlapping_vector_artwork(self) -> None:
         class SourcePage:

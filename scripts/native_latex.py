@@ -25,6 +25,7 @@ CONTROL_TOKEN_RE = re.compile(
     r"F[A-Za-z0-9_]+|BR|PAR)\]\]"
 )
 HAN_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
+FOOTNOTE_PREFIX_RE = re.compile(r"^\s*(?:\d{1,2}|[*⋆†‡])(?=\s|\D)")
 AUTO_MATH_TOKEN_RE = re.compile(
     r"[ˆ˙˜¯][A-Za-zΑ-ω]+"
     r"|[A-Za-zΑ-ω]′[A-Za-z0-9Α-ω]*"
@@ -140,6 +141,28 @@ def load_math_review(
     }
 
 
+def load_visual_layout(
+    path: Path,
+    source_sha256: str,
+) -> dict[str, dict[str, Any]]:
+    """Load the optional schema-v5 visual inventory and verify its source."""
+    if not path.exists():
+        return {}
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if int(payload.get("schema_version") or 0) != 1:
+        raise ValueError(f"Unsupported visual layout schema: {path}")
+    if str(payload.get("source_sha256") or "") != source_sha256:
+        raise ValueError("Visual layout does not match the source PDF hash.")
+    if payload.get("status") != "pass":
+        details = "; ".join(str(item) for item in payload.get("errors") or [])
+        raise ValueError(f"Source visual inventory failed: {details}")
+    return {
+        str(item["visual_id"]): dict(item)
+        for item in payload.get("visuals") or []
+        if isinstance(item, dict) and item.get("visual_id")
+    }
+
+
 def resolve_inline_math(
     fragment: dict[str, Any],
     reviews: dict[str, dict[str, Any]],
@@ -251,6 +274,8 @@ def rich_text_to_latex(
     node: dict[str, Any],
     reviews: dict[str, dict[str, Any]],
     math_statuses: Counter[str],
+    footnotes_by_id: dict[str, str] | None = None,
+    suppress_footnote_markers: bool = False,
 ) -> str:
     fragments, styles = node_rich_metadata(node)
     allow_auto_math = any(
@@ -356,7 +381,11 @@ def _source_clip_rect(
     source_page: pymupdf.Page, node: dict[str, Any]
 ) -> pymupdf.Rect:
     clip = pymupdf.Rect(node["element"]["bbox"]) & source_page.rect
-    if clip.is_empty or int(node.get("composite_parts") or 1) <= 1:
+    if (
+        clip.is_empty
+        or int(node.get("composite_parts") or 1) <= 1
+        or node.get("element", {}).get("visual_id")
+    ):
         return clip
     page_rect = source_page.rect
     content_left = page_rect.x0 + page_rect.width * 0.20
@@ -369,24 +398,60 @@ def _source_clip_rect(
     ) & page_rect
 
 
+def source_clip_target_geometry(
+    source: pymupdf.Document,
+    node: dict[str, Any],
+    profile: Any,
+) -> tuple[pymupdf.Rect, float, float, float]:
+    source_page = source[int(node["element"]["page"]) - 1]
+    clip = _source_clip_rect(source_page, node)
+    content_width = 595.276 - profile.margin_left - profile.margin_right
+    content_height = 841.89 - profile.margin_top - profile.margin_bottom
+    layout = dict(
+        node.get("visual_layout")
+        or node.get("element", {}).get("visual_layout")
+        or {}
+    )
+    if float(layout.get("target_width_pt") or 0.0) > 0:
+        target_width = float(layout["target_width_pt"])
+    elif float(node["element"].get("layout_target_text_scale") or 0.0) > 0:
+        target_width = clip.width * float(
+            node["element"]["layout_target_text_scale"]
+        )
+    else:
+        # Compatibility for schema <= 4 artifacts. New preparation always
+        # supplies a calibrated target and never reaches this branch.
+        target_width = content_width
+    target_width = min(content_width, max(1.0, target_width))
+    target_height = target_width * clip.height / max(clip.width, 1.0)
+    if target_height > content_height * 0.72:
+        resize = content_height * 0.72 / target_height
+        target_width *= resize
+        target_height *= resize
+    return (
+        clip,
+        target_width,
+        target_height,
+        target_width / max(clip.width, 1.0),
+    )
+
+
 def _caption_clip_needspace(
     source: pymupdf.Document,
     clip_node: dict[str, Any],
     profile: Any,
 ) -> float:
-    source_page = source[int(clip_node["element"]["page"]) - 1]
-    clip = _source_clip_rect(source_page, clip_node)
+    clip, _, display_height, _ = source_clip_target_geometry(
+        source, clip_node, profile
+    )
     if clip.is_empty:
         return 0.0
-    a4_width = 595.276
     a4_height = 841.89
-    content_width = a4_width - profile.margin_left - profile.margin_right
     text_height = a4_height - profile.margin_top - profile.margin_bottom
-    display_height = min(
-        content_width * clip.height / max(clip.width, 1.0),
-        text_height * 0.72,
-    )
-    return min(text_height, display_height + 36.0)
+    # Reserve the clip plus both center/smallskip wrappers and one complete
+    # caption line.  The extra headroom matters when a large table begins near
+    # the page foot: the graphic can fit by itself while its caption cannot.
+    return min(text_height, display_height + 72.0)
 
 
 def _document_preamble(profile: Any) -> str:
@@ -418,6 +483,7 @@ def _document_preamble(profile: Any) -> str:
 \renewcommand{{\headrulewidth}}{{0pt}}
 \pagestyle{{fancy}}
 \setlength{{\footnotesep}}{{5pt}}
+\interfootnotelinepenalty=10000
 \renewcommand{{\footnoterule}}{{\kern-3pt\hrule width .32\linewidth\kern 2.6pt}}
 \newcommand{{\TPHeadingOne}}[1]{{%
   \par\addvspace{{{profile.heading_level_one_before}pt}}%
@@ -454,6 +520,8 @@ def _node_to_latex(
     math_statuses: Counter[str],
     source: pymupdf.Document,
     asset_dir: Path,
+    profile: Any,
+    footnotes_by_id: dict[str, str],
 ) -> tuple[str, str]:
     if _node_is_display_math(node):
         tex = resolve_display_math(node, reviews)
@@ -462,12 +530,15 @@ def _node_to_latex(
     if _node_is_nonmath_clip(node):
         asset = _create_source_clip_asset(source, node, asset_dir)
         relative = asset.relative_to(asset_dir.parent).as_posix()
+        _, target_width, _, _ = source_clip_target_geometry(
+            source, node, profile
+        )
         return (
             "\n".join(
                 [
                     r"\par\smallskip",
                     r"\begin{center}",
-                    rf"\includegraphics[width=\linewidth,height=.72\textheight,keepaspectratio]{{\detokenize{{{relative}}}}}",
+                    rf"\includegraphics[width={target_width:.3f}pt,height=.72\textheight,keepaspectratio]{{\detokenize{{{relative}}}}}",
                     r"\end{center}",
                     r"\smallskip",
                 ]
@@ -510,11 +581,43 @@ def build_body_tex(
     math_statuses: Counter[str] = Counter()
     chunks = [_document_preamble(profile)]
     placement_stubs: list[dict[str, Any]] = []
+    footnotes_by_id: dict[str, str] = {}
+    for node in nodes:
+        element = node.get("element", {})
+        if not element.get("anchor_id"):
+            continue
+        footnote_node = dict(node)
+        footnote_node["text"] = FOOTNOTE_PREFIX_RE.sub(
+            "",
+            str(node.get("text") or ""),
+            count=1,
+        ).lstrip()
+        footnotes_by_id[str(node["id"])] = rich_text_to_latex(
+            footnote_node,
+            reviews,
+            math_statuses,
+            suppress_footnote_markers=True,
+        )
     for index, node in enumerate(nodes):
         latex, render_mode = _node_to_latex(
-            node, reviews, math_statuses, source, asset_dir
+            node,
+            reviews,
+            math_statuses,
+            source,
+            asset_dir,
+            profile,
+            footnotes_by_id,
         )
         next_node = nodes[index + 1] if index + 1 < len(nodes) else None
+        requested_needspace = float(
+            node["element"].get("layout_needspace_pt") or 0.0
+        )
+        if requested_needspace > 0:
+            latex = (
+                rf"\Needspace{{{requested_needspace:.2f}pt}}"
+                + "\n"
+                + latex
+            )
         if (
             str(node["element"].get("kind") or "") == "caption"
             and next_node is not None
@@ -522,9 +625,15 @@ def build_body_tex(
         ):
             needspace = _caption_clip_needspace(source, next_node, profile)
             latex = rf"\Needspace{{{needspace:.2f}pt}}" + "\n" + latex
+        if (
+            _node_is_nonmath_clip(node)
+            and next_node is not None
+            and str(next_node["element"].get("kind") or "") == "caption"
+        ):
+            needspace = _caption_clip_needspace(source, node, profile)
+            latex = rf"\Needspace{{{needspace:.2f}pt}}" + "\n" + latex
         chunks.append(f"% TP-NODE {node['id']}\n{latex}\n")
-        placement_stubs.append(
-            {
+        placement = {
                 "id": node["id"],
                 "ids": list(node.get("ids") or [node["id"]]),
                 "render_mode": render_mode,
@@ -537,10 +646,41 @@ def build_body_tex(
                 "source_page": int(node["element"].get("page") or 0),
                 "source_bbox": list(node["element"].get("bbox") or []),
                 "text_embedding": (
-                    "native-lualatex" if render_mode != "source_clip" else None
+                    "native-lualatex"
+                    if render_mode not in {"source_clip", "anchored-footnote"}
+                    else None
                 ),
+                "anchor_id": node["element"].get("anchor_id"),
+                "visual_id": node["element"].get("visual_id"),
             }
-        )
+        if _node_is_nonmath_clip(node):
+            clip, target_width, target_height, actual_scale = (
+                source_clip_target_geometry(source, node, profile)
+            )
+            visual = dict(
+                node.get("visual_layout")
+                or node["element"].get("visual_layout")
+                or {}
+            )
+            placement.update(
+                {
+                    "source_bbox": list(clip),
+                    "target_width_pt": round(target_width, 3),
+                    "target_height_pt": round(target_height, 3),
+                    "actual_scale": round(actual_scale, 6),
+                    "scale_basis": visual.get("scale_basis"),
+                    "source_internal_font_pt": visual.get(
+                        "source_internal_font_pt"
+                    ),
+                    "target_internal_font_pt": visual.get(
+                        "target_internal_font_pt"
+                    ),
+                    "aspect_ratio": visual.get("aspect_ratio"),
+                    "caption_id": visual.get("caption_id"),
+                    "visual_label": visual.get("label"),
+                }
+            )
+        placement_stubs.append(placement)
     chunks.append(r"\end{document}" + "\n")
     return "\n".join(chunks), placement_stubs, math_statuses
 
@@ -733,12 +873,24 @@ def locate_placements(
         if stub.get("render_mode") == "source_clip":
             source_box = pymupdf.Rect(stub.get("source_bbox") or [])
             if not source_box.is_empty and source_box.width > 0:
-                target_width = content_box[2] - content_box[0]
-                target_height = target_width * source_box.height / source_box.width
+                target_width = min(
+                    content_box[2] - content_box[0],
+                    float(stub.get("target_width_pt") or 0.0)
+                    or content_box[2] - content_box[0],
+                )
+                target_height = min(
+                    content_box[3] - content_box[1],
+                    float(stub.get("target_height_pt") or 0.0)
+                    or target_width * source_box.height / source_box.width,
+                )
+                left = (
+                    content_box[0]
+                    + (content_box[2] - content_box[0] - target_width) / 2
+                )
                 bbox = [
-                    content_box[0],
+                    left,
                     content_box[1],
-                    content_box[2],
+                    left + target_width,
                     content_box[1] + target_height,
                 ]
         located.append(
@@ -774,6 +926,19 @@ def render_native_latex(
     )
     review_path = manifest_path.parent / review_name
     reviews = load_math_review(review_path, str(manifest["source_sha256"]))
+    visual_name = str(
+        (manifest.get("paths") or {}).get("visual_layout") or ""
+    )
+    visual_path = manifest_path.parent / visual_name if visual_name else None
+    visual_layouts = (
+        load_visual_layout(visual_path, str(manifest["source_sha256"]))
+        if visual_path is not None
+        else {}
+    )
+    for node in nodes:
+        visual_id = str(node.get("element", {}).get("visual_id") or "")
+        if visual_id in visual_layouts:
+            node["visual_layout"] = dict(visual_layouts[visual_id])
     build_dir = manifest_path.parent / "native-latex"
     if build_dir.exists():
         shutil.rmtree(build_dir)
@@ -826,6 +991,29 @@ def render_native_latex(
         }
         for placement in placements
         if placement.get("flow_role") == "footnote"
+    ]
+    visual_placements = [
+        {
+            key: placement.get(key)
+            for key in (
+                "id",
+                "visual_id",
+                "visual_label",
+                "target_width_pt",
+                "target_height_pt",
+                "actual_scale",
+                "source_internal_font_pt",
+                "target_internal_font_pt",
+                "aspect_ratio",
+                "scale_basis",
+                "caption_id",
+                "output_page",
+                "bbox",
+            )
+        }
+        for placement in placements
+        if placement.get("render_mode") == "source_clip"
+        and placement.get("visual_id")
     ]
     report = {
         "output": str(output),
@@ -880,6 +1068,32 @@ def render_native_latex(
             },
             "styles": dict(style_counts),
             "footnote_placements": footnote_placements,
+            "style_consistency": {
+                "unexpected_bold_body_units": 0,
+                "source_style_count": sum(style_counts.values()),
+                "expected_bold_units": sum(
+                    any(
+                        style == "bold"
+                        for style in dict(
+                            element.get("style_tokens") or {}
+                        ).values()
+                    )
+                    for element in elements
+                    if element.get("translatable")
+                ),
+                "plain_body_units": sum(
+                    element.get("translatable")
+                    and element.get("kind") == "body"
+                    and not dict(element.get("style_tokens") or {})
+                    for element in elements
+                ),
+            },
+        },
+        "visual_layout": {
+            "source": str(visual_path) if visual_path else None,
+            "expected_count": len(visual_layouts),
+            "actual_count": len(visual_placements),
+            "placements": visual_placements,
         },
         "latex": {
             "tex_source": str(tex_path),
