@@ -1,5 +1,12 @@
 # Zotero ingestion
 
+## Contents
+
+- Responsibilities, metadata, and readiness
+- Search and guarded replacement
+- Connector ingestion
+- Verification and recovery
+
 Use `$zotero:Zotero` plus the skill-local adapter. Do not use computer-use,
 edit `zotero.sqlite`, or manipulate Zotero storage.
 
@@ -131,11 +138,14 @@ python <skill-dir>\scripts\zotero_ingest.py ingest `
   --target-name "<COLLECTION_NAME>"
 ```
 
-After the preview succeeds, immediately rerun with `--yes-ingest`. The adapter
-must refuse while a matched parent remains, create one session and parent,
-place it in the selected target, upload stored `原文 PDF`, `中文翻译 PDF`, and
-`中文翻译 Markdown`, create the `中文论文总结` child note, and verify the local
-result.
+After the preview succeeds, rerun `targets` immediately before the actual
+ingestion. Confirm that the exact target ID/name pair is still present and
+`filesEditable: true`, then rerun ingestion with the same pair and
+`--yes-ingest`. Do not reuse a target result captured before translation or a
+long batch pause. The adapter must refuse while a matched parent remains,
+create one session and parent, place it in the selected target, upload stored
+`原文 PDF`, `中文翻译 PDF`, and `中文翻译 Markdown`, create the `中文论文总结` child
+note, and verify the local result.
 
 ## Verification and recovery
 
@@ -149,6 +159,11 @@ Require exactly one parent, one stored attachment with each required title
 a partial Connector failure, search and inspect children before retrying.
 Never blindly rerun ingestion, overwrite generated children, or perform SQL
 cleanup.
+
+For a paper-list request, run the read-only audit in
+[batch-workflow.md](batch-workflow.md) before translating. Treat an item as
+already translated only when this exact four-child verification passes; a
+parent with partial or differently titled children is not complete.
 
 This verification covers Zotero identity, collection placement, stored
 attachments, and the child note. The configured reading path is Google Chrome,

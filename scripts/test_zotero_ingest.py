@@ -34,6 +34,25 @@ class ZoteroIngestTests(unittest.TestCase):
             "10.1137/0218012",
         )
 
+    def test_doi_url_is_not_mistaken_for_arxiv_id(self) -> None:
+        self.assertIsNone(
+            ingest.extract_arxiv(
+                {"url": "https://doi.org/10.1109/SP.2018.00020"}
+            )
+        )
+
+    def test_extracts_arxiv_only_from_explicit_arxiv_fields(self) -> None:
+        self.assertEqual(
+            ingest.extract_arxiv({"arXivID": "arXiv: 1709.00020v2"}),
+            "1709.00020",
+        )
+        self.assertEqual(
+            ingest.extract_arxiv(
+                {"extra": "DOI: 10.1000/2018.00020\narXiv: 1709.00020v1"}
+            ),
+            "1709.00020",
+        )
+
     def test_doi_match_does_not_fall_back_to_title(self) -> None:
         candidate = {
             "data": {

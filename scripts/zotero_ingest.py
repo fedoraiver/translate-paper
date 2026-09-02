@@ -291,14 +291,23 @@ def extract_doi(data: dict[str, Any]) -> str | None:
 
 
 def extract_arxiv(data: dict[str, Any]) -> str | None:
-    for field in (
-        "arXivID",
-        "archiveLocation",
-        "archive",
-        "url",
-        "extra",
-    ):
+    for field in ("arXivID", "archiveLocation"):
         arxiv = normalize_arxiv(str(data.get(field) or ""))
+        if arxiv:
+            return arxiv
+    url = str(data.get("url") or "")
+    if re.search(r"https?://arxiv\.org/(?:abs|pdf)/", url, flags=re.I):
+        arxiv = normalize_arxiv(url)
+        if arxiv:
+            return arxiv
+    extra = str(data.get("extra") or "")
+    for match in re.finditer(
+        r"(?:arxiv:\s*|https?://arxiv\.org/(?:abs|pdf)/)"
+        r"([a-z-]+(?:\.[a-z-]+)?/\d{7}|\d{4}\.\d{4,5})(?:v\d+)?",
+        extra,
+        flags=re.I,
+    ):
+        arxiv = normalize_arxiv(match.group(0))
         if arxiv:
             return arxiv
     return None
