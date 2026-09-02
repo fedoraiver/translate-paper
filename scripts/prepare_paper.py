@@ -395,6 +395,252 @@ def block_text(
     return clean_lines(lines), sizes, fonts, span_runs
 
 
+def _line_baseline(line: dict[str, Any], *, equation_fragment: bool) -> float:
+    spans = [
+        span
+        for span in line.get("spans", [])
+        if str(span.get("text") or "").strip() and span.get("origin")
+    ]
+    if not spans:
+        bbox = line.get("bbox") or [0.0, 0.0, 0.0, 0.0]
+        return float(bbox[3])
+    if equation_fragment:
+        baseline = max(float(span["origin"][1]) for span in spans)
+        text = "".join(str(span.get("text") or "") for span in spans).strip()
+        if text == "√":
+            baseline += max(float(span.get("size") or 0.0) for span in spans) * 0.85
+        return baseline
+    maximum_size = max(float(span.get("size") or 0.0) for span in spans)
+    dominant = [
+        float(span["origin"][1])
+        for span in spans
+        if float(span.get("size") or 0.0) >= maximum_size * 0.8
+    ]
+    return statistics.median(dominant)
+
+
+def _merge_raw_lines(
+    blocks: list[dict[str, Any]],
+    block_kinds: list[str],
+) -> list[dict[str, Any]]:
+    """Reassemble inline-math fragments without collapsing adjacent visual lines."""
+    lines: list[dict[str, Any]] = []
+    for block_index, block in enumerate(blocks):
+        block_kind = block_kinds[block_index]
+        for line in block.get("lines", []):
+            if not line.get("spans"):
+                continue
+            record = dict(line)
+            record["_block_kind"] = block_kind
+            record["_baseline"] = _line_baseline(
+                record,
+                equation_fragment=block_kind in {"equation", "footnote"},
+            )
+            lines.append(record)
+    if not lines:
+        return []
+
+    parents = list(range(len(lines)))
+
+    def find(index: int) -> int:
+        while parents[index] != index:
+            parents[index] = parents[parents[index]]
+            index = parents[index]
+        return index
+
+    def union(left: int, right: int) -> None:
+        left_root = find(left)
+        right_root = find(right)
+        if left_root != right_root:
+            parents[right_root] = left_root
+
+    body_lines = [
+        index for index, line in enumerate(lines) if line["_block_kind"] == "body"
+    ]
+    for position, left in enumerate(body_lines):
+        left_line = lines[left]
+        left_sizes = [
+            float(span.get("size") or 0.0)
+            for span in left_line.get("spans", [])
+            if float(span.get("size") or 0.0) > 0
+        ]
+        tolerance = max(1.0, (max(left_sizes) if left_sizes else 10.0) * 0.18)
+        for right in body_lines[position + 1 :]:
+            if abs(
+                float(left_line["_baseline"]) - float(lines[right]["_baseline"])
+            ) <= tolerance:
+                union(left, right)
+    for index, line in enumerate(lines):
+        if line["_block_kind"] not in {"equation", "footnote"}:
+            continue
+        rect = pymupdf.Rect(line.get("bbox") or [])
+        font_sizes = [
+            float(span.get("size") or 0.0)
+            for span in line.get("spans", [])
+            if float(span.get("size") or 0.0) > 0
+        ]
+        tolerance = max(2.0, (max(font_sizes) if font_sizes else 10.0) * 0.55)
+        candidates: list[tuple[float, int]] = []
+        for body_index in body_lines:
+            body_line = lines[body_index]
+            body_rect = pymupdf.Rect(body_line.get("bbox") or [])
+            horizontal_overlap = min(rect.x1, body_rect.x1) - max(rect.x0, body_rect.x0)
+            if horizontal_overlap <= 0:
+                continue
+            distance = abs(float(line["_baseline"]) - float(body_line["_baseline"]))
+            if distance <= tolerance:
+                candidates.append((distance, body_index))
+        if candidates:
+            _, body_index = min(candidates)
+            union(index, body_index)
+
+    grouped: dict[int, list[dict[str, Any]]] = {}
+    for index, line in enumerate(lines):
+        grouped.setdefault(find(index), []).append(line)
+
+    merged: list[dict[str, Any]] = []
+    for group in grouped.values():
+        group.sort(key=lambda line: float((line.get("bbox") or [0.0])[0]))
+        union_rect = pymupdf.Rect(group[0].get("bbox") or [])
+        spans: list[dict[str, Any]] = []
+        for line in group:
+            union_rect |= pymupdf.Rect(line.get("bbox") or [])
+            spans.extend(line.get("spans") or [])
+        spans.sort(key=lambda span: float((span.get("bbox") or [0.0])[0]))
+        merged.append(
+            {
+                "bbox": rect_list(union_rect),
+                "wmode": group[0].get("wmode", 0),
+                "dir": group[0].get("dir", (1.0, 0.0)),
+                "spans": spans,
+                "_baseline": statistics.median(
+                    float(line["_baseline"]) for line in group
+                ),
+            }
+        )
+    return sorted(
+        merged,
+        key=lambda line: (
+            float(line.get("_baseline") or 0.0),
+            float((line.get("bbox") or [0.0])[0]),
+        ),
+    )
+
+
+def merge_fragmented_text_blocks(
+    parsed: list[
+        tuple[
+            dict[str, Any],
+            str,
+            list[float],
+            list[str],
+            list[dict[str, Any]],
+        ]
+    ],
+    page_rect: pymupdf.Rect,
+    body_size: float,
+    page_number: int,
+) -> list[
+    tuple[
+        dict[str, Any],
+        str,
+        list[float],
+        list[str],
+        list[dict[str, Any]],
+    ]
+]:
+    """Merge body text whose inline mathematics was emitted as overlapping blocks."""
+    if len(parsed) < 2:
+        return parsed
+
+    kinds = [
+        classify_text_kind(
+            text,
+            pymupdf.Rect(block.get("bbox") or []),
+            page_rect,
+            statistics.median(sizes) if sizes else body_size,
+            body_size,
+            page_number,
+        )
+        for block, text, sizes, _, _ in parsed
+    ]
+    parents = list(range(len(parsed)))
+
+    def find(index: int) -> int:
+        while parents[index] != index:
+            parents[index] = parents[parents[index]]
+            index = parents[index]
+        return index
+
+    def union(left: int, right: int) -> None:
+        left_root = find(left)
+        right_root = find(right)
+        if left_root != right_root:
+            parents[right_root] = left_root
+
+    eligible = {"body", "equation", "footnote"}
+    for left in range(len(parsed)):
+        if kinds[left] not in eligible:
+            continue
+        left_rect = pymupdf.Rect(parsed[left][0].get("bbox") or [])
+        for right in range(left + 1, len(parsed)):
+            if kinds[right] not in eligible:
+                continue
+            right_rect = pymupdf.Rect(parsed[right][0].get("bbox") or [])
+            overlap = left_rect & right_rect
+            if not overlap.is_empty and overlap.width > 0 and overlap.height > 0:
+                union(left, right)
+
+    components: dict[int, list[int]] = {}
+    for index in range(len(parsed)):
+        components.setdefault(find(index), []).append(index)
+
+    replacements: dict[int, tuple[
+        dict[str, Any],
+        str,
+        list[float],
+        list[str],
+        list[dict[str, Any]],
+    ]] = {}
+    consumed: set[int] = set()
+    for indices in components.values():
+        component_kinds = {kinds[index] for index in indices}
+        if (
+            len(indices) < 2
+            or "body" not in component_kinds
+            or not component_kinds.intersection({"equation", "footnote"})
+        ):
+            continue
+        blocks = [parsed[index][0] for index in indices]
+        merged_rect = pymupdf.Rect(blocks[0].get("bbox") or [])
+        for block in blocks[1:]:
+            merged_rect |= pymupdf.Rect(block.get("bbox") or [])
+        merged_block = {
+            **blocks[0],
+            "bbox": rect_list(merged_rect),
+            "lines": _merge_raw_lines(
+                blocks,
+                [kinds[index] for index in indices],
+            ),
+        }
+        text, sizes, fonts, span_runs = block_text(merged_block)
+        first = min(indices)
+        replacements[first] = (
+            merged_block,
+            text,
+            sizes,
+            fonts,
+            span_runs,
+        )
+        consumed.update(index for index in indices if index != first)
+
+    return [
+        replacements.get(index, record)
+        for index, record in enumerate(parsed)
+        if index not in consumed
+    ]
+
+
 def locate_span_runs(
     source_text: str, span_runs: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:
@@ -936,11 +1182,6 @@ def classify_text_kind(
         and re.match(r"^\s*(?:[⋆*†‡]|\d{1,2}\b)", compact)
     ):
         return "footnote"
-    math_ratio = (
-        sum(1 for char in compact if char in MATH_CHARS) / max(1, len(compact))
-    )
-    if math_ratio >= 0.06 and len(compact.split()) <= 40:
-        return "equation"
     return "body"
 
 
@@ -950,6 +1191,88 @@ def detect_tables(page: pymupdf.Page) -> list[pymupdf.Rect]:
         return [pymupdf.Rect(table.bbox) for table in finder.tables]
     except Exception:
         return []
+
+
+def promote_display_math_fragments(
+    elements: list[dict[str, Any]],
+    body_size: float,
+) -> None:
+    """Keep symbol-only pieces of a display equation in one native-math group."""
+    equation_rects = [
+        pymupdf.Rect(element.get("bbox") or [])
+        for element in elements
+        if element.get("kind") == "equation"
+    ]
+    if not equation_rects:
+        return
+    pending = [
+        element
+        for element in elements
+        if element.get("kind") in {"body", "footnote"}
+        and element.get("render_mode") == "text"
+    ]
+    changed = True
+    while changed:
+        changed = False
+        for element in list(pending):
+            runs = list(element.get("span_runs") or [])
+            visible_runs = [
+                run for run in runs if str(run.get("text") or "").strip()
+            ]
+            visible_chars = sum(
+                len(re.sub(r"\s+", "", str(run.get("text") or "")))
+                for run in visible_runs
+            )
+            math_chars = sum(
+                len(re.sub(r"\s+", "", str(run.get("text") or "")))
+                for run in visible_runs
+                if run.get("style") == "math"
+            )
+            math_ratio = math_chars / max(1, visible_chars)
+            compact = normalized_heading(str(element.get("source_text") or ""))
+            rect = pymupdf.Rect(element.get("bbox") or [])
+            short_operator = compact in {"Pr", "E", "Var", "Cov"}
+            has_prose_word = bool(re.search(r"\b[A-Za-z]{3,}\b", compact))
+            starts_with_lowercase_prose = bool(
+                re.match(r"^[^A-Za-z]*[a-z][a-z-]{2,}\b", compact)
+            )
+            starts_with_prose_keyword = bool(
+                re.match(
+                    r"^(?:[–—-]\s*)?(?:For|If|Else|Return|Run|Set|While|Rewind|Obtain)\b",
+                    compact,
+                )
+            )
+            near_equation = any(
+                min(rect.y1, equation_rect.y1)
+                - max(rect.y0, equation_rect.y0)
+                > 0
+                or min(
+                    abs(rect.y0 - equation_rect.y1),
+                    abs(equation_rect.y0 - rect.y1),
+                )
+                <= body_size * 1.5
+                for equation_rect in equation_rects
+            )
+            if (
+                near_equation
+                and (
+                    rect.height <= body_size * 4.0
+                    or not has_prose_word
+                )
+                and len(re.sub(r"\s+", "", compact)) <= 240
+                and (
+                    math_ratio >= 0.35
+                    or short_operator
+                    or not has_prose_word
+                )
+                and (not starts_with_lowercase_prose or short_operator)
+                and (not starts_with_prose_keyword or short_operator)
+            ):
+                element["kind"] = "equation"
+                element["render_mode"] = "source_clip"
+                equation_rects.append(rect)
+                pending.remove(element)
+                changed = True
 
 
 def extract_text_page(
@@ -975,6 +1298,12 @@ def extract_text_page(
         parsed.append((block, text, sizes, fonts, span_runs))
         all_sizes.extend(sizes)
     body_size = statistics.median(all_sizes) if all_sizes else 10.0
+    parsed = merge_fragmented_text_blocks(
+        parsed,
+        page.rect,
+        body_size,
+        page_number,
+    )
 
     table_rects = detect_tables(page)
     image_rects = [
@@ -1049,6 +1378,7 @@ def extract_text_page(
             }
         )
 
+    promote_display_math_fragments(elements, body_size)
     mark_page_footnotes(elements, drawing_rects, page.rect, body_size)
     add_vector_figure_candidates(
         elements,
@@ -1691,8 +2021,24 @@ def build_math_review(
         else {}
     )
     entries: dict[str, dict[str, Any]] = {}
+    translatable_orders = [
+        int(element["order"])
+        for element in elements
+        if element.get("translatable") is True
+    ]
+    translation_start = (
+        min(translatable_orders) if translatable_orders else None
+    )
+    translation_stop = (
+        max(translatable_orders) if translatable_orders else None
+    )
 
     for element in elements:
+        if (
+            element.get("translatable") is False
+            or element.get("render_suppressed")
+        ):
+            continue
         for token, fragment in dict(
             element.get("inline_fragments") or {}
         ).items():
@@ -1701,9 +2047,17 @@ def build_math_review(
             fragment["display"] = False
             fragment["source_page"] = int(element.get("page") or 0)
             status = str(fragment.get("review_status") or "unresolved")
-            if status != "unresolved":
-                continue
             previous = dict(previous_entries.get(token) or {})
+            if (
+                previous
+                and (
+                    int(previous.get("source_page") or 0)
+                    != int(element.get("page") or 0)
+                    or str(previous.get("source_text") or "")
+                    != str(fragment.get("text") or "")
+                )
+            ):
+                previous = {}
             entries[token] = {
                 "kind": "inline",
                 "display": False,
@@ -1712,19 +2066,35 @@ def build_math_review(
                 "source_text": str(fragment.get("text") or ""),
                 "tex": str(previous.get("tex") or fragment.get("tex") or ""),
                 "review_status": str(
-                    previous.get("review_status") or "unresolved"
+                    previous.get("review_status") or status
                 ),
             }
 
     groups: list[list[dict[str, Any]]] = []
     current: list[dict[str, Any]] = []
     for element in sorted(elements, key=lambda item: int(item["order"])):
-        is_clip = element.get("render_mode") == "source_clip"
+        order = int(element["order"])
+        is_in_translation = (
+            translation_start is None
+            or translation_stop is None
+            or translation_start <= order <= translation_stop
+        )
+        is_clip = (
+            is_in_translation
+            and not element.get("render_suppressed")
+            and element.get("render_mode") == "source_clip"
+            and element.get("kind") == "equation"
+        )
         same_page = (
             current
             and int(current[-1]["page"]) == int(element.get("page") or 0)
         )
-        if is_clip and (not current or same_page):
+        same_visual_group = (
+            current
+            and str(current[-1].get("visual_id") or "")
+            == str(element.get("visual_id") or "")
+        )
+        if is_clip and (not current or (same_page and same_visual_group)):
             current.append(element)
             continue
         if current:
@@ -1744,7 +2114,16 @@ def build_math_review(
             source_box |= pymupdf.Rect(item["bbox"])
         previous = dict(previous_entries.get(entry_id) or {})
         source_ids = [str(item["id"]) for item in group]
-        if previous and list(previous.get("source_ids") or []) != source_ids:
+        source_text = " ".join(
+            str(item.get("source_text") or "").strip()
+            for item in group
+            if str(item.get("source_text") or "").strip()
+        )
+        if previous and (
+            list(previous.get("source_ids") or []) != source_ids
+            or int(previous.get("source_page") or 0) != int(group[0]["page"])
+            or str(previous.get("source_text") or "") != source_text
+        ):
             previous = {}
         entries[entry_id] = {
             "kind": "display",
@@ -1794,6 +2173,8 @@ def link_footnote_anchors(
     used: set[tuple[str, str]] = set()
     for footnote in elements:
         if footnote.get("kind") != "footnote":
+            continue
+        if not footnote.get("translatable"):
             continue
         text = str(footnote.get("source_text") or "")
         prefix = FOOTNOTE_PREFIX_RE.match(text)
