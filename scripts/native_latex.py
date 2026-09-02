@@ -320,8 +320,14 @@ def rich_text_to_latex(
             elif kind == "footnote-marker":
                 footnote_id = str(fragment.get("footnote_id") or "")
                 if footnote_id and footnote_id in (footnotes_by_id or {}):
+                    marker = latex_escape_text(
+                        str(fragment.get("text") or "")
+                    )
+                    explicit_number = f"[{marker}]" if marker.isdigit() else ""
                     output.append(
-                        r"\footnote{\fontsize{8.5pt}{11pt}\selectfont "
+                        r"\footnote"
+                        + explicit_number
+                        + r"{\fontsize{8.5pt}{11pt}\selectfont "
                         + str((footnotes_by_id or {})[footnote_id])
                         + "}"
                     )
@@ -705,11 +711,7 @@ def build_body_tex(
         if not element.get("anchor_id"):
             continue
         footnote_node = dict(node)
-        footnote_node["text"] = FOOTNOTE_PREFIX_RE.sub(
-            "",
-            str(node.get("text") or ""),
-            count=1,
-        ).lstrip()
+        footnote_node["text"] = footnote_body_without_number(node)
         footnotes_by_id[str(node["id"])] = rich_text_to_latex(
             footnote_node,
             reviews,
