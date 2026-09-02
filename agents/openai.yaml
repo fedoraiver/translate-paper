@@ -1,4 +1,4 @@
 interface:
   display_name: "Translate paper"
-  short_description: "Translate papers, preserve PDFs, and organize Zotero"
-  default_prompt: "Use $translate-paper to translate this academic paper into Chinese, preserve and validate its PDF content, summarize it, and organize the artifacts in Zotero."
+  short_description: "Translate paper batches and organize Zotero safely"
+  default_prompt: "Use $translate-paper to audit Zotero, translate one or more academic papers into Chinese, validate the artifacts, and resume unfinished batches safely."

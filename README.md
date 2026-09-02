@@ -1,12 +1,18 @@
 # translate-paper
 
-`translate-paper` 是一个 Codex skill，用于将学术论文 PDF 翻译为中文，同时保留图表、公式、引文、附录和参考文献，并生成经过验证的中文 PDF、Markdown 与论文总结。默认工作流还支持将最终产物安全导入 Zotero。
+`translate-paper` 是一个 Codex skill，用于将单篇或一组学术论文 PDF
+翻译为中文，同时保留图表、公式、引文、附录和参考文献，并生成经过验证
+的中文 PDF、Markdown 与论文总结。默认工作流还支持审计 Zotero 中缺少
+翻译的论文、断点续跑和安全导入最终产物。
 
 ## 功能
 
 - 处理文本型和扫描型论文 PDF。
+- 从论文列表或指定章节建立可恢复的批处理清单，只处理 Zotero 中缺少
+  完整中文附件的论文。
 - 仅使用当前 Codex 模型进行翻译；脚本只负责提取、OCR、保护标记、排版和验证。
 - 保留原论文的非正文材料，并翻译从 Introduction 到 Conclusion 的正文。
+- 通过哈希绑定的 `source-review.json` 重放人工核对过的视觉清单和提取修复。
 - 输出原始 PDF、中文翻译 PDF、中文正文 Markdown、中文总结和 Zotero 元数据。
 - 验证翻译完整性、版面结构、字体、公式、图表和 Zotero 附件结构。
 
@@ -33,13 +39,18 @@ New-Item -ItemType Junction `
 
 ```text
 使用 $translate-paper 将这篇论文翻译成中文。
+使用 $translate-paper 翻译这个列表中 Zotero 里还没有中文附件的论文，并支持继续未完成批次。
 ```
 
-skill 会按照 `SKILL.md` 中定义的准备、翻译、导出、验证、总结和 Zotero 导入流程执行。最终文件保存在：
+skill 会按照 `SKILL.md` 中定义的准备、翻译、导出、验证、总结和 Zotero
+导入流程执行。默认最终文件保存在：
 
 ```text
 output/pdf/<paper-slug>/
 ```
+
+项目也可以在 `batch-run.json` 中为每篇论文指定
+`translations/papers/<group>/<paper-slug>/` 等归档目录。
 
 ## 脚本
 
@@ -49,6 +60,7 @@ output/pdf/<paper-slug>/
 uv run --script scripts/prepare_paper.py --help
 uv run --script scripts/render_translation.py --help
 uv run --script scripts/check_translation.py --help
+python scripts/batch_workflow.py --help
 ```
 
 这些脚本不会自行做出翻译决策。
@@ -58,6 +70,7 @@ uv run --script scripts/check_translation.py --help
 ```powershell
 uv run --script scripts/test_paper_pipeline.py -v
 uv run --script scripts/test_zotero_ingest.py -v
+python scripts/test_batch_workflow.py -v
 ```
 
 ## License
