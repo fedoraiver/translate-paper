@@ -71,7 +71,10 @@ KEYWORDS_RE = re.compile(
 HEADING_RE = re.compile(
     r"^\s*(?:\d+(?:\.\d+)*[.)]?\s+|[A-Z][.)]\s+)[^\n]{2,120}$"
 )
-MATH_CHARS = set("=<>≤≥≈≠∑∏∫√∞λμσβαγδθφψω±×÷∂∇")
+MATH_CHARS = set(
+    "=<>≤≥≈≠∑∏∫√∞λμµσβαγδθφψω±×÷∂∇"
+    "+−-*/^·∈∉←→↔⊥∗◦"
+)
 CITATION_RE = re.compile(
     r"\[(?:\d{1,4}(?:\s*[-–,]\s*\d{1,4})*)\]"
 )
@@ -663,6 +666,220 @@ def locate_span_runs(
     return located
 
 
+MATHA_TEX = {
+    "`": "+",
+    "´": "-",
+    "ˆ": r"\times ",
+    "¨": r"\cdot ",
+    "˝": r"\circ ",
+    "˘": r"\pm ",
+    "˚": r"\ast ",
+    "“": "=",
+    "‰": r"\neq ",
+    "?": r"\sqrt{}",
+    "@": r"\forall ",
+    "D": r"\exists ",
+    "P": r"\in ",
+    "R": r"\notin ",
+    "^": r"\wedge ",
+    "p": "(",
+    "q": ")",
+    "r": "[",
+    "s": "]",
+    "t": r"\{",
+    "u": r"\}",
+    "x": r"\langle ",
+    "y": r"\rangle ",
+    "z": r"\backslash ",
+    "{": "/",
+    "|": r"\mid ",
+    "}": r"\Vert ",
+    "Ă": r"\subset ",
+    "ă": "<",
+    "ą": ">",
+    "ď": r"\leq ",
+    "ě": r"\geq ",
+    "Ð": r"\leftarrow ",
+    "Ñ": r"\rightarrow ",
+    "Ø": r"\leftrightarrow ",
+    "Ý": r"\relbar ",
+    "ñ": r"\Rightarrow ",
+    "ù": r"\Relbar ",
+    "‹": r"\ast ",
+}
+
+MATHX_TEX = {
+    "ř": r"\sum ",
+    "ÿ": r"\sum ",
+    "ś": r"\prod ",
+    "ź": r"\prod ",
+}
+
+
+def math_run_tex(run: dict[str, Any]) -> str:
+    """Decode the source font's glyph slots into portable TeX."""
+    value = str(run.get("text") or "")
+    font = str(run.get("font") or "")
+    if re.match(r"TeX-matha\d*$", font):
+        return "".join(MATHA_TEX.get(character, character) for character in value)
+    if re.match(r"TeX-mathb\d*$", font):
+        return (
+            value.replace("r", r"\lceil ")
+            .replace("s", r"\rceil ")
+        )
+    if re.match(r"TeX-mathx\d*$", font):
+        parts: list[str] = []
+        for character in value:
+            if character.isspace():
+                parts.append(character)
+            elif character in MATHX_TEX:
+                parts.append(MATHX_TEX[character])
+            else:
+                parts.append(
+                    f"[[UNRESOLVED:MATHX-{ord(character):04X}]]"
+                )
+        return "".join(parts)
+    if re.match(r"MSBM\d*$", font):
+        return "".join(
+            rf"\mathbb{{{character}}}"
+            if character.isalpha()
+            else character
+            for character in value
+        )
+    if re.match(r"CMSY\d*$", font):
+        parts = []
+        for character in value:
+            if character in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
+                parts.append(rf"\mathcal{{{character}}}")
+            elif character == "{":
+                parts.append(r"\{")
+            elif character == "}":
+                parts.append(r"\}")
+            elif character == "•":
+                parts.append(r"\bullet ")
+            elif character.isspace():
+                parts.append(character)
+            else:
+                parts.append(
+                    f"[[UNRESOLVED:CMSY-{ord(character):04X}]]"
+                )
+        return "".join(parts)
+    if re.match(r"CMMIB\d*$", font):
+        return rf"\boldsymbol{{{value}}}"
+    if re.match(r"CMBX\d*$", font) and re.fullmatch(
+        r"[A-Za-z0-9]+", value
+    ):
+        return rf"\mathbf{{{value}}}"
+    if re.match(r"CMR\d*$", font):
+        value = value.replace("$", r"\$")
+        value = value.replace("ˆ", r"\widehatmark{}")
+        if re.fullmatch(r"[A-Za-z]{2,}", value):
+            return rf"\mathrm{{{value}}}"
+    return value
+
+
+def normalize_math_tex(tex: str) -> str:
+    """Join split glyphs and scripts after font-aware decoding."""
+    greek_tex = {
+        "Α": "A",
+        "Β": "B",
+        "Γ": r"\Gamma ",
+        "Δ": r"\Delta ",
+        "Ε": "E",
+        "Ζ": "Z",
+        "Η": "H",
+        "Θ": r"\Theta ",
+        "Ι": "I",
+        "Κ": "K",
+        "Λ": r"\Lambda ",
+        "Μ": "M",
+        "Ν": "N",
+        "Ξ": r"\Xi ",
+        "Ο": "O",
+        "Π": r"\Pi ",
+        "Ρ": "P",
+        "Σ": r"\Sigma ",
+        "Τ": "T",
+        "Υ": r"\Upsilon ",
+        "Φ": r"\Phi ",
+        "Χ": "X",
+        "Ψ": r"\Psi ",
+        "Ω": r"\Omega ",
+        "α": r"\alpha ",
+        "β": r"\beta ",
+        "γ": r"\gamma ",
+        "δ": r"\delta ",
+        "ε": r"\epsilon ",
+        "ϵ": r"\varepsilon ",
+        "ζ": r"\zeta ",
+        "η": r"\eta ",
+        "θ": r"\theta ",
+        "ϑ": r"\vartheta ",
+        "ι": r"\iota ",
+        "κ": r"\kappa ",
+        "λ": r"\lambda ",
+        "μ": r"\mu ",
+        "µ": r"\mu ",
+        "ν": r"\nu ",
+        "ξ": r"\xi ",
+        "ο": r"\omicron ",
+        "π": r"\pi ",
+        "ϖ": r"\varpi ",
+        "ρ": r"\rho ",
+        "ϱ": r"\varrho ",
+        "σ": r"\sigma ",
+        "ς": r"\varsigma ",
+        "τ": r"\tau ",
+        "υ": r"\upsilon ",
+        "φ": r"\phi ",
+        "ϕ": r"\varphi ",
+        "χ": r"\chi ",
+        "ψ": r"\psi ",
+        "ω": r"\omega ",
+        "ℓ": r"\ell ",
+    }
+    tex = "".join(greek_tex.get(character, character) for character in tex)
+    tex = tex.replace(r"\leftarrow \relbar ", r"\longleftarrow ")
+    tex = tex.replace(r"\Relbar \Rightarrow ", r"\Longrightarrow ")
+    tex = tex.replace(r"\Leftarrow \Relbar ", r"\Longleftarrow ")
+    for _ in range(8):
+        updated = re.sub(
+            r"\^\{([^{}]*)\}\s*\^\{([^{}]*)\}",
+            r"^{\1\2}",
+            tex,
+        )
+        updated = re.sub(
+            r"_\{([^{}]*)\}\s*_\{([^{}]*)\}",
+            r"_{\1\2}",
+            updated,
+        )
+        if updated == tex:
+            break
+        tex = updated
+    tex = re.sub(
+        r"\^\{\\\$\}\s*\\longleftarrow\s*",
+        r"\\xleftarrow{\\$} ",
+        tex,
+    )
+    tex = re.sub(
+        r"\\longleftarrow\s*\^\{\\\$\}",
+        r"\\xleftarrow{\\$}",
+        tex,
+    )
+    tex = re.sub(
+        r"\\widehatmark\{\}\s*([A-Za-zΑ-ω])",
+        r"\\hat{\1}",
+        tex,
+    )
+    tex = re.sub(
+        r"([A-Za-zΑ-ω])\s*\\widehatmark\{\}",
+        r"\\hat{\1}",
+        tex,
+    )
+    tex = re.sub(r"(\\[A-Za-z]+) (?=[}\]])", r"\1", tex)
+    return re.sub(r"[ \t]+", " ", tex).strip()
+
+
 def math_markup(
     runs: list[dict[str, Any]],
     source_text: str | None = None,
@@ -695,6 +912,7 @@ def math_markup(
             html_parts.append(escaped_gap)
             markdown_parts.append(gap)
         value = str(run.get("text") or "")
+        tex_value = math_run_tex(run)
         escaped = (
             value.replace("&", "&amp;")
             .replace("<", "&lt;")
@@ -705,16 +923,16 @@ def math_markup(
         script = size > 0 and dominant_size > 0 and size <= dominant_size * 0.82
         if script and origin_y > baseline + 0.4:
             html_parts.append(f"<sub>{escaped}</sub>")
-            markdown_parts.append(f"_{{{value}}}")
+            markdown_parts.append(f"_{{{tex_value}}}")
         elif script and origin_y < baseline - 0.4:
             html_parts.append(f"<sup>{escaped}</sup>")
-            markdown_parts.append(f"^{{{value}}}")
+            markdown_parts.append(f"^{{{tex_value}}}")
         elif run.get("style") == "math" and re.search(r"[A-Za-zΑ-ω]", value):
             html_parts.append(f"<i class=\"math-var\">{escaped}</i>")
-            markdown_parts.append(value)
+            markdown_parts.append(tex_value)
         else:
             html_parts.append(escaped)
-            markdown_parts.append(value)
+            markdown_parts.append(tex_value)
         if cursor is not None:
             cursor = max(cursor, run_end)
     if (
@@ -731,7 +949,10 @@ def math_markup(
         )
         html_parts.append(escaped_gap)
         markdown_parts.append(gap)
-    return "".join(html_parts), "$" + "".join(markdown_parts) + "$"
+    return (
+        "".join(html_parts),
+        "$" + normalize_math_tex("".join(markdown_parts)) + "$",
+    )
 
 
 def math_fragment_bbox(runs: list[dict[str, Any]]) -> list[float] | None:
@@ -749,10 +970,7 @@ def math_fragment_bbox(runs: list[dict[str, Any]]) -> list[float] | None:
 
 
 def math_render_strategy(runs: list[dict[str, Any]], markdown: str) -> str:
-    if any(
-        re.search(r"(?:CMEX|CMSY|MSAM|MSBM)", str(run.get("font") or ""), re.I)
-        for run in runs
-    ):
+    if "[[UNRESOLVED:" in markdown:
         return "source-vector"
     tex = markdown[1:-1] if markdown.startswith("$") and markdown.endswith("$") else ""
     if re.search(r"\^\{[^{}]*\}\s*\^\{", tex):
@@ -770,6 +988,26 @@ def looks_like_math_run(run: dict[str, Any]) -> bool:
     value = str(run.get("text") or "").strip()
     if not value or len(value) > 120:
         return False
+    # PDF text spans often end at a font change immediately after "(i.e.,"
+    # or "(by". Punctuation does not turn these short prose words into math.
+    if re.search(r"\b(?:i\s*\.\s*e|e\s*\.\s*g)\s*\.", value, re.IGNORECASE):
+        return False
+    if re.search(r"\b(?:an|as|at|by|in|is|of|on|or|to)\b", value):
+        return False
+    if re.search(r"(?:^|[\s(])a(?:\s+(?=\d)|\s*$)", value):
+        return False
+    # Delimiters are recovered around real expressions below. Treating a
+    # closing prose parenthesis as a math seed swallows it into the preceding
+    # expression, as in "(by ECP_i)".
+    if re.fullmatch(r"[\s(){}\[\],.;:]+", value):
+        return False
+    # TeX's upright Greek capitals (for example a Lambda accumulator base)
+    # live in CMR, unlike italic variables. They still belong to adjacent
+    # mathematical subscripts and must participate in the same fragment.
+    if re.fullmatch(r"CMR\d+", str(run.get("font") or "")) and re.fullmatch(
+        r"[Α-Ωα-ω]+", value
+    ):
+        return True
     if not re.search(r"[=<>≤≥≈≠+\-*/^√∑∏∫(){}\[\]0-9]", value):
         return False
     prose_words = [
@@ -788,6 +1026,10 @@ def expand_math_fragment_bounds(
     function_open = re.search(r"[A-Za-z][A-Za-z0-9]*\(\s*$", prefix)
     if function_open:
         start = function_open.start()
+    else:
+        parenthesis_open = re.search(r"\(\s*$", prefix)
+        if parenthesis_open:
+            start = parenthesis_open.start()
     fragment = source_text[start:end]
     open_parentheses = fragment.count("(") - fragment.count(")")
     while open_parentheses > 0 and end < len(source_text):
@@ -834,7 +1076,10 @@ def build_rich_protection(
     math_runs = [
         run
         for run in located
-        if not LIST_MARKER_RE.fullmatch(str(run.get("text") or "").strip())
+        if not (
+            LIST_MARKER_RE.fullmatch(str(run.get("text") or "").strip())
+            and not source_text[: int(run["start"])].rsplit("\n", 1)[-1].strip()
+        )
         and (
             run.get("style") == "math"
             or looks_like_math_run(run)
@@ -871,7 +1116,14 @@ def build_rich_protection(
             continue
         fragment_text = source_text[start:end]
         compact_fragment = fragment_text.strip()
-        if re.fullmatch(r"[A-Za-zΑ-ω][,.;:]?", compact_fragment):
+        decorated_singleton = any(
+            re.search(r"\\(?:mathcal|mathbb|mathbf|boldsymbol)\{", math_run_tex(run))
+            for run in group
+        )
+        if (
+            re.fullmatch(r"[A-Za-zΑ-ω][,.;:]?", compact_fragment)
+            and not decorated_singleton
+        ):
             following = source_text[end : end + 1]
             if not (
                 compact_fragment == "q"
@@ -1059,11 +1311,28 @@ def classify_columns(elements: list[dict[str, Any]], page_width: float) -> int:
         pymupdf.Rect(element["bbox"])
         for element in elements
         if element["render_mode"] == "text"
+        and element.get("kind") in {"body", "footnote"}
         and len(element.get("source_text", "")) >= 20
+        and len(
+            re.findall(
+                r"\b[A-Za-z][A-Za-z-]{2,}\b",
+                str(element.get("source_text") or ""),
+            )
+        )
+        >= 3
     ]
     left = [rect for rect in text_boxes if rect.x1 <= page_width * 0.61]
     right = [rect for rect in text_boxes if rect.x0 >= page_width * 0.39]
-    return 2 if len(left) >= 2 and len(right) >= 2 else 1
+    aligned_pairs = sum(
+        1
+        for left_rect in left
+        if any(
+            max(left_rect.y0, right_rect.y0)
+            < min(left_rect.y1, right_rect.y1)
+            for right_rect in right
+        )
+    )
+    return 2 if len(left) >= 2 and len(right) >= 2 and aligned_pairs >= 2 else 1
 
 
 def reading_order(
@@ -1141,12 +1410,12 @@ def classify_text_kind(
     page_number: int,
 ) -> str:
     compact = normalized_heading(text)
-    # Journal running heads often sit noticeably below the physical top edge.
-    # Keep them out of the body even when the publisher places them around 12%
-    # of the page height (the first page is handled as front matter below).
-    if rect.y1 <= page_rect.height * (0.14 if page_number > 1 else 0.055):
-        return "header"
     if rect.y0 >= page_rect.height * 0.92:
+        return "footer"
+    if (
+        rect.y0 >= page_rect.height * 0.85
+        and re.fullmatch(r"(?:\d{1,4}|[ivxlcdm]{1,8})", compact, re.IGNORECASE)
+    ):
         return "footer"
     if rect.height >= rect.width * 3 and (
         rect.x1 <= page_rect.width * 0.12 or rect.x0 >= page_rect.width * 0.88
@@ -1168,12 +1437,62 @@ def classify_text_kind(
         and len(compact) <= 300
     ):
         return "front-matter"
+    math_ratio = (
+        sum(1 for char in compact if char in MATH_CHARS) / max(1, len(compact))
+    )
+    has_heading_word = bool(
+        re.search(r"\b[A-Za-z][A-Za-z-]{2,}\b", compact)
+    )
+    numbered_tail = re.match(
+        r"^\s*\d+(?:\.\d+)*[.)]?\s+(?P<tail>.+)$",
+        compact,
+    )
+    starts_with_heading_word = bool(
+        numbered_tail
+        and re.match(
+            r"[A-Za-z][A-Za-z-]{2,}\b",
+            numbered_tail.group("tail"),
+        )
+    )
+    starts_with_lowercase_prose = bool(
+        re.match(r"^[^A-Za-z]*[a-z][a-z-]{2,}\b", compact)
+    )
+    starts_with_prose_keyword = bool(
+        re.match(
+            r"^(?:[–—-]\s*)?(?:For|If|Else|Return|Run|Set|While|Rewind|Obtain)\b",
+            compact,
+        )
+    )
+    if (
+        math_ratio >= 0.06
+        and len(compact.split()) <= 40
+        and not starts_with_lowercase_prose
+        and not starts_with_prose_keyword
+    ) or (
+        HEADING_RE.match(compact)
+        and not has_heading_word
+        and len(compact.split()) <= 16
+    ) or (
+        HEADING_RE.match(compact)
+        and math_ratio > 0
+        and numbered_tail is not None
+        and not starts_with_heading_word
+    ):
+        return "equation"
     if (
         INTRO_RE.match(compact)
         or CONCLUSION_RE.match(compact)
         or STOP_RE.match(compact)
-        or HEADING_RE.match(compact)
-        or (font_size >= body_size * 1.18 and len(compact) <= 180)
+        or (
+            HEADING_RE.match(compact)
+            and has_heading_word
+            and math_ratio < 0.06
+        )
+        or (
+            font_size >= body_size * 1.18
+            and len(compact) <= 180
+            and math_ratio < 0.06
+        )
     ):
         return "heading"
     if (
@@ -2131,11 +2450,7 @@ def build_math_review(
             "source_page": int(group[0]["page"]),
             "source_bbox": rect_list(source_box),
             "source_ids": source_ids,
-            "source_text": " ".join(
-                str(item.get("source_text") or "").strip()
-                for item in group
-                if str(item.get("source_text") or "").strip()
-            ),
+            "source_text": source_text,
             "tex": str(previous.get("tex") or ""),
             "review_status": str(
                 previous.get("review_status") or "unresolved"
@@ -2201,7 +2516,8 @@ def link_footnote_anchors(
         linked += 1
     return {
         "footnotes": sum(
-            element.get("kind") == "footnote" for element in elements
+            element.get("kind") == "footnote" and element.get("translatable")
+            for element in elements
         ),
         "linked": linked,
         "warnings": warnings,
@@ -2290,6 +2606,7 @@ def build_visual_layout(
         element
         for element in elements
         if element.get("kind") == "caption"
+        and not element.get("render_suppressed")
         and visual_label(str(element.get("source_text") or ""))
     ]
     candidates = [

@@ -142,7 +142,61 @@ class PaperPipelineTests(unittest.TestCase):
         )
         self.assertIn(" = ", html)
         self.assertIn("<sup>α</sup>", html)
-        self.assertEqual(markdown, "$c = c^{α}$")
+        self.assertEqual(markdown, r"$c = c^{\alpha}$")
+
+    def test_normalize_math_tex_converts_unicode_greek_and_micro_sign(self) -> None:
+        self.assertEqual(
+            prepare_paper.normalize_math_tex("µ(λ)+α+ρ+ℓ"),
+            r"\mu (\lambda )+\alpha +\rho +\ell",
+        )
+
+    def test_math_markup_decodes_mathabx_and_blackboard_fonts(self) -> None:
+        runs = [
+            {
+                "text": "P",
+                "font": "TeX-matha10",
+                "size": 10.0,
+                "style": "math",
+                "origin": [0.0, 10.0],
+            },
+            {
+                "text": "Z",
+                "font": "MSBM10",
+                "size": 10.0,
+                "style": "math",
+                "origin": [10.0, 10.0],
+            },
+            {
+                "text": "p",
+                "font": "CMMI8",
+                "size": 7.0,
+                "style": "math",
+                "origin": [20.0, 12.0],
+            },
+        ]
+        _, markdown = prepare_paper.math_markup(runs)
+        self.assertEqual(markdown, r"$\in \mathbb{Z}_{p}$")
+        self.assertEqual(
+            prepare_paper.math_render_strategy(runs, markdown),
+            "tex-vector",
+        )
+
+    def test_math_markup_keeps_unmapped_large_glyph_for_review(self) -> None:
+        runs = [
+            {
+                "text": "A",
+                "font": "TeX-mathx10",
+                "size": 10.0,
+                "style": "math",
+                "origin": [0.0, 10.0],
+            }
+        ]
+        _, markdown = prepare_paper.math_markup(runs)
+        self.assertIn("[[UNRESOLVED:MATHX-0041]]", markdown)
+        self.assertEqual(
+            prepare_paper.math_render_strategy(runs, markdown),
+            "source-vector",
+        )
 
     def test_symbol_font_bullet_is_not_protected_as_math(self) -> None:
         source = "• Block version: validation rules."
@@ -186,6 +240,271 @@ class PaperPipelineTests(unittest.TestCase):
             4,
         )
         self.assertEqual(kind, "body")
+
+    def test_top_of_page_prose_is_not_assumed_to_be_a_running_header(
+        self,
+    ) -> None:
+        kind = prepare_paper.classify_text_kind(
+            "This paragraph continues from the preceding page and spans the body.",
+            pymupdf.Rect(72, 74, 540, 100),
+            pymupdf.Rect(0, 0, 612, 792),
+            10.9,
+            10.9,
+            6,
+        )
+        self.assertEqual(kind, "body")
+
+    def test_math_line_starting_with_number_is_not_a_heading(self) -> None:
+        kind = prepare_paper.classify_text_kind(
+            "1 Xn · · · X(m−1)n",
+            pymupdf.Rect(180, 300, 390, 320),
+            pymupdf.Rect(0, 0, 595, 842),
+            11.0,
+            10.0,
+            12,
+        )
+        self.assertEqual(kind, "equation")
+
+    def test_short_numbered_formula_without_heading_word_is_equation(self) -> None:
+        kind = prepare_paper.classify_text_kind(
+            "1 ga2",
+            pymupdf.Rect(180, 300, 230, 320),
+            pymupdf.Rect(0, 0, 595, 842),
+            11.0,
+            10.0,
+            18,
+        )
+        self.assertEqual(kind, "equation")
+
+    def test_long_numbered_formula_prefix_is_not_a_heading(self) -> None:
+        kind = prepare_paper.classify_text_kind(
+            "1 µ+1 group elements and 2µN operations",
+            pymupdf.Rect(120, 300, 470, 330),
+            pymupdf.Rect(0, 0, 595, 842),
+            11.0,
+            10.0,
+            31,
+        )
+        self.assertEqual(kind, "equation")
+
+    def test_lowercase_paragraph_tail_with_inline_math_is_body(self) -> None:
+        kind = prepare_paper.classify_text_kind(
+            "accepts, b = 1.",
+            pymupdf.Rect(130, 700, 240, 720),
+            pymupdf.Rect(0, 0, 595, 842),
+            10.0,
+            10.0,
+            7,
+        )
+        self.assertEqual(kind, "body")
+
+    def test_matrix_fragments_do_not_trigger_two_column_layout(self) -> None:
+        elements = [
+            {
+                "bbox": [130, 100, 280, 500],
+                "kind": "body",
+                "render_mode": "text",
+                "source_text": "t0,0 t0,1 t1,0 t1,1 tm-1,0 tm-1,1",
+            },
+            {
+                "bbox": [330, 100, 470, 500],
+                "kind": "body",
+                "render_mode": "text",
+                "source_text": "t'0 t'1 t''0 t''1 u1 u2 u3 u4",
+            },
+            {
+                "bbox": [130, 520, 470, 560],
+                "kind": "body",
+                "render_mode": "text",
+                "source_text": "This paragraph spans the normal single-column body width.",
+            },
+        ]
+        self.assertEqual(prepare_paper.classify_columns(elements, 595.0), 1)
+
+    def test_two_prose_columns_are_still_detected(self) -> None:
+        elements = [
+            {
+                "bbox": [40, 100, 280, 180],
+                "kind": "body",
+                "render_mode": "text",
+                "source_text": "Left column paragraph with several ordinary prose words.",
+            },
+            {
+                "bbox": [40, 200, 280, 280],
+                "kind": "body",
+                "render_mode": "text",
+                "source_text": "Another left paragraph with enough ordinary prose words.",
+            },
+            {
+                "bbox": [320, 100, 560, 180],
+                "kind": "body",
+                "render_mode": "text",
+                "source_text": "Right column paragraph with several ordinary prose words.",
+            },
+            {
+                "bbox": [320, 200, 560, 280],
+                "kind": "body",
+                "render_mode": "text",
+                "source_text": "Another right paragraph with enough ordinary prose words.",
+            },
+        ]
+        self.assertEqual(prepare_paper.classify_columns(elements, 600.0), 2)
+
+    def test_algorithm_instruction_with_inline_math_is_body(self) -> None:
+        kind = prepare_paper.classify_text_kind(
+            "For 1 ≤ i ≤ µ + 1: If i = µ + 1",
+            pymupdf.Rect(130, 300, 430, 340),
+            pymupdf.Rect(0, 0, 595, 842),
+            10.0,
+            10.0,
+            10,
+        )
+        self.assertEqual(kind, "body")
+
+    def test_overlapping_inline_math_blocks_merge_into_body(self) -> None:
+        def record(
+            text: str,
+            bbox: list[float],
+            font: str,
+            baseline: float,
+        ) -> tuple[
+            dict[str, object],
+            str,
+            list[float],
+            list[str],
+            list[dict[str, object]],
+        ]:
+            span = {
+                "text": text,
+                "font": font,
+                "size": 10.0,
+                "flags": 4,
+                "origin": [bbox[0], baseline],
+                "bbox": bbox,
+            }
+            block = {
+                "bbox": bbox,
+                "lines": [{"bbox": bbox, "spans": [span]}],
+            }
+            source, sizes, fonts, spans = prepare_paper.block_text(block)
+            return block, source, sizes, fonts, spans
+
+        parsed = [
+            record("Cost O(", [100, 100, 300, 130], "LMRoman10-Regular", 128),
+            record("√", [250, 110, 260, 125], "LMMathSymbols10-Regular", 119.5),
+            record("N).", [260, 115, 400, 145], "LMRoman10-Regular", 128),
+        ]
+        merged = prepare_paper.merge_fragmented_text_blocks(
+            parsed,
+            pymupdf.Rect(0, 0, 595, 842),
+            10.0,
+            3,
+        )
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0][1], "Cost O(√N).")
+
+    def test_inline_math_merge_preserves_adjacent_visual_lines(self) -> None:
+        def make_span(
+            text: str,
+            bbox: list[float],
+            font: str,
+            baseline: float,
+        ) -> dict[str, object]:
+            return {
+                "text": text,
+                "font": font,
+                "size": 10.0,
+                "flags": 4,
+                "origin": [bbox[0], baseline],
+                "bbox": bbox,
+            }
+
+        body_lines = [
+            {
+                "bbox": [100, 100, 400, 122],
+                "spans": [
+                    make_span(
+                        "First sentence.",
+                        [100, 100, 400, 122],
+                        "LMRoman10-Regular",
+                        120,
+                    )
+                ],
+            },
+            {
+                "bbox": [100, 122, 400, 145],
+                "spans": [
+                    make_span(
+                        "Cost O(",
+                        [100, 122, 300, 145],
+                        "LMRoman10-Regular",
+                        140,
+                    ),
+                    make_span(
+                        "N).",
+                        [260, 122, 400, 145],
+                        "LMRoman10-Regular",
+                        140,
+                    ),
+                ],
+            },
+            {
+                "bbox": [100, 142, 400, 165],
+                "spans": [
+                    make_span(
+                        "Next sentence.",
+                        [100, 142, 400, 165],
+                        "LMRoman10-Regular",
+                        160,
+                    )
+                ],
+            },
+        ]
+        body_block = {"bbox": [100, 100, 400, 165], "lines": body_lines}
+        body_source, body_sizes, body_fonts, body_spans = prepare_paper.block_text(
+            body_block
+        )
+        radical_bbox = [250, 125, 260, 143]
+        radical_block = {
+            "bbox": radical_bbox,
+            "lines": [
+                {
+                    "bbox": radical_bbox,
+                    "spans": [
+                        make_span(
+                            "√",
+                            radical_bbox,
+                            "LMMathSymbols10-Regular",
+                            131.5,
+                        )
+                    ],
+                }
+            ],
+        }
+        radical_source, radical_sizes, radical_fonts, radical_spans = (
+            prepare_paper.block_text(radical_block)
+        )
+        parsed = [
+            (body_block, body_source, body_sizes, body_fonts, body_spans),
+            (
+                radical_block,
+                radical_source,
+                radical_sizes,
+                radical_fonts,
+                radical_spans,
+            ),
+        ]
+        merged = prepare_paper.merge_fragmented_text_blocks(
+            parsed,
+            pymupdf.Rect(0, 0, 595, 842),
+            10.0,
+            3,
+        )
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(
+            merged[0][1],
+            "First sentence.\nCost O(√N).\nNext sentence.",
+        )
 
     def test_reviewed_boundary_supports_paper_without_conclusion(self) -> None:
         units = [
