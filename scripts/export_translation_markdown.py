@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.11"
-# dependencies = []
+# dependencies = ["pymupdf>=1.26.0,<2"]
 # ///
 """Export the reviewed Chinese body translation as readable Markdown.
 
@@ -13,15 +13,18 @@ from __future__ import annotations
 import argparse
 import json
 import re
+from itertools import pairwise
 from pathlib import Path
 from typing import Any
 
+from native_latex import resolve_display_math, resolve_inline_math
 
 PLACEHOLDER_RE = re.compile(r"\[\[P\d{4}\]\]")
 CONTROL_TOKEN_RE = re.compile(
     r"\[\[(?:[BIE][A-Za-z0-9_]*_(?:OPEN|CLOSE)|"
     r"F[A-Za-z0-9_]+|BR|PAR)\]\]"
 )
+STYLE_TOKEN_RE = re.compile(r"\[\[([BIE][A-Za-z0-9_]*)_(OPEN|CLOSE)\]\]")
 
 
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -65,14 +68,56 @@ def restore_tokens(unit: dict[str, Any], translated_text: str) -> str:
     return restored.strip()
 
 
-def rich_text_to_markdown(unit: dict[str, Any], text: str) -> str:
+def rich_text_to_markdown(
+    unit: dict[str, Any],
+    text: str,
+    reviews: dict[str, dict[str, Any]] | None = None,
+) -> str:
     fragments = dict(unit.get("inline_fragments") or {})
     styles = dict(unit.get("style_tokens") or {})
     output: list[str] = []
+    pending_math: list[str] = []
+    style_stack: list[str] = []
+    matches = list(CONTROL_TOKEN_RE.finditer(text))
+    coalesced_style_edges: set[int] = set()
+    for index, (left, right) in enumerate(pairwise(matches)):
+        left_style = STYLE_TOKEN_RE.fullmatch(left.group(0))
+        right_style = STYLE_TOKEN_RE.fullmatch(right.group(0))
+        if (
+            left.end() == right.start()
+            and left_style
+            and right_style
+            and left_style.group(2) == "CLOSE"
+            and right_style.group(2) == "OPEN"
+            and left_style.group(1) in styles
+            and styles.get(left_style.group(1))
+            == styles.get(right_style.group(1))
+        ):
+            coalesced_style_edges.update((index, index + 1))
+
+    def flush_math() -> None:
+        if pending_math:
+            # A space separates TeX control words without introducing a second
+            # adjacent dollar delimiter, which Markdown can read as display math.
+            output.append("$" + " ".join(pending_math) + "$")
+            pending_math.clear()
+
     cursor = 0
-    for match in CONTROL_TOKEN_RE.finditer(text):
-        output.append(text[cursor : match.start()])
+    for index, match in enumerate(matches):
+        literal = text[cursor : match.start()]
+        if literal:
+            flush_math()
+            output.append(literal)
         token = match.group(0)
+        fragment = fragments.get(token, {})
+        if fragment.get("kind") == "math":
+            tex, _ = resolve_inline_math(
+                {**fragment, "token": token}, reviews or {}
+            )
+            pending_math.append(tex)
+            cursor = match.end()
+            continue
+        flush_math()
         if token == "[[BR]]":
             output.append("  \n")
         elif token == "[[PAR]]":
@@ -85,25 +130,29 @@ def rich_text_to_markdown(unit: dict[str, Any], text: str) -> str:
                 if output:
                     output[-1] = re.sub(r"\s+$", "", output[-1])
                 output.append(f"<sup>{value}</sup>")
-            elif kind == "math":
-                tex = str(fragment.get("tex") or "").strip()
-                output.append(f"${tex}$" if tex else f"${value}$")
             elif kind == "footnote-marker":
                 output.append(f"<sup>{value}</sup>")
             else:
                 output.append(value)
         else:
-            style_match = re.fullmatch(
-                r"\[\[([BIE][A-Za-z0-9_]*)_(OPEN|CLOSE)\]\]", token
-            )
+            style_match = STYLE_TOKEN_RE.fullmatch(token)
             if not style_match or style_match.group(1) not in styles:
                 raise ValueError(f"{unit['id']}: unknown rich token {token}")
-            marker = "**" if styles[style_match.group(1)] == "bold" else "*"
-            output.append(marker)
+            key, edge = style_match.groups()
+            if edge == "OPEN":
+                style_stack.append(key)
+            elif not style_stack or style_stack.pop() != key:
+                raise ValueError(f"{unit['id']}: reversed or crossed style token {token}")
+            if index not in coalesced_style_edges:
+                marker = "**" if styles[key] == "bold" else "*"
+                output.append(marker)
         cursor = match.end()
+    flush_math()
     output.append(text[cursor:])
+    if style_stack:
+        raise ValueError(f"{unit['id']}: unclosed style token")
     rendered = "".join(output)
-    if CONTROL_TOKEN_RE.search(rendered):
+    if CONTROL_TOKEN_RE.search(rendered) or "[[UNRESOLVED:" in rendered:
         raise ValueError(f"{unit['id']}: unresolved rich token")
     if unit.get("block_style") == "italic":
         rendered = f"<em>{rendered}</em>"
@@ -150,17 +199,11 @@ def export_markdown(
     consumed_display_ids: set[str] = set()
     for unit in ordered_units[start:stop]:
         unit_id = str(unit["id"])
-        if unit_id in consumed_display_ids:
+        if unit_id in consumed_display_ids or unit.get("render_suppressed"):
             continue
         display = dict(review_entries.get(unit_id) or {})
-        if display.get("kind") == "display":
-            if display.get("review_status") != "manually_reviewed":
-                raise ValueError(
-                    f"{unit_id}: display math review is incomplete"
-                )
-            tex = str(display.get("tex") or "").strip()
-            if not tex:
-                raise ValueError(f"{unit_id}: display math TeX is empty")
+        if display.get("kind") == "display" or unit.get("kind") == "equation":
+            tex = resolve_display_math(unit, review_entries)
             lines.extend(("$$", tex, "$$", ""))
             consumed_display_ids.update(
                 str(value) for value in display.get("source_ids") or [unit_id]
@@ -173,7 +216,7 @@ def export_markdown(
         if not translated:
             raise ValueError(f"{unit['id']}: translated_text is empty")
         restored = rich_text_to_markdown(
-            unit, restore_tokens(unit, translated)
+            unit, restore_tokens(unit, translated), review_entries
         )
         if unit.get("kind") == "footnote":
             footnotes.append(restored)
@@ -196,6 +239,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--manifest", required=True, type=Path)
     parser.add_argument("--translations", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--title", help="Override the source title in Markdown only.")
     return parser.parse_args()
 
 
@@ -205,6 +249,8 @@ def main() -> int:
     translations_path = args.translations.expanduser().resolve()
     output_path = args.output.expanduser().resolve()
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if args.title:
+        manifest["source_title"] = args.title
     if manifest.get("boundary", {}).get("needs_boundary_review"):
         raise SystemExit("Translation boundary review is incomplete.")
     units_path = manifest_path.parent / manifest["paths"]["translation_units"]
