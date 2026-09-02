@@ -95,6 +95,27 @@ def _fragment_tex(fragment: dict[str, Any]) -> str:
 
 
 def normalize_native_tex(value: str) -> str:
+    # Percentages arrive from the PDF as literal percent signs. In TeX an
+    # unescaped percent comments out the closing math delimiter and the rest
+    # of the paragraph. Preserve existing escapes (and preceding line breaks).
+    value = re.sub(
+        r"(?<!\\)((?:\\\\)*)%",
+        lambda match: match.group(1) + r"\%",
+        value,
+    )
+    # Normalize common glyph substitutions emitted by embedded paper fonts.
+    # Sonic's source uses U+03D5 for phi and a Cyrillic small-de glyph where
+    # the mathematical generator is the Latin letter g.
+    value = value.replace("ϕ", r"\phi")
+    value = value.replace("д", "g")
+    value = re.sub(
+        r"([A-Za-zΑ-ω])\u20d7",
+        lambda match: rf"\vec{{{match.group(1)}}}",
+        value,
+    )
+    value = value.replace("≫", r"\gg ")
+    value = value.replace("↔", r"\leftrightarrow ")
+    value = value.replace("𝔫", r"\mathfrak{n}")
     value = re.sub("\u0338\\s*=", r"\\ne ", value)
     value = value.replace("\u0338", r"\not ")
     for mark, command in {
@@ -116,6 +137,53 @@ def normalize_native_tex(value: str) -> str:
         value,
     )
     return value
+
+
+def validate_native_tex_compatibility(tex: str, label: str) -> None:
+    if re.search(r"\\tag\s*\{", tex):
+        raise MathReviewError(
+            f"{label}: \\tag{{...}} is unsupported inside TPDisplayMath; "
+            r"write the equation number as \qquad(n)."
+        )
+    unsupported = {
+        "\u20d7": r"use \vec{...}",
+        "≫": r"use \gg",
+        "↔": r"use \leftrightarrow",
+        "𝔫": r"use \mathfrak{n}",
+    }
+    found = [
+        f"U+{ord(character):04X} {character!r}: {replacement}"
+        for character, replacement in unsupported.items()
+        if character in tex
+    ]
+    if found:
+        raise MathReviewError(
+            f"{label}: unsupported native-TeX Unicode remains: "
+            + "; ".join(found)
+        )
+    mathematical_alphanumerics = sorted(
+        {
+            character
+            for character in tex
+            if 0x1D400 <= ord(character) <= 0x1D7FF
+        }
+    )
+    combining_math = sorted(
+        {
+            character
+            for character in tex
+            if 0x20D0 <= ord(character) <= 0x20FF
+        }
+    )
+    if mathematical_alphanumerics or combining_math:
+        details = ", ".join(
+            f"U+{ord(character):04X} {character!r}"
+            for character in [*mathematical_alphanumerics, *combining_math]
+        )
+        raise MathReviewError(
+            f"{label}: unsupported mathematical Unicode {details}; "
+            "replace it with explicit reviewed TeX."
+        )
 
 
 def load_math_review(
@@ -193,6 +261,10 @@ def resolve_inline_math(
             f"{token}: Unicode radical glyph is not native TeX; "
             r"use \sqrt{...}."
         )
+    validate_native_tex_compatibility(
+        tex,
+        token or "<unnamed math fragment>",
+    )
     if not tex or not _tex_balanced(tex):
         raise MathReviewError(f"{token}: invalid or unbalanced TeX: {tex!r}")
     return tex, status
@@ -214,6 +286,7 @@ def resolve_display_math(
             f"{node['id']}: Unicode radical glyph is not native TeX; "
             r"use \sqrt{...}."
         )
+    validate_native_tex_compatibility(tex, str(node["id"]))
     if not tex or not _tex_balanced(tex):
         raise MathReviewError(
             f"{node['id']}: display equation has invalid TeX."
@@ -233,8 +306,155 @@ def latex_escape_text(value: str) -> str:
         "_": r"\_",
         "^": r"\textasciicircum{}",
         "~": r"\textasciitilde{}",
+        "α": r"\(\alpha\)",
+        "β": r"\(\beta\)",
+        "γ": r"\(\gamma\)",
+        "δ": r"\(\delta\)",
+        "ε": r"\(\epsilon\)",
+        "ζ": r"\(\zeta\)",
+        "η": r"\(\eta\)",
+        "θ": r"\(\theta\)",
+        "ι": r"\(\iota\)",
+        "κ": r"\(\kappa\)",
+        "λ": r"\(\lambda\)",
+        "μ": r"\(\mu\)",
+        "ν": r"\(\nu\)",
+        "ξ": r"\(\xi\)",
+        "ο": r"\(o\)",
+        "π": r"\(\pi\)",
+        "ρ": r"\(\rho\)",
+        "σ": r"\(\sigma\)",
+        "τ": r"\(\tau\)",
+        "υ": r"\(\upsilon\)",
+        "φ": r"\(\phi\)",
+        "ϕ": r"\(\phi\)",
+        "χ": r"\(\chi\)",
+        "ψ": r"\(\psi\)",
+        "ω": r"\(\omega\)",
+        "Γ": r"\(\Gamma\)",
+        "Δ": r"\(\Delta\)",
+        "Θ": r"\(\Theta\)",
+        "Λ": r"\(\Lambda\)",
+        "Ξ": r"\(\Xi\)",
+        "Π": r"\(\Pi\)",
+        "Σ": r"\(\Sigma\)",
+        "Φ": r"\(\Phi\)",
+        "Ψ": r"\(\Psi\)",
+        "Ω": r"\(\Omega\)",
+        "д": "g",
+        "ℓ": r"\(\ell\)",
+        "∈": r"\(\in\)",
+        "∉": r"\(\notin\)",
+        "∅": r"\(\varnothing\)",
+        "∪": r"\(\cup\)",
+        "∏": r"\(\prod\)",
+        "∑": r"\(\sum\)",
+        "∥": r"\(\parallel\)",
+        "≈": r"\(\approx\)",
+        "≠": r"\(\neq\)",
+        "≤": r"\(\leq\)",
+        "≥": r"\(\geq\)",
+        "⊂": r"\(\subset\)",
+        "⊆": r"\(\subseteq\)",
+        "⊥": r"\(\bot\)",
+        "→": r"\(\to\)",
+        "←": r"\(\leftarrow\)",
+        "↔": r"\(\leftrightarrow\)",
+        "↦": r"\(\mapsto\)",
+        "−": r"\(-\)",
+        "×": r"\(\times\)",
+        "′": r"\(\prime\)",
+        "□": r"\(\rule{0.55em}{0.55em}\)",
+        "⊙": r"\(\odot\)",
+        "⌈": r"\(\lceil\)",
+        "⌉": r"\(\rceil\)",
+        "⁰": r"\textsuperscript{0}",
+        "¹": r"\textsuperscript{1}",
+        "²": r"\textsuperscript{2}",
+        "³": r"\textsuperscript{3}",
+        "⁴": r"\textsuperscript{4}",
+        "⁵": r"\textsuperscript{5}",
+        "⁶": r"\textsuperscript{6}",
+        "⁷": r"\textsuperscript{7}",
+        "⁸": r"\textsuperscript{8}",
+        "⁹": r"\textsuperscript{9}",
+        "⁺": r"\textsuperscript{+}",
+        "⁻": r"\textsuperscript{-}",
+        "ⁿ": r"\textsuperscript{n}",
+        "ⁱ": r"\textsuperscript{i}",
+        "ᵀ": r"\textsuperscript{T}",
+        "ᴰ": r"\textsuperscript{D}",
+        "ᵃ": r"\textsuperscript{a}",
+        "ᵇ": r"\textsuperscript{b}",
+        "ᶜ": r"\textsuperscript{c}",
+        "ᵈ": r"\textsuperscript{d}",
+        "ᵉ": r"\textsuperscript{e}",
+        "ᶠ": r"\textsuperscript{f}",
+        "ᵍ": r"\textsuperscript{g}",
+        "ʰ": r"\textsuperscript{h}",
+        "ʲ": r"\textsuperscript{j}",
+        "ᵏ": r"\textsuperscript{k}",
+        "ˡ": r"\textsuperscript{l}",
+        "ᵐ": r"\textsuperscript{m}",
+        "ᵒ": r"\textsuperscript{o}",
+        "ᵖ": r"\textsuperscript{p}",
+        "ʳ": r"\textsuperscript{r}",
+        "ˢ": r"\textsuperscript{s}",
+        "ᵘ": r"\textsuperscript{u}",
+        "ᵛ": r"\textsuperscript{v}",
+        "ˣ": r"\textsuperscript{x}",
+        "ʸ": r"\textsuperscript{y}",
+        "ᶻ": r"\textsuperscript{z}",
+        "ʷ": r"\textsuperscript{w}",
+        "ᵗ": r"\textsuperscript{t}",
+        "ᵢ": r"\textsubscript{i}",
+        "₀": r"\textsubscript{0}",
+        "₁": r"\textsubscript{1}",
+        "₂": r"\textsubscript{2}",
+        "₃": r"\textsubscript{3}",
+        "₄": r"\textsubscript{4}",
+        "₅": r"\textsubscript{5}",
+        "₆": r"\textsubscript{6}",
+        "₇": r"\textsubscript{7}",
+        "₈": r"\textsubscript{8}",
+        "₉": r"\textsubscript{9}",
+        "ₓ": r"\textsubscript{x}",
+        "ₙ": r"\textsubscript{n}",
+        "ⱼ": r"\textsubscript{j}",
+        "ₐ": r"\textsubscript{a}",
+        "ₑ": r"\textsubscript{e}",
+        "ₕ": r"\textsubscript{h}",
+        "ₖ": r"\textsubscript{k}",
+        "ₗ": r"\textsubscript{l}",
+        "ₘ": r"\textsubscript{m}",
+        "ₒ": r"\textsubscript{o}",
+        "ₚ": r"\textsubscript{p}",
+        "ₛ": r"\textsubscript{s}",
+        "ₜ": r"\textsubscript{t}",
+        "⟨": r"\(\langle\)",
+        "⟩": r"\(\rangle\)",
+        "⋯": r"\(\cdots\)",
+        "≡": r"\(\equiv\)",
+        "∘": r"\(\circ\)",
+        "★": r"\(\star\)",
+        "≫": r"\(\gg\)",
+        "𝔫": r"\(\mathfrak{n}\)",
     }
-    return "".join(replacements.get(character, character) for character in value)
+    output: list[str] = []
+    index = 0
+    while index < len(value):
+        character = value[index]
+        if index + 1 < len(value) and value[index + 1] == "\u20d7":
+            output.append(r"\(\vec{" + character + r"}\)")
+            index += 2
+            continue
+        if "①" <= character <= "⑳" or "\u25a0" <= character <= "\u25ff":
+            output.append(r"\TPTextSymbol{" + character + "}")
+            index += 1
+            continue
+        output.append(replacements.get(character, character))
+        index += 1
+    return "".join(output)
 
 
 def _auto_math_tex(token: str) -> str:
@@ -294,6 +514,39 @@ def rich_text_to_latex(
         for fragment in fragments.values()
     )
     text = str(node.get("text") or "")
+    unmatched_vector = any(
+        index == 0 or not re.fullmatch(r"[A-Za-zΑ-ω]", text[index - 1])
+        for index, character in enumerate(text)
+        if character == "\u20d7"
+    )
+    if unmatched_vector:
+        raise ValueError(
+            f"{node['id']}: combining vector arrow U+20D7 has no base "
+            r"character; use a reviewed \vec{...} math fragment."
+        )
+    unsupported_prose = sorted(
+        {
+            character
+            for character in text
+            if (
+                0x1D400 <= ord(character) <= 0x1D7FF
+                and character != "𝔫"
+            )
+            or (
+                0x20D0 <= ord(character) <= 0x20FF
+                and character != "\u20d7"
+            )
+        }
+    )
+    if unsupported_prose:
+        details = ", ".join(
+            f"U+{ord(character):04X} {character!r}"
+            for character in unsupported_prose
+        )
+        raise ValueError(
+            f"{node['id']}: unsupported mathematical Unicode {details}; "
+            "move it into a reviewed native-math fragment."
+        )
     output: list[str] = []
     cursor = 0
     for match in CONTROL_TOKEN_RE.finditer(text):
@@ -580,6 +833,8 @@ def _document_preamble(profile: Any) -> str:
 \setsansfont{{Latin Modern Sans}}
 \setmonofont{{Latin Modern Mono}}
 \setmathfont{{Latin Modern Math}}
+\newfontfamily\TPSymbolFont[AutoFakeBold=2.2,AutoFakeSlant=0.18]{{Segoe UI Symbol}}
+\newcommand{{\TPTextSymbol}}[1]{{{{\TPSymbolFont #1}}}}
 \setCJKmainfont[AutoFakeBold=2.2,AutoFakeSlant=0.18]{{SimSun}}
 \setCJKsansfont{{SimHei}}
 \setCJKmonofont{{SimSun}}
