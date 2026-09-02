@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 import pymupdf
+import source_review
 from typography import ZH_ACADEMIC_V1
 
 
@@ -152,6 +153,14 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Reviewed boundary JSON. Defaults to <work-dir>/boundary-review.json; "
             "a reviewed file is applied automatically on reruns."
+        ),
+    )
+    parser.add_argument(
+        "--source-review",
+        type=Path,
+        help=(
+            "Source-hash-bound extraction review JSON. Defaults to "
+            "<work-dir>/source-review.json and is replayed on reruns."
         ),
     )
     return parser.parse_args()
@@ -2614,6 +2623,7 @@ def build_visual_layout(
         for element in elements
         if element.get("kind") in {"figure", "table"}
         and element.get("render_mode") == "source_clip"
+        and not element.get("render_suppressed")
     ]
     warnings: list[str] = []
     errors: list[str] = []
@@ -2646,13 +2656,34 @@ def build_visual_layout(
         if not same_page:
             errors.append(f"{label}: caption has no source visual object.")
             continue
-        visual = min(
-            same_page,
-            key=lambda item: min(
-                abs(pymupdf.Rect(item["bbox"]).y1 - caption_rect.y0),
-                abs(pymupdf.Rect(item["bbox"]).y0 - caption_rect.y1),
-            ),
-        )
+        reviewed_id = str(caption.get("visual_id") or "")
+        reviewed_matches = [
+            item for item in same_page
+            if reviewed_id and item.get("review_visual_id") == reviewed_id
+        ]
+        if reviewed_id and caption.get("source_review_reason"):
+            if len(reviewed_matches) != 1:
+                errors.append(
+                    f"{label}: reviewed caption has no unique source visual."
+                )
+                continue
+            visual = reviewed_matches[0]
+        else:
+            # Same-row figures in separate columns must not cross-associate
+            # merely because one vertical gap is a fraction of a point smaller.
+            visual = min(
+                same_page,
+                key=lambda item: (
+                    not (
+                        pymupdf.Rect(item["bbox"]).x0 < caption_rect.x1
+                        and pymupdf.Rect(item["bbox"]).x1 > caption_rect.x0
+                    ),
+                    min(
+                        abs(pymupdf.Rect(item["bbox"]).y1 - caption_rect.y0),
+                        abs(pymupdf.Rect(item["bbox"]).y0 - caption_rect.y1),
+                    ),
+                ),
+            )
         used.add(str(visual["id"]))
         visual_rect = pymupdf.Rect(visual["bbox"])
         visual_parts = [
@@ -2660,6 +2691,7 @@ def build_visual_layout(
             for element in elements
             if int(element["page"]) == page_number
             and element.get("render_mode") == "source_clip"
+            and not element.get("render_suppressed")
             and element.get("kind") != "equation"
             and (
                 element is visual
@@ -2693,6 +2725,9 @@ def build_visual_layout(
                 "used source visual/content width ratio."
             )
         target_width = min(output_width, visual_rect.width * scale)
+        scale = target_width / max(visual_rect.width, 1.0)
+        if internal_size is not None:
+            target_internal = internal_size * scale
         target_height = target_width * visual_rect.height / max(
             visual_rect.width, 1.0
         )
@@ -2703,13 +2738,18 @@ def build_visual_layout(
             scale *= height_scale
             if target_internal is not None:
                 target_internal *= height_scale
-        visual_id = label
+        visual_id = str(visual.get("review_visual_id") or label)
+        reviewed_source_ids = [
+            str(value)
+            for value in visual.get("review_visual_source_ids") or []
+        ]
         entry = {
             "visual_id": visual_id,
             "label": label,
             "kind": caption_kind,
             "page": page_number,
-            "source_ids": [str(part["id"]) for part in visual_parts],
+            "source_ids": reviewed_source_ids
+            or [str(part["id"]) for part in visual_parts],
             "caption_id": str(caption["id"]),
             "source_bbox": rect_list(visual_rect),
             "source_body_font_pt": round(body_size, 3),
@@ -2733,6 +2773,17 @@ def build_visual_layout(
         visuals.append(entry)
         for element in [*visual_parts, caption]:
             element["visual_id"] = visual_id
+        for reviewed_id in reviewed_source_ids:
+            reviewed_element = next(
+                (
+                    element
+                    for element in elements
+                    if str(element.get("id")) == reviewed_id
+                ),
+                None,
+            )
+            if reviewed_element is not None:
+                reviewed_element["visual_id"] = visual_id
         visual["visual_layout"] = entry
 
     for candidate in candidates:
@@ -2861,6 +2912,28 @@ def main() -> int:
             review_path,
             make_boundary_review(all_elements, boundary, source_hash_before),
         )
+    source_review_path = (
+        args.source_review.expanduser().resolve()
+        if args.source_review
+        else work_dir / "source-review.json"
+    )
+    try:
+        source_review_payload = source_review.load_source_review(
+            source_review_path,
+            source_hash_before,
+        )
+        source_review_path.parent.mkdir(parents=True, exist_ok=True)
+        json_dump(source_review_path, source_review_payload)
+        source_review_report = source_review.apply_source_review(
+            all_elements,
+            source_review_payload,
+            source_hash_before,
+            page_records,
+            protect_element,
+            translations_path=work_dir / "translations.jsonl",
+        )
+    except source_review.SourceReviewError as error:
+        raise SystemExit(f"Invalid source review: {error}") from error
     math_review_path = work_dir / "math-review.json"
     existing_math_review: dict[str, Any] | None = None
     if math_review_path.exists():
@@ -2887,6 +2960,17 @@ def main() -> int:
     )
     visual_layout_path = work_dir / "visual-layout.json"
     json_dump(visual_layout_path, visual_layout)
+    source_errors, source_warnings = source_review.detect_source_issues(
+        all_elements,
+        visual_layout,
+    )
+    source_review_report = source_review.complete_report(
+        source_review_report,
+        source_errors,
+        source_warnings,
+    )
+    source_review_report_path = work_dir / "source-review-report.json"
+    json_dump(source_review_report_path, source_review_report)
     units_path = work_dir / "translation-units.jsonl"
     template_path = work_dir / "translations.template.jsonl"
     write_jsonl(units_path, all_elements)
@@ -2907,6 +2991,16 @@ def main() -> int:
             if element["translatable"]
         ),
     )
+    if source_review_report["applied_operations"]:
+        try:
+            source_review.reconcile_translations(
+                work_dir / "translations.jsonl",
+                all_elements,
+            )
+        except source_review.SourceReviewError as error:
+            raise SystemExit(
+                f"Cannot reconcile translations after source review: {error}"
+            ) from error
     glossary_path = work_dir / "glossary.json"
     if not glossary_path.exists():
         json_dump(glossary_path, {})
@@ -2940,6 +3034,8 @@ def main() -> int:
             "layout_text": "layout.txt",
             "source_preview": "source-preview",
             "boundary_review": str(review_path),
+            "source_review": str(source_review_path),
+            "source_review_report": source_review_report_path.name,
             "math_review": math_review_path.name,
             "visual_layout": visual_layout_path.name,
         },
@@ -2985,6 +3081,10 @@ def main() -> int:
                     visual_layout["status"] != "pass",
                     "The source visual inventory has blocking errors.",
                 ),
+                (
+                    source_review_report["status"] != "pass",
+                    "The source extraction review has blocking errors.",
+                ),
             )
             if condition
         ],
@@ -2994,6 +3094,15 @@ def main() -> int:
             "count": len(visual_layout["visuals"]),
             "warnings": len(visual_layout["warnings"]),
             "errors": len(visual_layout["errors"]),
+        },
+        "source_review": {
+            "status": source_review_report["status"],
+            "reviewed": source_review_report["reviewed"],
+            "applied_operations": source_review_report[
+                "applied_operations"
+            ],
+            "errors": len(source_review_report["errors"]),
+            "warnings": len(source_review_report["warnings"]),
         },
         "footnotes": footnote_links,
     }
