@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import re
 import shutil
+import statistics
 import subprocess
 from collections import Counter
 from pathlib import Path
@@ -371,6 +372,80 @@ def _node_is_nonmath_clip(node: dict[str, Any]) -> bool:
     )
 
 
+def prepare_native_clip_nodes(
+    nodes: list[dict[str, Any]],
+    elements: list[dict[str, Any]],
+    profile: Any,
+) -> list[dict[str, Any]]:
+    """Keep independently reviewed clips separate and scale their source text."""
+    body_sizes = [
+        float(element.get("font_size") or 0.0)
+        for element in elements
+        if element.get("kind") == "body"
+        and element.get("render_mode") == "text"
+        and float(element.get("font_size") or 0.0) > 0
+    ]
+    source_body_size = statistics.median(body_sizes) if body_sizes else 10.0
+    text_scale = profile.body_font_size / source_body_size
+    result: list[dict[str, Any]] = []
+    for original in nodes:
+        parts = list(original.get("elements") or [original["element"]])
+        # Legacy flow batching unions adjacent source rectangles. Separate
+        # invariant objects without a shared reviewed visual ID must never
+        # become one rectangular crop (which can include unrelated prose).
+        if (
+            _node_is_nonmath_clip(original)
+            and not original["element"].get("visual_id")
+            and len(parts) > 1
+        ):
+            children = [
+                {
+                    **original,
+                    "id": part["id"],
+                    "ids": [part["id"]],
+                    "element": dict(part),
+                    "elements": [part],
+                    "composite_parts": 1,
+                }
+                for part in parts
+            ]
+        else:
+            children = [{**original, "element": dict(original["element"])}]
+        for node in children:
+            if (
+                _node_is_nonmath_clip(node)
+                and not node.get("visual_layout")
+                and not node["element"].get("visual_layout")
+                and not node["element"].get("layout_target_text_scale")
+            ):
+                node["element"]["layout_target_text_scale"] = text_scale
+            result.append(node)
+    return result
+
+
+def footnote_body_without_number(node: dict[str, Any]) -> str:
+    """Drop only the recorded label; TeX emits that label at the anchor."""
+    text = str(node.get("text") or "").lstrip()
+    number = str(node.get("element", {}).get("footnote_number") or "")
+    fragments, _ = node_rich_metadata(node)
+    first = CONTROL_TOKEN_RE.match(text)
+    if number and first:
+        fragment = fragments.get(first.group(0), {})
+        if re.fullmatch(
+            re.escape(number) + r"[.)]?",
+            str(fragment.get("text") or "").strip(),
+        ):
+            return text[first.end():].lstrip()
+    if number:
+        return re.sub(
+            r"^" + re.escape(number) + r"(?=\s|[.)]|$)[.)]?\s*",
+            "",
+            text,
+            count=1,
+        )
+    return FOOTNOTE_PREFIX_RE.sub("", text, count=1).lstrip()
+
+
 def _sanitize_id(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "-", value)
 
@@ -398,6 +473,16 @@ def _create_source_clip_asset(
 def _source_clip_rect(
     source_page: pymupdf.Page, node: dict[str, Any]
 ) -> pymupdf.Rect:
+    visual_layout = dict(
+        node.get("visual_layout")
+        or node.get("element", {}).get("visual_layout")
+        or {}
+    )
+    calibrated_bbox = visual_layout.get("source_bbox")
+    if calibrated_bbox:
+        calibrated = pymupdf.Rect(calibrated_bbox) & source_page.rect
+        if not calibrated.is_empty:
+            return calibrated
     clip = pymupdf.Rect(node["element"]["bbox"]) & source_page.rect
     if (
         clip.is_empty
@@ -551,12 +636,18 @@ def _node_to_latex(
         _, target_width, _, _ = source_clip_target_geometry(
             source, node, profile
         )
+        placement_marker = "TPVIS" + _sanitize_id(str(node["id"]))
         return (
             "\n".join(
                 [
                     r"\par\smallskip",
                     r"\begin{center}",
-                    rf"\includegraphics[width={target_width:.3f}pt,height=.72\textheight,keepaspectratio]{{\detokenize{{{relative}}}}}",
+                    (
+                        r"\makebox[0pt][l]{"
+                        rf"\fontsize{{0.1pt}}{{0.1pt}}\selectfont {placement_marker}"
+                        r"}"
+                        rf"\includegraphics[width={target_width:.3f}pt,height=.72\textheight,keepaspectratio]{{\detokenize{{{relative}}}}}"
+                    ),
                     r"\end{center}",
                     r"\smallskip",
                 ]
@@ -699,8 +790,10 @@ def build_body_tex(
                     "source_internal_font_pt": visual.get(
                         "source_internal_font_pt"
                     ),
-                    "target_internal_font_pt": visual.get(
-                        "target_internal_font_pt"
+                    "target_internal_font_pt": (
+                        round(float(visual["source_internal_font_pt"]) * actual_scale, 3)
+                        if visual.get("source_internal_font_pt") is not None
+                        else None
                     ),
                     "aspect_ratio": visual.get("aspect_ratio"),
                     "caption_id": visual.get("caption_id"),
@@ -908,8 +1001,15 @@ def locate_placements(
     located: list[dict[str, Any]] = []
     for stub, node in zip(placement_stubs, nodes):
         plain = _replace_control_tokens_with_text(node)
-        candidates = re.findall(r"[\u3400-\u9fffA-Za-z0-9][\u3400-\u9fffA-Za-z0-9\s：，。,.()-]{5,40}", plain)
-        anchor = candidates[0].strip() if candidates else ""
+        if stub.get("render_mode") == "source_clip":
+            anchor = "TPVIS" + _sanitize_id(str(stub["id"]))
+        else:
+            candidates = re.findall(
+                r"[\u3400-\u9fffA-Za-z0-9]"
+                r"[\u3400-\u9fffA-Za-z0-9\s：，。,.()-]{5,40}",
+                plain,
+            )
+            anchor = candidates[0].strip() if candidates else ""
         page_number = last_page
         if anchor:
             normalized_anchor = _normalize(anchor[:20])
@@ -950,8 +1050,10 @@ def locate_placements(
             }
         )
     by_id = {
-        str(item["id"]): item
+        str(unit_id): item
         for item in located
+        for unit_id in item.get("ids") or [item.get("id")]
+        if unit_id
     }
     for item in located:
         anchor_id = str(item.get("anchor_id") or "")
@@ -1000,6 +1102,7 @@ def render_native_latex(
         visual_id = str(node.get("element", {}).get("visual_id") or "")
         if visual_id in visual_layouts:
             node["visual_layout"] = dict(visual_layouts[visual_id])
+    nodes = prepare_native_clip_nodes(nodes, elements, profile)
     build_dir = manifest_path.parent / "native-latex"
     if build_dir.exists():
         shutil.rmtree(build_dir)
