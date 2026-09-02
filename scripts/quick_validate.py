@@ -20,7 +20,8 @@ from typing import Any
 import pymupdf
 
 
-SUSPICIOUS_TEXT = ("[[", "\ufffd", "\u25a1", "\u25a0")
+UNRESOLVED_TEXT = ("[[",)
+SUSPICIOUS_GLYPHS = ("\ufffd", "\u25a1", "\u25a0")
 
 
 def sha256(path: Path) -> str:
@@ -38,6 +39,7 @@ def validate_pdf(
 ) -> dict[str, Any]:
     errors: list[str] = []
     metrics: dict[str, Any] = {}
+    source_glyph_text = ""
     if not translated.is_file():
         return {
             "status": "fail",
@@ -56,6 +58,17 @@ def validate_pdf(
                 != expected_source_sha256.casefold()
             ):
                 errors.append("Source PDF hash changed.")
+            try:
+                source_document = pymupdf.open(source)
+                try:
+                    source_glyph_text = "\n".join(
+                        page.get_text("text", sort=True)
+                        for page in source_document
+                    )
+                finally:
+                    source_document.close()
+            except Exception as error:
+                errors.append(f"Source PDF could not be inspected: {error}")
 
     try:
         document = pymupdf.open(translated)
@@ -92,7 +105,10 @@ def validate_pdf(
             text = page.get_text("text")
             if text.strip():
                 searchable_pages += 1
-            if any(marker in text for marker in SUSPICIOUS_TEXT):
+            if any(marker in text for marker in UNRESOLVED_TEXT) or any(
+                marker in text and marker not in source_glyph_text
+                for marker in SUSPICIOUS_GLYPHS
+            ):
                 errors.append(
                     f"Page {index + 1} contains an unresolved or suspicious glyph."
                 )

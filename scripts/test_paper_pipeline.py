@@ -27,6 +27,7 @@ import native_latex
 import prepare_paper
 import quick_validate
 import render_translation
+import source_review
 
 
 class PaperPipelineTests(unittest.TestCase):
@@ -1015,6 +1016,64 @@ class PaperPipelineTests(unittest.TestCase):
         self.assertGreaterEqual(clip.x1, 595.28 * 0.805)
         source.close()
 
+    def test_native_visual_layout_bbox_overrides_composite_union(self) -> None:
+        source = pymupdf.open()
+        page = source.new_page(width=595.28, height=841.89)
+        node = {
+            "id": "figure",
+            "element": {
+                "page": 1,
+                "bbox": [100.0, 400.0, 500.0, 600.0],
+                "visual_id": "figure-1",
+            },
+            "composite_parts": 3,
+            "visual_layout": {
+                "source_bbox": [130.0, 420.0, 470.0, 580.0],
+                "target_width_pt": 340.0,
+            },
+        }
+        clip = native_latex._source_clip_rect(page, node)
+        self.assertEqual(list(clip), [130.0, 420.0, 470.0, 580.0])
+        source.close()
+
+    def test_joined_placement_indexes_every_source_unit(self) -> None:
+        placement = {
+            "id": "p1",
+            "ids": ["p1", "p2"],
+            "output_page": 4,
+        }
+        indexed = check_translation.index_placements_by_id([placement])
+        self.assertIs(indexed["p1"], placement)
+        self.assertIs(indexed["p2"], placement)
+
+    def test_full_original_source_pages_only_include_full_boundaries(
+        self,
+    ) -> None:
+        pages = check_translation.full_original_source_pages(
+            {
+                "boundary_layout": {
+                    "segments": [
+                        {
+                            "source_page": 1,
+                            "mode": "full-page",
+                            "role": "front-original",
+                        },
+                        {
+                            "source_page": 8,
+                            "mode": "full-page",
+                            "role": "tail-original",
+                        },
+                        {
+                            "source_page": 7,
+                            "mode": "partial-page",
+                            "role": "tail-original",
+                        },
+                    ]
+                }
+            }
+        )
+        self.assertEqual(pages, {1, 8})
+
     def test_native_source_clip_reserves_space_for_following_caption(
         self,
     ) -> None:
@@ -1064,6 +1123,7 @@ class PaperPipelineTests(unittest.TestCase):
         table_chunk = tex.split("% TP-NODE table\n", 1)[1].split(
             "% TP-NODE caption\n", 1
         )[0]
+        self.assertIn("TPVIStable", table_chunk)
         self.assertRegex(
             table_chunk,
             r"\\Needspace\{\d+\.\d{2}pt\}\s+\\par\\smallskip",
@@ -1073,6 +1133,39 @@ class PaperPipelineTests(unittest.TestCase):
         )
         self.assertGreater(needspace, 340.0)
         source.close()
+
+    def test_native_source_clip_location_uses_exact_visual_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output_path = Path(directory) / "output.pdf"
+            document = pymupdf.open()
+            first = document.new_page(width=595.28, height=841.89)
+            first.insert_text((72, 72), "repeated table text")
+            second = document.new_page(width=595.28, height=841.89)
+            second.insert_text((72, 72), "repeated table text TPVIStable")
+            document.save(output_path)
+            document.close()
+            stub = {
+                "id": "table",
+                "ids": ["table"],
+                "render_mode": "source_clip",
+                "source_bbox": [100.0, 100.0, 300.0, 200.0],
+                "target_width_pt": 200.0,
+                "target_height_pt": 100.0,
+            }
+            node = {
+                "id": "table",
+                "text": "repeated table text",
+                "element": {"inline_fragments": {}, "style_tokens": {}},
+            }
+            placements = native_latex.locate_placements(
+                output_path,
+                [stub],
+                [node],
+                1,
+                2,
+                render_translation.PROFILE,
+            )
+        self.assertEqual(placements[0]["output_page"], 2)
 
     def test_native_inline_math_never_uses_an_image_asset(self) -> None:
         token = "[[Fp1_0001]]"
@@ -1204,6 +1297,197 @@ class PaperPipelineTests(unittest.TestCase):
             "unresolved",
         )
         self.assertEqual(review["entries"]["eq1"]["kind"], "display")
+
+    def test_math_review_splits_adjacent_display_groups_by_visual_id(
+        self,
+    ) -> None:
+        first = {
+            **self.unit("eq1", 1, "equation", "a = b"),
+            "render_mode": "source_clip",
+            "page": 1,
+            "bbox": [10, 20, 100, 40],
+            "visual_id": "math-p1-a",
+        }
+        second = {
+            **self.unit("eq2", 2, "equation", "c = d"),
+            "render_mode": "source_clip",
+            "page": 1,
+            "bbox": [10, 50, 100, 70],
+            "visual_id": "math-p1-b",
+        }
+        review = prepare_paper.build_math_review([first, second], "hash")
+        self.assertEqual(list(review["entries"]), ["eq1", "eq2"])
+        self.assertEqual(review["entries"]["eq1"]["source_ids"], ["eq1"])
+        self.assertEqual(review["entries"]["eq2"]["source_ids"], ["eq2"])
+
+    def test_math_review_keeps_auto_validated_inline_for_audit(self) -> None:
+        inline = {
+            **self.unit("p1", 1, "body", "x"),
+            "inline_fragments": {
+                "[[Fp1_0001]]": {
+                    "kind": "math",
+                    "token": "[[Fp1_0001]]",
+                    "text": "x_i",
+                    "tex": "x_i",
+                    "review_status": "auto_validated",
+                    "source_bbox": [0, 0, 10, 10],
+                }
+            },
+        }
+        review = prepare_paper.build_math_review([inline], "hash")
+        self.assertEqual(
+            review["entries"]["[[Fp1_0001]]"]["review_status"],
+            "auto_validated",
+        )
+
+    def test_math_review_ignores_original_tail_and_non_math_visuals(
+        self,
+    ) -> None:
+        translated = {
+            **self.unit("body", 10, "body", "text"),
+            "translatable": True,
+        }
+        visual = {
+            **self.unit("figure", 11, "figure", ""),
+            "render_mode": "source_clip",
+            "translatable": False,
+        }
+        equation = {
+            **self.unit("equation", 12, "equation", "a = b"),
+            "render_mode": "source_clip",
+            "translatable": False,
+        }
+        translated_after = {
+            **self.unit("body-after", 13, "body", "text"),
+            "translatable": True,
+        }
+        tail = {
+            **self.unit("tail-equation", 20, "equation", "c = d"),
+            "render_mode": "source_clip",
+            "translatable": False,
+        }
+        tail["inline_fragments"] = {
+            "[[Ftail_0001]]": {
+                "kind": "math",
+                "text": "x",
+                "tex": "x",
+                "review_status": "unresolved",
+            }
+        }
+        review = prepare_paper.build_math_review(
+            [translated, visual, equation, translated_after, tail],
+            "hash",
+        )
+        self.assertIn("equation", review["entries"])
+        self.assertNotIn("figure", review["entries"])
+        self.assertNotIn("tail-equation", review["entries"])
+        self.assertNotIn("[[Ftail_0001]]", review["entries"])
+
+    def test_math_review_does_not_reuse_tex_for_changed_source_text(self) -> None:
+        inline = {
+            **self.unit("p1", 1, "body", "y"),
+            "inline_fragments": {
+                "[[Fp1_0001]]": {
+                    "kind": "math",
+                    "token": "[[Fp1_0001]]",
+                    "text": "y",
+                    "tex": "y",
+                    "review_status": "unresolved",
+                    "source_bbox": [0, 0, 10, 10],
+                }
+            },
+        }
+        review = prepare_paper.build_math_review(
+            [inline],
+            "hash",
+            {
+                "source_sha256": "hash",
+                "entries": {
+                    "[[Fp1_0001]]": {
+                        "kind": "inline",
+                        "source_page": 1,
+                        "source_text": "x",
+                        "tex": "x_i",
+                        "review_status": "manually_reviewed",
+                    }
+                },
+            },
+        )
+        entry = review["entries"]["[[Fp1_0001]]"]
+        self.assertEqual(entry["source_text"], "y")
+        self.assertEqual(entry["tex"], "y")
+        self.assertEqual(entry["review_status"], "unresolved")
+
+    def test_symbol_only_display_fragments_are_promoted_and_grouped(self) -> None:
+        equation = {
+            **self.unit("eq", 1, "equation", "a = b"),
+            "render_mode": "source_clip",
+            "page": 1,
+            "order": 1,
+            "bbox": [150, 200, 350, 220],
+            "span_runs": [],
+        }
+        symbol = {
+            **self.unit("symbol", 1, "body", "h"),
+            "render_mode": "text",
+            "page": 1,
+            "order": 2,
+            "bbox": [350, 200, 360, 220],
+            "span_runs": [{"text": "h", "style": "math"}],
+        }
+        operator = {
+            **self.unit("operator", 1, "body", "Pr"),
+            "render_mode": "text",
+            "page": 1,
+            "order": 3,
+            "bbox": [130, 200, 150, 220],
+            "span_runs": [{"text": "Pr", "style": "text"}],
+        }
+        elements = [equation, symbol, operator]
+        prepare_paper.promote_display_math_fragments(elements, 10.0)
+        self.assertTrue(all(item["kind"] == "equation" for item in elements))
+        review = prepare_paper.build_math_review(elements, "hash")
+        self.assertEqual(list(review["entries"]), ["eq"])
+        self.assertEqual(
+            review["entries"]["eq"]["source_ids"],
+            ["eq", "symbol", "operator"],
+        )
+
+    def test_math_fragment_misclassified_as_footnote_is_promoted(self) -> None:
+        element = {
+            **self.unit("subscript", 1, "footnote", "0,0 t′"),
+            "render_mode": "text",
+            "page": 1,
+            "order": 1,
+            "bbox": [200, 600, 245, 614],
+            "span_runs": [
+                {"text": "0,0", "style": "text"},
+                {"text": "t′", "style": "math"},
+            ],
+        }
+        prepare_paper.promote_display_math_fragments(
+            [
+                {
+                    **self.unit("eq", 1, "equation", "a = b"),
+                    "render_mode": "source_clip",
+                    "bbox": [180, 600, 210, 614],
+                    "span_runs": [],
+                },
+                element,
+            ],
+            10.0,
+        )
+        self.assertEqual(element["kind"], "equation")
+        self.assertEqual(element["render_mode"], "source_clip")
+
+    def test_untranslated_front_matter_footnote_needs_no_anchor(self) -> None:
+        footnote = {
+            **self.unit("front-note", 1, "footnote", "† Publication note"),
+            "translatable": False,
+            "inline_fragments": {},
+        }
+        report = prepare_paper.link_footnote_anchors([footnote])
+        self.assertEqual(report, {"footnotes": 0, "linked": 0, "warnings": []})
 
     def test_markdown_exports_reviewed_display_math(self) -> None:
         units = [
@@ -1830,6 +2114,109 @@ class PaperPipelineTests(unittest.TestCase):
         self.assertTrue(any("no source visual" in item for item in layout["errors"]))
         document.close()
 
+    def test_visual_on_full_original_tail_page_needs_no_separate_placement(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest_path = root / "manifest.json"
+            visual_path = root / "visual-layout.json"
+            manifest = {
+                "schema_version": 5,
+                "source_sha256": "hash",
+                "paths": {"visual_layout": visual_path.name},
+            }
+            visual_path.write_text(
+                (
+                    '{"source_sha256":"hash","errors":[],"warnings":[],'
+                    '"visuals":[{"visual_id":"figure-1","page":35}]}'
+                ),
+                encoding="utf-8",
+            )
+            output = pymupdf.open()
+            output.new_page(width=595.28, height=841.89)
+            errors, warnings, metrics = check_translation.validate_visual_layout(
+                manifest,
+                manifest_path,
+                {
+                    "visual_layout": {"placements": []},
+                    "placements": [],
+                    "boundary_layout": {
+                        "segments": [
+                            {
+                                "source_page": 35,
+                                "mode": "full-page",
+                                "role": "tail-original",
+                            }
+                        ]
+                    },
+                },
+                output,
+            )
+            output.close()
+        self.assertEqual(errors, [])
+        self.assertEqual(warnings, [])
+        self.assertEqual(metrics["status"], "pass")
+        self.assertEqual(metrics["checked"], 1)
+        self.assertEqual(metrics["original_boundary_visuals"], 1)
+
+    def test_visual_in_original_column_requires_complete_crop_coverage(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            inventory = root / "visual-layout.json"
+            inventory.write_text(
+                json.dumps(
+                    {
+                        "source_sha256": "hash",
+                        "errors": [],
+                        "warnings": [],
+                        "visuals": [
+                            {
+                                "visual_id": "figure-tail",
+                                "page": 15,
+                                "source_bbox": [50, 300, 250, 600],
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            manifest = {
+                "schema_version": 5,
+                "source_sha256": "hash",
+                "paths": {"visual_layout": inventory.name},
+            }
+            segment = {
+                "source_page": 15,
+                "mode": "partial-page",
+                "role": "tail-original",
+                "source_bbox": [0, 161, 306, 792],
+            }
+            layout = {
+                "visual_layout": {"placements": []},
+                "placements": [],
+                "boundary_layout": {"segments": [segment]},
+            }
+            output = pymupdf.open()
+            output.new_page(width=612, height=792)
+            errors, _, metrics = check_translation.validate_visual_layout(
+                manifest, root / "manifest.json", layout, output
+            )
+            self.assertEqual(errors, [])
+            self.assertEqual(metrics["original_boundary_visuals"], 1)
+            segment["source_bbox"][1] = 400
+            errors, _, _ = check_translation.validate_visual_layout(
+                manifest, root / "manifest.json", layout, output
+            )
+            self.assertTrue(
+                any(
+                    "expected one rendered visual" in error for error in errors
+                )
+            )
+            output.close()
+
     def test_math_fragment_includes_big_o_parentheses_and_is_not_bold(self) -> None:
         source = "Runtime is O(√p)."
         spans = [
@@ -1897,8 +2284,281 @@ class PaperPipelineTests(unittest.TestCase):
             Counter(),
             footnotes_by_id={"fn": "页底注"},
         )
-        self.assertIn(r"\footnote{\fontsize{8.5pt}{11pt}\selectfont 页底注}", rendered)
+        self.assertIn(
+            r"\footnote[1]{\fontsize{8.5pt}{11pt}\selectfont 页底注}",
+            rendered,
+        )
         self.assertNotIn(r"\textsuperscript", rendered)
+
+    def test_source_review_groups_visual_fragments_idempotently(self) -> None:
+        elements = [
+            {
+                **self.unit("visual-a", 1, "figure", ""),
+                "page": 1,
+                "bbox": [10, 10, 80, 80],
+                "render_mode": "source_clip",
+                "translatable": False,
+            },
+            {
+                **self.unit("visual-b", 2, "figure-text", "axis"),
+                "page": 1,
+                "bbox": [75, 20, 130, 70],
+                "render_mode": "source_clip",
+                "translatable": False,
+            },
+            {
+                **self.unit("caption", 3, "body", "Figure 2. Results"),
+                "page": 1,
+                "bbox": [10, 85, 130, 100],
+                "translatable": False,
+            },
+        ]
+        review = {
+            "schema_version": 1,
+            "source_sha256": "source",
+            "reviewed": True,
+            "reason": "The page preview shows one multi-panel figure.",
+            "operations": [
+                {
+                    "op": "group_visual",
+                    "visual_id": "Figure 2",
+                    "anchor_id": "visual-a",
+                    "member_ids": ["visual-a", "visual-b"],
+                    "caption_id": "caption",
+                    "reason": "Join the two vector fragments and bind the caption.",
+                }
+            ],
+        }
+        page_records = [{"page": 1, "width": 200, "height": 200}]
+        first = copy.deepcopy(elements)
+        second = copy.deepcopy(elements)
+        first_report = source_review.apply_source_review(
+            first,
+            review,
+            "source",
+            page_records,
+            prepare_paper.protect_element,
+        )
+        second_report = source_review.apply_source_review(
+            second,
+            review,
+            "source",
+            page_records,
+            prepare_paper.protect_element,
+        )
+        self.assertEqual(first, second)
+        self.assertEqual(first_report, second_report)
+        self.assertEqual(first[0]["bbox"], [10.0, 10.0, 130.0, 80.0])
+        self.assertTrue(first[1]["render_suppressed"])
+        self.assertEqual(first[2]["kind"], "caption")
+
+    def test_source_review_refuses_to_discard_completed_translation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            translations = Path(directory) / "translations.jsonl"
+            translations.write_text(
+                '{"id":"body","translated_text":"已经翻译"}\n',
+                encoding="utf-8",
+            )
+            elements = [
+                {
+                    **self.unit("body", 1, "body", "Source prose"),
+                    "page": 1,
+                    "translatable": True,
+                }
+            ]
+            review = {
+                "schema_version": 1,
+                "source_sha256": "source",
+                "reviewed": True,
+                "reason": "The source preview classifies this as a plot label.",
+                "operations": [
+                    {
+                        "op": "suppress_units",
+                        "ids": ["body"],
+                        "reason": "This text belongs inside the plot.",
+                    }
+                ],
+            }
+            with self.assertRaises(source_review.SourceReviewError):
+                source_review.apply_source_review(
+                    elements,
+                    review,
+                    "source",
+                    [{"page": 1, "width": 200, "height": 200}],
+                    prepare_paper.protect_element,
+                    translations_path=translations,
+                )
+
+    def test_source_review_inserts_recovered_prose_and_reconciles(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            translations = Path(directory) / "translations.jsonl"
+            translations.write_text(
+                '{"id":"body","translated_text":"已有译文"}\n',
+                encoding="utf-8",
+            )
+            elements = [
+                {
+                    **self.unit("body", 1, "body", "Existing prose."),
+                    "page": 1,
+                    "section": "1 Introduction",
+                    "translatable": True,
+                }
+            ]
+            prepare_paper.protect_element(elements[0])
+            review = {
+                "schema_version": 1,
+                "source_sha256": "source",
+                "reviewed": True,
+                "reason": "The source preview contains a swallowed paragraph.",
+                "operations": [
+                    {
+                        "op": "insert_unit",
+                        "id": "review-p0001-u0001",
+                        "after_id": "body",
+                        "page": 1,
+                        "bbox": [10, 30, 180, 60],
+                        "kind": "body",
+                        "source_text": "Recovered source prose.",
+                        "translatable": True,
+                        "reason": "Recover exact prose visible below the figure.",
+                    }
+                ],
+            }
+            source_review.apply_source_review(
+                elements,
+                review,
+                "source",
+                [{"page": 1, "width": 200, "height": 200}],
+                prepare_paper.protect_element,
+                translations_path=translations,
+            )
+            source_review.reconcile_translations(translations, elements)
+            records = [
+                json.loads(line)
+                for line in translations.read_text(encoding="utf-8").splitlines()
+            ]
+        self.assertEqual([record["id"] for record in records], [
+            "body",
+            "review-p0001-u0001",
+        ])
+        self.assertEqual(records[0]["translated_text"], "已有译文")
+        self.assertEqual(records[1]["translated_text"], "")
+
+    def test_source_review_detects_formula_only_body_and_plot_axis(self) -> None:
+        elements = [
+            {
+                **self.unit("formula", 1, "body", "x_i = y_i + z_i"),
+                "page": 1,
+                "translatable": True,
+                "span_runs": [
+                    {"text": "x_i = y_i + z_i", "style": "math"}
+                ],
+            },
+            {
+                **self.unit("axis", 2, "heading", "10 20 30"),
+                "page": 1,
+                "bbox": [40, 40, 80, 55],
+                "translatable": True,
+            },
+        ]
+        visual_layout = {
+            "visuals": [
+                {
+                    "visual_id": "Figure 3",
+                    "page": 1,
+                    "source_bbox": [10, 10, 100, 100],
+                    "source_ids": ["plot"],
+                    "caption_id": "caption",
+                }
+            ]
+        }
+        errors, _ = source_review.detect_source_issues(elements, visual_layout)
+        self.assertTrue(any("formula-only" in error for error in errors))
+        self.assertTrue(any("axis or plot label" in error for error in errors))
+
+    def test_suppressed_plot_equation_is_not_added_to_math_review(self) -> None:
+        body = {
+            **self.unit("body", 1, "body", "Translated body."),
+            "translatable": True,
+            "inline_fragments": {},
+        }
+        axis = {
+            **self.unit("axis", 2, "equation", "10 20 30"),
+            "render_mode": "source_clip",
+            "render_suppressed": True,
+            "translatable": False,
+            "visual_id": "Figure 1",
+        }
+        tail = {
+            **self.unit("tail", 3, "body", "More translated body."),
+            "translatable": True,
+            "inline_fragments": {},
+        }
+        review = prepare_paper.build_math_review(
+            [body, axis, tail],
+            "source",
+        )
+        self.assertNotIn("axis", review["entries"])
+
+    def test_reviewed_source_hash_mismatch_is_blocking(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "source-review.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "source_sha256": "old",
+                        "reviewed": True,
+                        "reason": "Reviewed against the old source.",
+                        "operations": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaises(source_review.SourceReviewError):
+                source_review.load_source_review(path, "new")
+
+    def test_native_math_normalizes_known_missing_glyph_sequences(self) -> None:
+        self.assertEqual(
+            native_latex.normalize_native_tex("x⃗ ≫ 𝔫 ↔ y"),
+            r"\vec{x} \gg  \mathfrak{n} \leftrightarrow  y",
+        )
+        self.assertIn(r"\vec{x}", native_latex.latex_escape_text("x⃗"))
+        self.assertIn(r"\gg", native_latex.latex_escape_text("≫"))
+        self.assertIn(r"\mathfrak{n}", native_latex.latex_escape_text("𝔫"))
+        self.assertIn(
+            r"\leftrightarrow",
+            native_latex.latex_escape_text("↔"),
+        )
+
+    def test_native_display_math_rejects_tag_with_actionable_numbering(self) -> None:
+        node = {
+            "id": "equation-4",
+            "element": {"kind": "equation"},
+        }
+        reviews = {
+            "equation-4": {
+                "review_status": "manually_reviewed",
+                "tex": r"x=y\tag{4}",
+            }
+        }
+        with self.assertRaisesRegex(
+            native_latex.MathReviewError,
+            r"\\qquad\(n\)",
+        ):
+            native_latex.resolve_display_math(node, reviews)
+
+    def test_native_prose_reports_unsupported_unicode_with_unit_id(self) -> None:
+        node = {
+            "id": "body-unsupported",
+            "text": "使用数学字符 𝕏。",
+            "element": {
+                "inline_fragments": {},
+                "style_tokens": {},
+            },
+        }
+        with self.assertRaisesRegex(ValueError, "body-unsupported"):
+            native_latex.rich_text_to_latex(node, {}, Counter())
 
     @staticmethod
     def unit(

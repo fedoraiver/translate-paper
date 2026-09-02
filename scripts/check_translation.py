@@ -22,6 +22,7 @@ import math
 import re
 import statistics
 from collections import Counter
+from itertools import pairwise
 from pathlib import Path
 from typing import Any
 
@@ -151,6 +152,124 @@ def invariant_present(value: str, normalized_output: str) -> bool:
     chunks = [normalized[start : start + chunk_size] for start in starts]
     required = 1 if len(chunks) == 1 else 2
     return sum(chunk in normalized_output for chunk in chunks) >= required
+
+
+def index_placements_by_id(
+    placements: list[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    indexed: dict[str, dict[str, Any]] = {}
+    for item in placements:
+        unit_ids = list(item.get("ids") or [])
+        if item.get("id") and item.get("id") not in unit_ids:
+            unit_ids.append(item["id"])
+        for unit_id in unit_ids:
+            if unit_id:
+                indexed[str(unit_id)] = item
+    return indexed
+
+
+def full_original_source_pages(layout: dict[str, Any] | None) -> set[int]:
+    return {
+        int(item.get("source_page") or 0)
+        for item in (
+            ((layout or {}).get("boundary_layout") or {}).get("segments") or []
+        )
+        if item.get("mode") == "full-page"
+        and item.get("role") in {"front-original", "tail-original"}
+    }
+
+
+def original_boundary_output_text(
+    document: pymupdf.Document, layout: dict[str, Any] | None
+) -> str:
+    """Extract original clips separately so columns cannot interleave prose.
+
+    Only text actually present in the output contributes to the corpus; source
+    text and declared coverage are never used as evidence of text preservation.
+    Boundary geometry and source/output content are validated independently.
+    """
+    texts: list[str] = []
+    for segment in (
+        ((layout or {}).get("boundary_layout") or {}).get("segments") or []
+    ):
+        if segment.get("role") not in {"front-original", "tail-original"}:
+            continue
+        page_index = int(segment.get("output_page") or 0) - 1
+        if not 0 <= page_index < len(document):
+            continue
+        rectangle = pymupdf.Rect(segment.get("target_bbox") or [])
+        if rectangle.is_empty:
+            continue
+        texts.append(
+            document[page_index].get_text("text", clip=rectangle, sort=True)
+        )
+    return "\n".join(texts)
+
+
+def missing_invariant_ids(
+    units: list[dict[str, Any]],
+    normalized_output: str,
+    layout: dict[str, Any] | None,
+) -> list[str]:
+    exact_original_pages = full_original_source_pages(layout)
+    missing: list[str] = []
+    for unit in units:
+        text = str(unit.get("source_text") or "")
+        if (
+            unit.get("translatable")
+            or unit.get("render_suppressed")
+            or int(unit.get("page") or 0) in exact_original_pages
+            or unit.get("render_mode") != "text"
+            or unit.get("kind") in {"header", "footer"}
+            or len(normalize_text(text)) < 60
+        ):
+            continue
+        if not invariant_present(text, normalized_output):
+            missing.append(str(unit["id"]))
+    return missing
+
+
+def validate_source_clip_envelopes(
+    layout: dict[str, Any] | None,
+    units: list[dict[str, Any]],
+) -> tuple[list[str], dict[str, Any]]:
+    """Reject clips that include separately rendered prose or other objects.
+
+    Suppressed fragments belong to their reviewed replacement and must not be
+    counted as independently rendered objects. A union of two source clips,
+    however, must not swallow active units between them or in another column.
+    """
+    errors: list[str] = []
+    checked = 0
+    for placement in list((layout or {}).get("placements") or []):
+        if placement.get("render_mode") != "source_clip":
+            continue
+        represented = {str(value) for value in placement.get("ids") or []}
+        represented.add(str(placement.get("id") or ""))
+        source_page = int(placement.get("source_page") or 0)
+        rectangle = pymupdf.Rect(placement.get("source_bbox") or [])
+        if rectangle.is_empty:
+            errors.append(f"{placement.get('id')}: source clip envelope is empty.")
+            continue
+        unexpected = []
+        for unit in units:
+            if (
+                str(unit["id"]) in represented
+                or unit.get("render_suppressed")
+                or unit.get("kind") in {"header", "footer"}
+                or int(unit.get("page") or 0) != source_page
+            ):
+                continue
+            intersection = rectangle & pymupdf.Rect(unit.get("bbox") or [])
+            if intersection.get_area() > 0.5:
+                unexpected.append(str(unit["id"]))
+        if unexpected:
+            errors.append(
+                f"{placement.get('id')}: source clip envelope includes "
+                "unrequested active source units: " + ", ".join(unexpected)
+            )
+        checked += 1
+    return errors, {"checked": checked, "contaminated_clips": len(errors)}
 
 
 def make_contact_sheet(images: list[Path], output: Path) -> None:
@@ -804,10 +923,35 @@ def validate_typography(
     return errors, warnings, metrics
 
 
+def rectangle_covered_by_regions(
+    rectangle: pymupdf.Rect, regions: list[pymupdf.Rect]
+) -> bool:
+    """Check complete coverage without double-counting overlapping clips."""
+    clipped = [rectangle & region for region in regions]
+    clipped = [region for region in clipped if not region.is_empty]
+    edges = sorted(
+        {value for region in clipped for value in (region.x0, region.x1)}
+    )
+    area = 0.0
+    for left, right in pairwise(edges):
+        intervals = sorted(
+            (region.y0, region.y1)
+            for region in clipped
+            if region.x0 <= left and region.x1 >= right
+        )
+        end = float("-inf")
+        for top, bottom in intervals:
+            area += (right - left) * max(0.0, bottom - max(top, end))
+            end = max(end, bottom)
+    return area >= rectangle.get_area() - 0.5
+
+
 def validate_boundary_layout(
     source_document: pymupdf.Document,
     output_document: pymupdf.Document,
     layout: dict[str, Any] | None,
+    elements: list[dict[str, Any]] | None = None,
+    manifest: dict[str, Any] | None = None,
 ) -> tuple[list[str], dict[str, Any]]:
     errors: list[str] = []
     metrics: dict[str, Any] = {
@@ -815,6 +959,7 @@ def validate_boundary_layout(
         "front_segments": 0,
         "tail_segments": 0,
         "segments_checked": 0,
+        "original_units_checked": 0,
     }
     if layout is None:
         errors.append("Boundary layout report is missing.")
@@ -842,28 +987,70 @@ def validate_boundary_layout(
         errors.append("Translated-body page range is invalid.")
         return errors, metrics
 
-    front_pages = [int(item.get("output_page") or 0) for item in front]
-    tail_pages = [int(item.get("output_page") or 0) for item in tail]
+    front_pages = list(
+        dict.fromkeys(int(item.get("output_page") or 0) for item in front)
+    )
+    tail_pages = list(
+        dict.fromkeys(int(item.get("output_page") or 0) for item in tail)
+    )
     if front_pages != list(range(1, translation_start)):
-        errors.append("Original front segments are not contiguous before the body.")
-    if tail_pages != list(range(translation_end + 1, len(output_document) + 1)):
-        errors.append("Original tail segments are not contiguous after the body.")
+        errors.append(
+            "Original front segments are not contiguous before the body."
+        )
+    if tail_pages != list(
+        range(translation_end + 1, len(output_document) + 1)
+    ):
+        errors.append(
+            "Original tail segments are not contiguous after the body."
+        )
     placement_pages = {
         int(item.get("output_page") or 0)
         for item in list(layout.get("placements") or [])
     }
     boundary_pages = set(front_pages + tail_pages)
     if placement_pages & boundary_pages:
-        errors.append("Translated flow content shares an original boundary page.")
+        errors.append(
+            "Translated flow content shares an original boundary page."
+        )
+
+    original_units: list[tuple[dict[str, Any], str]] = []
+    body_units: list[dict[str, Any]] = []
+    if elements is not None and manifest is not None:
+        ordered = sorted(elements, key=lambda item: int(item["order"]))
+        positions = {
+            str(item["id"]): index for index, item in enumerate(ordered)
+        }
+        source_boundary = manifest.get("boundary") or {}
+        start = positions.get(
+            str(source_boundary.get("introduction_id") or "")
+        )
+        stop_id = str(source_boundary.get("post_body_stop_id") or "")
+        stop = positions.get(stop_id, len(ordered))
+        if start is None or stop <= start:
+            errors.append(
+                "Source boundary IDs are invalid for overlap validation."
+            )
+        else:
+            body_units = ordered[start:stop]
+            original_units = [
+                (item, "front-original") for item in ordered[:start]
+            ] + [(item, "tail-original") for item in ordered[stop:]]
+
+    source_regions: dict[tuple[int, str], list[pymupdf.Rect]] = {}
+    target_regions: dict[int, list[pymupdf.Rect]] = {}
 
     for segment in segments:
         source_page_index = int(segment.get("source_page") or 0) - 1
         output_page_index = int(segment.get("output_page") or 0) - 1
         if not (0 <= source_page_index < len(source_document)):
-            errors.append(f"Boundary source page is invalid: {source_page_index + 1}")
+            errors.append(
+                f"Boundary source page is invalid: {source_page_index + 1}"
+            )
             continue
         if not (0 <= output_page_index < len(output_document)):
-            errors.append(f"Boundary output page is invalid: {output_page_index + 1}")
+            errors.append(
+                f"Boundary output page is invalid: {output_page_index + 1}"
+            )
             continue
         source_rect = pymupdf.Rect(segment.get("source_bbox") or [])
         target_rect = pymupdf.Rect(segment.get("target_bbox") or [])
@@ -873,6 +1060,41 @@ def validate_boundary_layout(
                 f"source page {source_page_index + 1}"
             )
             continue
+        if not source_document[source_page_index].rect.contains(source_rect):
+            errors.append(
+                f"Boundary source crop exceeds page {source_page_index + 1}."
+            )
+        if not output_document[output_page_index].rect.contains(target_rect):
+            errors.append(
+                f"Boundary target crop exceeds page {output_page_index + 1}."
+            )
+        if (
+            abs(source_rect.width - target_rect.width) > 0.1
+            or abs(source_rect.height - target_rect.height) > 0.1
+        ):
+            errors.append(
+                f"Original boundary scale changed on output page {output_page_index + 1}."
+            )
+        previous_targets = target_regions.setdefault(output_page_index, [])
+        if any(
+            (target_rect & previous).get_area() > 0.5
+            for previous in previous_targets
+        ):
+            errors.append(
+                f"Original boundary clips overlap on output page {output_page_index + 1}."
+            )
+        previous_targets.append(target_rect)
+        source_regions.setdefault(
+            (source_page_index + 1, str(segment.get("role") or "")), []
+        ).append(source_rect)
+        for unit in body_units:
+            if (
+                int(unit["page"]) == source_page_index + 1
+                and (source_rect & pymupdf.Rect(unit["bbox"])).get_area() > 0.5
+            ):
+                errors.append(
+                    f"Original boundary crop overlaps translated body unit {unit['id']}."
+                )
         source_text = normalize_text(
             source_document[source_page_index].get_text(
                 "text", clip=source_rect, sort=True
@@ -902,6 +1124,15 @@ def validate_boundary_layout(
                     f"{output_page_index + 1}."
                 )
         metrics["segments_checked"] += 1
+    for unit, role in original_units:
+        if not rectangle_covered_by_regions(
+            pymupdf.Rect(unit["bbox"]),
+            source_regions.get((int(unit["page"]), role), []),
+        ):
+            errors.append(
+                f"Original boundary unit {unit['id']} is not completely preserved."
+            )
+        metrics["original_units_checked"] += 1
     return errors, metrics
 
 
@@ -925,9 +1156,15 @@ def validate_visual_layout(
     try:
         inventory = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
-        return [f"Visual layout inventory could not be read: {error}"], warnings, {}
+        return (
+            [f"Visual layout inventory could not be read: {error}"],
+            warnings,
+            {},
+        )
     if inventory.get("source_sha256") != manifest.get("source_sha256"):
-        errors.append("Visual layout inventory source hash differs from manifest.")
+        errors.append(
+            "Visual layout inventory source hash differs from manifest."
+        )
     errors.extend(str(item) for item in inventory.get("errors") or [])
     warnings.extend(str(item) for item in inventory.get("warnings") or [])
     expected = {
@@ -940,6 +1177,25 @@ def validate_visual_layout(
     actual: dict[str, list[dict[str, Any]]] = {}
     for item in actual_items:
         actual.setdefault(str(item.get("visual_id") or ""), []).append(item)
+    full_original_pages = {
+        int(item.get("source_page") or 0)
+        for item in (
+            ((layout or {}).get("boundary_layout") or {}).get("segments") or []
+        )
+        if item.get("mode") == "full-page"
+        and item.get("role") in {"front-original", "tail-original"}
+    }
+    original_regions: dict[int, list[pymupdf.Rect]] = {}
+    for segment in ((layout or {}).get("boundary_layout") or {}).get(
+        "segments"
+    ) or []:
+        if segment.get("role") in {
+            "front-original",
+            "tail-original",
+        } and segment.get("source_bbox"):
+            original_regions.setdefault(
+                int(segment.get("source_page") or 0), []
+            ).append(pymupdf.Rect(segment["source_bbox"]))
     placements = {
         str(unit_id): item
         for item in (layout or {}).get("placements") or []
@@ -948,8 +1204,24 @@ def validate_visual_layout(
     }
     checked = 0
     fallback_count = 0
+    original_boundary_visuals = 0
     for visual_id, source_item in expected.items():
         rendered = actual.get(visual_id, [])
+        if not rendered and (
+            int(source_item.get("page") or 0) in full_original_pages
+            or (
+                source_item.get("source_bbox")
+                and rectangle_covered_by_regions(
+                    pymupdf.Rect(source_item["source_bbox"]),
+                    original_regions.get(
+                        int(source_item.get("page") or 0), []
+                    ),
+                )
+            )
+        ):
+            checked += 1
+            original_boundary_visuals += 1
+            continue
         if len(rendered) != 1:
             errors.append(
                 f"{visual_id}: expected one rendered visual, found {len(rendered)}."
@@ -981,12 +1253,16 @@ def validate_visual_layout(
             - ZH_ACADEMIC_V1.margin_right
             + 0.6
         ):
-            errors.append(f"{visual_id}: rendered visual exceeds content width.")
+            errors.append(
+                f"{visual_id}: rendered visual exceeds content width."
+            )
         caption = placements.get(str(source_item.get("caption_id") or ""))
         if not caption:
             errors.append(f"{visual_id}: caption placement is missing.")
         elif int(caption.get("output_page") or 0) != page_number:
-            errors.append(f"{visual_id}: visual and caption are on different pages.")
+            errors.append(
+                f"{visual_id}: visual and caption are on different pages."
+            )
         source_internal = source_item.get("source_internal_font_pt")
         target_internal = source_item.get("target_internal_font_pt")
         if source_internal is not None and target_internal is not None:
@@ -1001,13 +1277,18 @@ def validate_visual_layout(
     extra = sorted(set(actual) - set(expected) - {""})
     if extra:
         errors.append("Unexpected rendered visuals: " + ", ".join(extra))
-    return errors, warnings, {
-        "status": "pass" if not errors else "fail",
-        "inventory_path": str(path),
-        "expected": len(expected),
-        "checked": checked,
-        "automatic_fallbacks": fallback_count,
-    }
+    return (
+        errors,
+        warnings,
+        {
+            "status": "pass" if not errors else "fail",
+            "inventory_path": str(path),
+            "expected": len(expected),
+            "checked": checked,
+            "automatic_fallbacks": fallback_count,
+            "original_boundary_visuals": original_boundary_visuals,
+        },
+    )
 
 
 def main() -> int:
@@ -1140,10 +1421,12 @@ def main() -> int:
 
     rendered_paths: list[Path] = []
     output_text = ""
+    boundary_invariant_text = ""
     output_page_count = 0
     typography_metrics: dict[str, Any] = {}
     boundary_metrics: dict[str, Any] = {}
     visual_metrics: dict[str, Any] = {}
+    source_clip_metrics: dict[str, Any] = {}
     layout_path = translated.with_suffix(".layout.json")
     layout: dict[str, Any] | None = None
     if layout_path.exists():
@@ -1237,10 +1520,9 @@ def main() -> int:
                 + ", ".join(missing_footnotes)
             )
         unit_by_id = {str(unit["id"]): unit for unit in units}
-        placement_by_id = {
-            str(item.get("id")): item
-            for item in list(layout.get("placements") or [])
-        }
+        placement_by_id = index_placements_by_id(
+            list(layout.get("placements") or [])
+        )
         for item in footnote_placements:
             unit = unit_by_id.get(str(item.get("id"))) or {}
             anchor_id = str(unit.get("anchor_id") or "")
@@ -1261,6 +1543,9 @@ def main() -> int:
     if translated.exists():
         try:
             output_document = pymupdf.open(translated)
+            boundary_invariant_text = original_boundary_output_text(
+                output_document, layout
+            )
             output_page_count = len(output_document)
             if output_page_count == 0:
                 errors.append("Translated PDF has no pages")
@@ -1293,7 +1578,7 @@ def main() -> int:
             source_document = pymupdf.open(source)
             try:
                 boundary_errors, boundary_metrics = validate_boundary_layout(
-                    source_document, output_document, layout
+                    source_document, output_document, layout, units, manifest
                 )
                 errors.extend(boundary_errors)
                 visual_errors, visual_warnings, visual_metrics = (
@@ -1306,6 +1591,10 @@ def main() -> int:
                 )
                 errors.extend(visual_errors)
                 warnings.extend(visual_warnings)
+                source_clip_errors, source_clip_metrics = (
+                    validate_source_clip_envelopes(layout, units)
+                )
+                errors.extend(source_clip_errors)
             finally:
                 source_document.close()
             output_document.close()
@@ -1316,23 +1605,22 @@ def main() -> int:
         errors.append("Rendered PDF contains unresolved protected placeholders")
     if CONTROL_TOKEN_RE.search(output_text):
         errors.append("Rendered PDF contains unresolved rich-text tokens")
+    source_glyph_text = ""
+    if source.exists():
+        source_glyph_document = pymupdf.open(source)
+        try:
+            source_glyph_text = "\n".join(
+                page.get_text("text", sort=True)
+                for page in source_glyph_document
+            )
+        finally:
+            source_glyph_document.close()
     for marker in ("\ufffd", "\u25a1", "\u25a0"):
-        if marker in output_text:
+        if marker in output_text and marker not in source_glyph_text:
             errors.append(f"Rendered PDF text contains suspicious glyph {marker!r}")
 
-    normalized_output = normalize_text(output_text)
-    invariant_missing: list[str] = []
-    for unit in units:
-        text = unit.get("source_text", "")
-        if (
-            unit.get("translatable")
-            or unit.get("render_mode") != "text"
-            or unit.get("kind") in {"header", "footer"}
-            or len(normalize_text(text)) < 60
-        ):
-            continue
-        if not invariant_present(text, normalized_output):
-            invariant_missing.append(unit["id"])
+    normalized_output = normalize_text(output_text + "\n" + boundary_invariant_text)
+    invariant_missing = missing_invariant_ids(units, normalized_output, layout)
     if invariant_missing:
         message = (
             "Invariant source text was not found verbatim in extracted output: "
@@ -1352,11 +1640,13 @@ def main() -> int:
             "translated_pages": output_page_count,
             "translation_units": len(required),
             "rendered_pages": len(rendered_paths),
+            "strict_invariants": bool(args.strict_invariants),
             "invariant_text_misses": len(invariant_missing),
             "contact_sheet": str(contact_sheet) if contact_sheet.exists() else None,
             "typography": typography_metrics,
             "boundary_layout": boundary_metrics,
             "visual_layout": visual_metrics,
+            "source_clip_envelopes": source_clip_metrics,
             "rich_text": {
                 "inline_fragments": dict(expected_inline),
                 "styles": dict(expected_styles),
