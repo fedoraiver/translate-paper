@@ -1,5 +1,13 @@
 # Translation contract
 
+## Contents
+
+- Translation engine and content boundary
+- Fidelity and persistent files
+- Visual and mathematical preservation
+- Default Chinese typography
+- Reader scope
+
 ## Translation engine
 
 The active Codex model must perform every translation decision and write every
@@ -23,7 +31,7 @@ Translate:
 Keep verbatim:
 
 - title, subtitle, authors, affiliations, addresses, dates;
-- abstract, classification codes, keywords;
+- abstract, table of contents, classification codes, keywords;
 - figures, tables, algorithms, listings, and their captions;
 - display equations and mathematical notation;
 - citation markers and bibliography keys;
@@ -60,6 +68,9 @@ deterministically.
 
 - `manifest.json`: identity, geometry, extraction methods, boundaries, paths;
 - `boundary-review.json`: hash-bound manual review gate and candidates;
+- `source-review.json`: hash-bound, replayable extraction/visual corrections;
+- `source-review-report.json`: applied operations and blocking extraction
+  diagnostics;
 - `translation-units.jsonl`: ordered source elements and protected text;
 - `translations.template.jsonl`: empty translation checkpoints;
 - `math-review.json`: hash-bound native TeX and review status for ambiguous
@@ -73,6 +84,11 @@ deterministically.
 Create `translations.jsonl` from the template. Fill only `translated_text` and
 save after every section. Export `中文翻译正文.md` from the completed JSONL so the
 translation remains auditable independently of PDF layout.
+
+Use [source-review.md](source-review.md) when a visual detector swallows prose,
+splits a multi-panel figure, leaves plot labels as headings/equations, or
+misclassifies a caption. Do not replace this persistent review with a
+paper-specific repair script.
 
 ## Visual preservation
 
@@ -116,6 +132,10 @@ image, source equation clip, and PDF image/Form fallback are forbidden for
 mathematical content. If reconstruction is not lossless, leave the review
 unresolved and abort export.
 
+Treat a formula-only translatable body unit as an extraction error. Reclassify
+it as native display math or merge it with its actual surrounding prose; never
+add filler Chinese merely to pass the Chinese-text check.
+
 Classify mathematical expressions before interpreting PDF bold flags. A
 symbol-heavy or math-font run must enter the math fragment/review path and must
 not create prose bold markers. Ordinary body text may be bold only when its
@@ -124,11 +144,21 @@ Expand fragment boundaries to include adjacent function names and balanced
 delimiters, so `O(\sqrt{p})` is one atom. Literal Unicode `√` is forbidden in
 native TeX; use a complete `\sqrt{...}` command.
 
+Do not use `\tag{...}` inside `TPDisplayMath`; write an equation number as
+`\qquad(n)`. Normalize reviewed mathematical text to TeX before compilation:
+use `\vec{...}` for combining vector arrows, `\gg` for `≫`,
+`\mathfrak{n}` for the Fraktur glyph, and `\leftrightarrow` for `↔`.
+The renderer may normalize these known forms but must report any unsupported
+Unicode with the affected unit ID before LuaLaTeX.
+
 Treat a long sentence beginning with “Table N gives/shows/compares...” as
 narrative body, not a caption. A caption must be a compact label attached to its
 visual.
 
 Compose the document as `original front -> translated body -> original tail`.
+The original front includes the title, authors, abstract, and table of
+contents. The original tail includes acknowledgements, references, and
+appendices.
 Copy full untranslated source pages as vector PDF pages. If the Introduction or
 post-Conclusion boundary occurs mid-page, crop the untranslated portion from
 the source PDF without rasterization and place it on a separate output page.

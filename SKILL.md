@@ -1,265 +1,170 @@
 ---
 name: translate-paper
-description: Translate academic-paper PDFs into Chinese with the active Codex model, preserve figures, tables, equations, citations, appendices, references, and original bibliographic material, create validated Chinese PDF, Markdown, and summary artifacts, and safely import them into Zotero by default unless the user opts out. Use for text or scanned papers when the user asks for Chinese paper translation, layout-preserving output, paper summarization, Zotero ingestion, or exact-parent replacement.
+description: Translate one or more academic-paper PDFs into Chinese with the active Codex model, preserve figures, tables, native mathematics, citations, appendices, references, and original bibliographic material, validate PDF/Markdown/summary artifacts, and safely organize them in Zotero by default. Use for single papers, paper lists or sections, Zotero missing-translation audits, resumable translation batches, layout-preserving output, summaries, ingestion, or exact-parent replacement.
 ---
 
 # Translate paper
 
 Translate every Chinese sentence with the active Codex model. Never use a
-translation API, website, browser translator, local translation model,
-machine-translation library, or subagent. OCR recognizes source text only.
+translation API, browser translator, local translation model, machine-
+translation package, or delegated agent. Use scripts only for deterministic
+extraction, OCR, review replay, rendering, validation, packaging, and Zotero
+operations.
 
-## Required preparation
+## Prepare
 
 1. Load and follow `$pdf`.
 2. Read [references/translation-contract.md](references/translation-contract.md).
-3. Treat Zotero as in scope by default. Skip Zotero only when the user
-   explicitly requests no Zotero import or a local-only result; omission is not
-   an opt-out. When Zotero is in scope, read
+3. Choose single-paper mode unless the request names a list/section, asks which
+   Zotero papers lack translations, or resumes multiple papers. For those
+   cases, read [references/batch-workflow.md](references/batch-workflow.md).
+4. Treat Zotero as in scope unless the user explicitly requests local-only
+   output. When in scope, read
    [references/zotero-ingestion.md](references/zotero-ingestion.md), load
-   `$zotero:Zotero`, and use the plugin plus the skill-local adapter.
-   Assume Zotero opens PDFs in Google Chrome; do not inspect or report
-   built-in-reader overlays. Only if the user explicitly brings the built-in
-   reader back into scope, read
-   [references/zotero-reader.md](references/zotero-reader.md).
-4. Obtain the source PDF. On every ingest run, resolve Zotero targets. Honor an
-   explicit user-supplied library or collection; otherwise use the writable
-   currently selected target. If none is selected, use the only writable
-   target when exactly one exists. Ask for the destination only when no
-   writable target exists or multiple plausible targets remain.
-5. Never modify the source PDF, `zotero.sqlite`, or Zotero storage. Do not fall
-   back to computer-use.
+   `$zotero:Zotero`, and use the plugin plus skill-local adapter.
+5. Never modify the source PDF, `zotero.sqlite`, or Zotero storage. Do not use
+   computer-use as a fallback.
 
-## Workflow
+## Single-paper workflow
 
-### 1. Prepare and review the paper
+### 1. Extract and review
 
 ```powershell
 uv run --script <skill-dir>\scripts\prepare_paper.py `
   --input <source.pdf> `
-  --work-dir <cwd>\tmp\pdfs\<paper-slug> `
+  --work-dir <work-dir> `
   --ocr auto
 ```
 
-Inspect `manifest.json`, `visual-layout.json`, `translation-units.jsonl`,
-`layout.txt`, and all source previews. Verify reading order, the Introduction
-start, the last main-section end, and the first excluded heading. Require one
-unique inventory entry for every numbered figure and table. Missing, duplicate,
-cropped, or malformed visual objects are blocking errors.
+Inspect the manifest, boundary review, source previews, translation units,
+math review, visual layout, and source-review report.
 
-For each visual, verify that `visual-layout.json` records the complete vector
-envelope (drawing, internal labels, and caption association), source hash,
-source body/internal font sizes, target dimensions, aspect ratio, and scale
-basis. Size by typography:
+- Preserve the title, authors, abstract, and table of contents as original
+  front matter.
+- Translate the reviewed Introduction-through-Conclusion main body.
+- Preserve acknowledgements, references, and appendices as the original tail.
+- Clear `needs_boundary_review` through `boundary-review.json`, never by
+  editing the manifest.
+- Require `source_review.status: pass`, one unique inventory entry for every
+  numbered figure/table, and no unresolved mathematical entry.
 
-`target internal font = source internal font / source body font × 11.5pt`.
+When extraction swallows prose, splits a multi-panel visual, misclassifies a
+caption, or leaves plot labels as headings/equations, read
+[references/source-review.md](references/source-review.md). Record corrections
+in source-hash-bound `source-review.json` and rerun preparation. Do not create a
+paper-specific repair script.
 
-When internal font size cannot be measured, automatically continue using the
-source visual/content-width ratio and retain the generated warning. This is the
-only sizing fallback; a missing or duplicate visual never falls back.
+Treat a formula-only translatable body record as an extraction error. Convert
+it to reviewed native display math or merge it with its real surrounding prose;
+never add filler Chinese to pass validation.
 
-Inspect `math-review.json`. Every inline mathematical fragment must contain
-valid TeX and a review status. Reconstruct each display equation as one logical
-TeX block, set `review_status` to `manually_reviewed`, and compare it with the
-source preview. Do not translate or export while any mathematical entry is
-`unresolved`.
-
-If `manifest.json` says `needs_boundary_review: true`, edit
-`boundary-review.json`, not the manifest:
-
-- set `start_id` and `stop_before_id` from `candidates`;
-- set `reviewed` to `true` and write a specific `reason`;
-- set `allow_missing_conclusion` only after confirming that the paper genuinely
-  has no Conclusion heading;
-- use `include_ids` and `exclude_ids` only for OCR classification mistakes.
-
-Rerun the same preparation command. It applies the reviewed file only when its
-source hash matches. Do not translate until the resulting manifest clears the
-review gate. For scanned mathematical papers, visually compare OCR text with
-every source page and change equations, diagrams, tables, and damaged regions
-to `source_clip`.
-
-### 2. Translate with Codex
+### 2. Translate
 
 Copy `translations.template.jsonl` to `translations.jsonl`. Fill only
-`translated_text`:
+`translated_text` for translatable records.
 
-- translate records whose `translatable` value is `true`;
-- translate from `protected_text`, preserving every `[[Pdddd]]`, `[[F...]]`,
-  and paired `[[B..._OPEN/CLOSE]]` / `[[I..._OPEN/CLOSE]]` marker exactly
-  once and in order;
-- place the translated equivalent inside source bold/italic marker pairs; keep
-  a source line break before a bold definition label such as Completeness,
-  Soundness, or Zero-knowledge;
-- retain IDs and one JSON object per line;
-- work in section-sized batches of at most about 4,000 source words;
-- decide terminology from context. Keep canonical assumption, protocol, and
-  problem names in English while translating generic concepts into Chinese.
-  Use `glossary.json` only as a per-paper consistency record, never as a
-  mechanical global replacement table;
-- retain standard English acronyms on first use;
-- persist each completed batch before continuing.
-
-Scripts may extract, protect, render, or validate text. They must never make a
-translation decision.
+- Translate from `protected_text`.
+- Preserve every `[[Pdddd]]`, `[[F...]]`, bold marker, and italic marker
+  exactly once and in order.
+- Keep IDs and one JSON object per line.
+- Translate in section batches of at most about 4,000 source words and persist
+  every completed batch.
+- Keep formal assumption/protocol/problem names in English when conventional;
+  translate generic concepts into Chinese.
+- Use `glossary.json` only for within-paper consistency.
 
 ### 3. Export, render, and validate
 
-Use the default `zh-academic-v1` general Chinese academic typography profile:
-
-- A4 narrative body: SimSun 11.5pt, justified, 16.9pt absolute line pitch,
-  natural 0pt letter spacing, 23pt first-line indent, and 4pt paragraph spacing;
-- level-one headings: SimHei 13.8pt with strong spacing;
-- level-two and deeper headings: SimHei 11.5pt with compact spacing;
-- translated-page margins: 53pt left/right, 48.5pt top, and 55.5pt bottom;
-- numbered headings: one ideographic space between the number and title;
-- list items: hanging indent, never the narrative first-line indent;
-- source-page continuations: merge into one logical paragraph before layout.
-- source bold/italic runs: preserve them in translated prose;
-- non-mathematical Latin text: use Latin Modern Roman regular, bold, and italic
-  faces while retaining SimSun/SimHei for Chinese;
-- definition items: render a semantic paragraph start with the normal 23pt
-  first-line indent, never a bare HTML line break;
-- all inline and display mathematics: render as embedded LuaLaTeX text with
-  Latin Modern Math. Never use raster images, SVG, HTML images, source-PDF
-  equation clips, or PDF image/Form fallbacks for mathematical content;
-- native-TeX review gate: abort export when TeX is missing, unbalanced,
-  unreviewed, fails LuaLaTeX compilation, or reports a missing glyph. Never
-  weaken this gate by falling back to a visual copy of the formula;
-- mathematical fragments: protect the complete atomic expression, including
-  adjacent function names and delimiters such as `O(\sqrt{p})`. Reject a
-  literal Unicode `√`; it must be represented by complete `\sqrt{...}` TeX.
-- style consistency: math-font or symbol-font runs enter math review before
-  prose styling. Never emit bold body text without a source bold span; preserve
-  genuine source bold and italic spans exactly;
-- numeric body citations: render as superscripts; never superscript bibliography
-  entries or mathematical intervals;
-- body footnotes: maintain an explicit note-number/anchor/body link and insert
-  the note at that anchor so TeX repaginates it onto the same page bottom. Use
-  `end-of-body` only when the complete note is taller than the usable page;
-- figures and tables: keep one complete vector object, centered and
-  proportional. Use its calibrated target width, never unconditional
-  `width=\linewidth`; shrink only when it exceeds the content box. Keep the
-  visual and caption on one page and keep adjacent display equations separate.
-  Only non-mathematical visual objects may use source vector clips;
-- draw translated text directly into its final page box; never re-embed the
-  4096pt measurement page because the final PDF must expose one unambiguous
-  text coordinate system.
-
-Compose the final PDF in this fixed order:
-
-- preserve all material before the Introduction as vector source-PDF pages;
-- start the translated Introduction-to-Conclusion body on a fresh page;
-- preserve all material after the Conclusion as vector source-PDF pages;
-- when a boundary shares a source page, split that page at the reviewed
-  boundary and place the untranslated vector crop on its own output page;
-- never reflow authors, abstract, keywords, biographies, acknowledgements,
-  appendices, or references as substitute text.
+Use `zh-academic-v1` and native LuaLaTeX mathematics:
 
 ```powershell
 uv run --script <skill-dir>\scripts\export_translation_markdown.py `
   --manifest <work-dir>\manifest.json `
   --translations <work-dir>\translations.jsonl `
-  --output <output-dir>\中文翻译正文.md
+  --output <staging-dir>\中文翻译正文.md
 
 uv run --script <skill-dir>\scripts\render_translation.py `
   --manifest <work-dir>\manifest.json `
   --translations <work-dir>\translations.jsonl `
-  --output <output-dir>\中文翻译.pdf
+  --output <staging-dir>\中文翻译.pdf
 
 uv run --script <skill-dir>\scripts\check_translation.py `
   --source <source.pdf> `
-  --translated <output-dir>\中文翻译.pdf `
+  --translated <staging-dir>\中文翻译.pdf `
   --manifest <work-dir>\manifest.json `
   --translations <work-dir>\translations.jsonl `
-  --preview-dir <work-dir>\translated-preview
+  --preview-dir <work-dir>\translated-preview `
+  --strict-invariants
 ```
 
-Require a passing report, then conduct two visual passes: inspect the full
-contact sheet for global pagination and inspect at readable resolution every
-page containing figures, tables, footnotes, equations, mixed one/two-column
-layout, or multiple source clips. Compare the source and output visual
-inventories in the second pass. Fix clipping, overlap, fragmentation,
-distortion, caption splitting, missing glyphs, malformed citations, or
-untranslated body before continuing. Confirm that the layout report names
-`native-lualatex-v1`, `zh-academic-v1`, SimSun, SimHei, Latin Modern Roman,
-and Latin Modern Math; do not accept Microsoft YaHei for translated Chinese
-text or SimSun for translated English prose. Require `native-font` for every
-inline fragment, `native-display-font` for every display equation, zero
-unresolved math, and zero mathematical image fallbacks. Confirm
-that `boundary_layout` records contiguous original front segments, translated
-body pages, and original tail segments with no shared output page.
-Require `native-lualatex` text embedding, zero 4096pt measurement forms, and no
-unexpected intrinsic PDF link annotations on translated-body pages.
-Require every visual exactly once with matching target size/aspect ratio,
-caption page, and internal-font calibration. Require every anchored footnote on
-its anchor page and zero unexpected bold body units.
-Run `scripts/quick_validate.py` as the final fast structural smoke test before
-publishing or replacing a Zotero attachment.
+Require a passing strict report. Inspect the contact sheet, then inspect at
+readable resolution every page containing a figure, table, footnote, equation,
+mixed columns, or multiple clips. Reject clipping, duplication, caption splits,
+missing glyphs, mathematical image fallbacks, unexpected bold text, lost
+invariant text, or boundary overlap.
 
-### 4. Write and validate the Chinese summary
+Use `\qquad(n)`, not `\tag{n}`, for display-equation numbering. Prefer reviewed
+TeX such as `\vec{...}`, `\gg`, `\mathfrak{n}`, and `\leftrightarrow`; resolve
+any unit-specific unsupported-Unicode error before rerendering.
 
-Write `<output-dir>\中文论文总结.md`, using only the paper, with these headings:
+Run the fast structural check and save its report:
 
-- 文献信息
-- 一句话结论
-- 研究问题
-- 方法与数据
-- 核心贡献
-- 主要结果
-- 局限
-- 复现材料
-- 关键词
+```powershell
+uv run --script <skill-dir>\scripts\quick_validate.py `
+  --source <source.pdf> `
+  --translated <staging-dir>\中文翻译.pdf `
+  --expected-source-sha256 <source-sha256> `
+  --report <work-dir>\quick-validation.json
+```
 
-Use 800–1,500 Chinese characters. Preserve exact reported numbers and label any
-inference as an inference. If the paper provides no dataset, code, or
-supplementary material, say so instead of inventing one.
+### 4. Summarize and package
+
+Write `中文论文总结.md` from the paper only, using the nine required headings
+enforced by `check_summary.py`. Target 1,200–1,400 Chinese characters while
+retaining the accepted 800–1,500 range.
 
 ```powershell
 uv run --script <skill-dir>\scripts\check_summary.py `
-  --summary <output-dir>\中文论文总结.md `
+  --summary <staging-dir>\中文论文总结.md `
   --report <work-dir>\summary-validation.json
 ```
 
-### 5. Prepare Zotero metadata
+Write original-language `zotero-item.json` with item type, title, creators,
+date, publication fields, DOI/arXiv/URL, and language. Require DOI, arXiv ID, or
+exact title plus year. Set `_sourceParentKey` only when the run began from that
+known parent.
 
-Write `<output-dir>\zotero-item.json` with original-language metadata. Include
-`itemType`, title, creators, date, and all available publication, volume, issue,
-pages, DOI, URL, and language fields. Never translate Zotero bibliographic
-metadata.
+Use `output/pdf/<slug>` as the default final directory. Honor a project-
+supplied directory such as `translations/papers/<group>/<slug>`. Include:
 
-Require DOI, arXiv ID, or exact title plus year. If this run began from a known
-Zotero parent, record its exact item key as `_sourceParentKey`; never infer that
-field from a search result. The adapter strips it before creating the new item.
+- byte-identical `原文 PDF.pdf`;
+- `中文翻译.pdf`, `中文翻译正文.md`, `中文论文总结.md`, `zotero-item.json`;
+- `中文翻译.layout.json`, `translation-validation.json`;
+- `quick-validation.json` and `summary-validation.json`;
+- `source-review-report.json` when review operations were applied.
 
-### 6. Ingest into Zotero by default
+### 5. Ingest and verify Zotero
 
-Run this step unless the user explicitly opted out of Zotero import. Do not
-interpret silence about Zotero as permission to skip it.
+Follow the exact sequence in
+[references/zotero-ingestion.md](references/zotero-ingestion.md): readiness,
+targets, search, guarded replacement, ingest preview, targets again immediately
+before `--yes-ingest`, actual ingest, then verify.
 
-Follow [references/zotero-ingestion.md](references/zotero-ingestion.md):
+Require one exact parent with exactly four children: stored `原文 PDF`, stored
+`中文翻译 PDF`, stored `中文翻译 Markdown`, and one `中文论文总结` note. Report the
+local final paths, target, parent key, and verified child titles.
 
-1. Check plugin, local API, Connector, and Web API credential readiness.
-2. Resolve one writable destination target.
-3. Search local and synced state.
-4. Stop on multiple matches or conflicting identity.
-5. Immediately delete one unique exact/source-parent match and its children
-   with `--yes-delete`. Invoking this skill is standing authorization for that
-   guarded replacement; do not request another confirmation.
-6. Wait for local sync absence, preview ingestion, then run `--yes-ingest`.
-7. Verify one parent with `原文 PDF`, `中文翻译 PDF`,
-   `中文翻译 Markdown`, and `中文论文总结`.
+## Batch workflow
 
-Never ingest while an old matched parent remains locally. After a partial
-Connector failure, search and inspect children before any retry.
-Verify Zotero storage structure only; do not launch or inspect the built-in PDF
-reader because the configured reading path is Google Chrome.
+Create the source-hash-bound `batch-run.json` described in
+[references/batch-workflow.md](references/batch-workflow.md). Audit Zotero
+before translating, skip only parents whose four-child verification passes,
+and call `next` after every completion or resume.
 
-## Output contract
+Process the returned paper through the single-paper gates, stage its artifacts
+under its work directory (or declare overrides), call `package`, ingest and
+verify Zotero, then call `record-zotero`. Finish only when `audit --zotero`
+writes a passing `batch-audit.json`.
 
-- Intermediates: `tmp/pdfs/<paper-slug>/`.
-- Finals: `output/pdf/<paper-slug>/`.
-- Finals include the byte-identical original PDF, `中文翻译.pdf`,
-  `中文翻译正文.md`, `中文论文总结.md`, and `zotero-item.json`.
-- Report local paths even after successful Zotero ingestion.
-- Report Zotero parent key, target, and verified child titles after ingestion.
+Never restart a terminal paper after compaction or resume. A changed source hash
+invalidates only that paper.
