@@ -9,6 +9,8 @@
 
 from __future__ import annotations
 
+import copy
+import json
 import sys
 import tempfile
 import unittest
@@ -1395,30 +1397,277 @@ class PaperPipelineTests(unittest.TestCase):
         )
         self.assertEqual(tuple(expanded), (112.0, 417.0, 487.0, 499.0))
 
-    def test_mixed_boundary_pages_are_split_around_translated_body(self) -> None:
+    def mixed_column_boundary_fixture(
+        self,
+    ) -> tuple[pymupdf.Document, list[dict[str, object]], dict[str, object]]:
+        source = pymupdf.open()
+        for _ in range(2):
+            source.new_page(width=612, height=792)
+        records = [
+            (
+                "title",
+                1,
+                "front-matter",
+                [160, 96, 452, 125],
+                "Original title across both columns",
+                (190, 115),
+            ),
+            (
+                "abstract",
+                1,
+                "body",
+                [54, 228, 297, 617],
+                "Original abstract ends in left column",
+                (54, 600),
+            ),
+            (
+                "intro",
+                1,
+                "heading",
+                [54, 630, 150, 643],
+                "Introduction",
+                (54, 640),
+            ),
+            (
+                "body-left",
+                1,
+                "body",
+                [54, 653, 297, 720],
+                "Excluded left introduction body",
+                (54, 680),
+            ),
+            (
+                "body-right",
+                1,
+                "body",
+                [315, 228, 558, 720],
+                "Excluded right introduction body",
+                (315, 250),
+            ),
+            (
+                "conclusion",
+                2,
+                "body",
+                [54, 72, 297, 160],
+                "Excluded conclusion before acknowledgments",
+                (54, 100),
+            ),
+            (
+                "ack",
+                2,
+                "heading",
+                [54, 173, 297, 186],
+                "Acknowledgments",
+                (54, 184),
+            ),
+            (
+                "tail-left",
+                2,
+                "body",
+                [54, 197, 297, 720],
+                "Original left acknowledgments and references",
+                (54, 230),
+            ),
+            (
+                "tail-right",
+                2,
+                "body",
+                [315, 72, 558, 720],
+                "Original right references start at page top",
+                (315, 85),
+            ),
+        ]
+        elements = []
+        for order, (unit_id, page, kind, bbox, text, origin) in enumerate(
+            records, 1
+        ):
+            source[page - 1].insert_text(origin, text, fontsize=9)
+            elements.append(
+                {
+                    **self.unit(unit_id, order, kind, text),
+                    "page": page,
+                    "bbox": bbox,
+                    "translatable": unit_id
+                    in {"intro", "body-left", "body-right", "conclusion"},
+                }
+            )
+        manifest = {
+            "page_count": 2,
+            "pages": [
+                {"page": page, "width": 612, "height": 792, "columns": 2}
+                for page in (1, 2)
+            ],
+            "boundary": {
+                "introduction_id": "intro",
+                "post_body_stop_id": "ack",
+            },
+        }
+        return source, elements, manifest
+
+    def test_native_mixed_columns_preserve_front_and_tail_without_body(
+        self,
+    ) -> None:
+        source, elements, manifest = self.mixed_column_boundary_fixture()
+        _, front, tail = render_translation.partition_translation_body(
+            elements, manifest
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            body_path = Path(directory) / "body.pdf"
+            output_path = Path(directory) / "output.pdf"
+            body = pymupdf.open()
+            body.new_page().insert_text(
+                (72, 72), "Translated body placeholder"
+            )
+            body.save(body_path)
+            body.close()
+            start, end, count, placements = native_latex.compose_final_pdf(
+                output_path, body_path, source, front, tail
+            )
+            self.assertEqual((start, end, count), (2, 2, 3))
+            output = pymupdf.open(
+                stream=output_path.read_bytes(), filetype="pdf"
+            )
+            front_text = output[0].get_text()
+            tail_text = output[2].get_text()
+            self.assertIn("Original title across both columns", front_text)
+            self.assertIn("Original abstract ends in left column", front_text)
+            self.assertNotIn("Excluded", front_text)
+            self.assertNotIn("Introduction", front_text)
+            self.assertIn("Acknowledgments", tail_text)
+            self.assertIn(
+                "Original right references start at page top", tail_text
+            )
+            self.assertNotIn("Excluded", tail_text)
+            layout = {
+                "boundary_layout": {
+                    "profile": "original-front-translated-body-original-tail",
+                    "translation_page_start": start,
+                    "translation_page_end": end,
+                    "segments": placements,
+                },
+                "placements": [],
+            }
+            errors, metrics = check_translation.validate_boundary_layout(
+                source, output, layout, elements, manifest
+            )
+            self.assertEqual(errors, [])
+            self.assertEqual(metrics["segments_checked"], len(placements))
+            broken_layout = copy.deepcopy(layout)
+            broken_layout["boundary_layout"]["segments"][0]["source_bbox"] = [
+                0,
+                0,
+                612,
+                792,
+            ]
+            broken_errors, _ = check_translation.validate_boundary_layout(
+                source, output, broken_layout, elements, manifest
+            )
+            self.assertTrue(
+                any(
+                    "overlaps translated body" in error
+                    for error in broken_errors
+                )
+            )
+            missing_layout = copy.deepcopy(layout)
+            missing_layout["boundary_layout"]["segments"] = [
+                item
+                for item in placements
+                if not (
+                    item["role"] == "tail-original"
+                    and item["source_bbox"][0] > 0
+                )
+            ]
+            missing_errors, _ = check_translation.validate_boundary_layout(
+                source, output, missing_layout, elements, manifest
+            )
+            self.assertTrue(
+                any(
+                    "tail-right is not completely preserved" in error
+                    for error in missing_errors
+                )
+            )
+            # Each output boundary page remains vector content at source geometry.
+            self.assertFalse(output[0].get_images())
+            self.assertFalse(output[2].get_images())
+            output.close()
+        source.close()
+
+    def test_flow_renderer_keeps_boundary_column_clips_on_one_page(
+        self,
+    ) -> None:
+        source, elements, manifest = self.mixed_column_boundary_fixture()
+        _, front, tail = render_translation.partition_translation_body(
+            elements, manifest
+        )
+        renderer = render_translation.FlowRenderer(
+            source, 612, 792, 1, 18, mock.Mock(), render_translation.PROFILE
+        )
+        for index, segment in enumerate(front):
+            renderer.place_boundary_segment(segment, start_new_page=False)
+        for index, segment in enumerate(tail):
+            renderer.place_boundary_segment(segment, start_new_page=index == 0)
+        self.assertEqual(len(renderer.document), 2)
+        self.assertNotIn("Excluded", renderer.document[0].get_text())
+        self.assertNotIn("Excluded", renderer.document[1].get_text())
+        self.assertIn(
+            "Original title across both columns",
+            renderer.document[0].get_text(),
+        )
+        self.assertIn(
+            "Original right references start at page top",
+            renderer.document[1].get_text(),
+        )
+        renderer.document.close()
+        source.close()
+
+    def test_boundary_partition_rejects_overlapping_original_and_body(
+        self,
+    ) -> None:
+        source, elements, manifest = self.mixed_column_boundary_fixture()
+        elements[1]["bbox"][3] = 640
+        with self.assertRaisesRegex(
+            ValueError, "Original front and body overlap"
+        ):
+            render_translation.partition_translation_body(elements, manifest)
+        source.close()
+
+    def test_mixed_boundary_pages_are_split_around_translated_body(
+        self,
+    ) -> None:
         elements = [
             {
                 **self.unit("front", 1, "front-matter", "Authors"),
                 "page": 1,
             },
             {
-                **self.unit("intro", 2, "heading", "1 Introduction"),
+                **self.unit("abstract", 2, "front-matter", "Abstract"),
+                "page": 2,
+                "bbox": [120, 80, 450, 560],
+            },
+            {
+                **self.unit("intro", 3, "heading", "1 Introduction"),
                 "page": 2,
                 "bbox": [120, 588, 200, 600],
                 "translatable": True,
             },
             {
-                **self.unit("body", 3, "body", "Body."),
+                **self.unit("body", 4, "body", "Body."),
                 "page": 3,
                 "translatable": True,
             },
             {
-                **self.unit("ack", 4, "heading", "Acknowledgement"),
+                **self.unit("conclusion", 5, "body", "Conclusion."),
+                "page": 20,
+                "bbox": [120, 80, 450, 340],
+                "translatable": True,
+            },
+            {
+                **self.unit("ack", 6, "heading", "Acknowledgement"),
                 "page": 20,
                 "bbox": [120, 363, 210, 375],
             },
             {
-                **self.unit("refs", 5, "body", "References"),
+                **self.unit("refs", 7, "body", "References"),
                 "page": 21,
             },
         ]
@@ -1436,7 +1685,9 @@ class PaperPipelineTests(unittest.TestCase):
         body, front, tail = render_translation.partition_translation_body(
             elements, manifest
         )
-        self.assertEqual([item["id"] for item in body], ["intro", "body"])
+        self.assertEqual(
+            [item["id"] for item in body], ["intro", "body", "conclusion"]
+        )
         self.assertEqual(
             [(item["source_page"], item["mode"]) for item in front],
             [(1, "full-page"), (2, "partial-page")],

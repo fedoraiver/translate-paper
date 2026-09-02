@@ -704,7 +704,10 @@ def build_flow_nodes(
 ) -> list[dict[str, Any]]:
     nodes: list[dict[str, Any]] = []
     for element in sorted(elements, key=lambda item: int(item["order"])):
-        if element.get("kind") in {"header", "footer"}:
+        if (
+            element.get("kind") in {"header", "footer"}
+            or element.get("render_suppressed")
+        ):
             continue
         if element.get("render_mode") == "source_clip":
             if nodes and is_caption_continuation(nodes[-1], element):
@@ -804,22 +807,158 @@ def build_flow_nodes(
     return nodes
 
 
+def boundary_page_segments(
+    page_elements: list[dict[str, Any]],
+    original_ids: set[str],
+    page_record: dict[str, Any],
+    role: str,
+) -> list[dict[str, Any]]:
+    """Keep original boundary material in its own source column geometry.
+
+    A reading-order boundary can occur at different heights in each column.
+    Clipping at the boundary heading's y-coordinate alone either repeats body
+    text or discards original material from the other column.
+    """
+    width, height = float(page_record["width"]), float(page_record["height"])
+    columns = 2 if int(page_record.get("columns") or 1) == 2 else 1
+    segments: list[dict[str, Any]] = []
+    for column in range(columns):
+        left, right = width * column / columns, width * (column + 1) / columns
+        lane = pymupdf.Rect(left, 0.0, right, height)
+        included: list[pymupdf.Rect] = []
+        excluded: list[pymupdf.Rect] = []
+        for element in page_elements:
+            rect = pymupdf.Rect(element["bbox"]) & lane
+            if rect.is_empty:
+                continue
+            collection = (
+                included if str(element["id"]) in original_ids else excluded
+            )
+            collection.append(rect)
+        if not included:
+            continue
+        if role == "front-original":
+            original_end = max(rect.y1 for rect in included)
+            body_start = min((rect.y0 for rect in excluded), default=height)
+            if original_end > body_start + 0.1:
+                raise ValueError(
+                    f"Original front and body overlap in source page "
+                    f"{page_record['page']}, column {column + 1}; review boundaries."
+                )
+            top = 0.0
+            bottom = (
+                max(original_end, body_start - 8.0) if excluded else height
+            )
+        else:
+            original_start = min(rect.y0 for rect in included)
+            body_end = max((rect.y1 for rect in excluded), default=0.0)
+            if body_end > original_start + 0.1:
+                raise ValueError(
+                    f"Body and original tail overlap in source page "
+                    f"{page_record['page']}, column {column + 1}; review boundaries."
+                )
+            top = max(body_end, original_start - 12.0) if excluded else 0.0
+            bottom = height
+        segments.append(
+            {
+                "role": role,
+                "mode": "partial-page",
+                "source_page": int(page_record["page"]),
+                "source_bbox": [left, top, right, bottom],
+                # Keep two columns aligned, including any title spanning the gutter.
+                "target_left": left,
+                "target_top": top if columns == 2 else min(top, 42.0),
+            }
+        )
+    if len(segments) == 2:
+        first, second = segments
+        if first["source_bbox"][1::2] == second["source_bbox"][1::2]:
+            first["source_bbox"][2] = width
+            segments.pop()
+        elif any(
+            str(item["id"]) in original_ids
+            and float(item["bbox"][0]) < width / 2 < float(item["bbox"][2])
+            for item in page_elements
+        ):
+            # Import a spanning title as one form rather than splitting words
+            # at the gutter. Only join where no source element crosses the
+            # horizontal cut; a references paragraph may cross the tail cut.
+            cut = (
+                min(item["source_bbox"][3] for item in segments)
+                if role == "front-original"
+                else max(item["source_bbox"][1] for item in segments)
+            )
+            if not any(
+                float(item["bbox"][1]) < cut < float(item["bbox"][3])
+                for item in page_elements
+            ):
+                common_bbox = (
+                    [0.0, 0.0, width, cut]
+                    if role == "front-original"
+                    else [0.0, cut, width, height]
+                )
+                common = {
+                    **first,
+                    "source_bbox": common_bbox,
+                    "target_left": 0.0,
+                    "target_top": common_bbox[1],
+                }
+                for segment in segments:
+                    if role == "front-original":
+                        segment["source_bbox"][1] = cut
+                        segment["target_top"] = cut
+                    else:
+                        segment["source_bbox"][3] = cut
+                segments = [common] + [
+                    item
+                    for item in segments
+                    if item["source_bbox"][3] > item["source_bbox"][1]
+                ]
+    for element in page_elements:
+        rect = pymupdf.Rect(element["bbox"])
+        if (
+            columns == 2
+            and str(element["id"]) in original_ids
+            and rect.x0 < width / 2 < rect.x1
+            and not any(
+                pymupdf.Rect(item["source_bbox"]).contains(rect)
+                for item in segments
+            )
+        ):
+            raise ValueError(
+                f"Original boundary unit {element['id']} spans incompatible "
+                "column crops; review its source geometry."
+            )
+    for segment in segments:
+        if segment["source_bbox"] == [0.0, 0.0, width, height]:
+            segment["mode"] = "full-page"
+    return segments
+
+
 def partition_translation_body(
     elements: list[dict[str, Any]],
     manifest: dict[str, Any],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     """Split source-original front/tail material from the translated body."""
     ordered = sorted(elements, key=lambda item: int(item["order"]))
-    positions = {str(element["id"]): index for index, element in enumerate(ordered)}
+    positions = {
+        str(element["id"]): index for index, element in enumerate(ordered)
+    }
     boundary = manifest.get("boundary") or {}
     start_id = str(boundary.get("introduction_id") or "")
     stop_id = str(boundary.get("post_body_stop_id") or "")
     if start_id not in positions:
-        raise ValueError("Translation start ID is missing from source elements.")
+        raise ValueError(
+            "Translation start ID is missing from source elements."
+        )
     start_index = positions[start_id]
-    stop_index = positions.get(stop_id, len(ordered)) if stop_id else len(ordered)
+    stop_index = (
+        positions.get(stop_id, len(ordered)) if stop_id else len(ordered)
+    )
     if stop_index <= start_index:
-        raise ValueError("Translation stop boundary precedes the start boundary.")
+        raise ValueError(
+            "Translation stop boundary precedes the start boundary."
+        )
 
     body_elements = ordered[start_index:stop_index]
     start_element = ordered[start_index]
@@ -832,7 +971,9 @@ def partition_translation_body(
     def page_geometry(page_number: int) -> tuple[float, float]:
         page = page_records.get(page_number)
         if not page:
-            raise ValueError(f"Missing geometry for source page {page_number}.")
+            raise ValueError(
+                f"Missing geometry for source page {page_number}."
+            )
         return float(page["width"]), float(page["height"])
 
     front_segments: list[dict[str, Any]] = []
@@ -848,50 +989,27 @@ def partition_translation_body(
                 "target_top": 0.0,
             }
         )
-    start_width, start_height = page_geometry(start_page)
-    start_y = float(start_element["bbox"][1])
-    if start_y > start_height * 0.22:
-        front_segments.append(
-            {
-                "role": "front-original",
-                "mode": "partial-page",
-                "source_page": start_page,
-                "source_bbox": [
-                    0.0,
-                    0.0,
-                    start_width,
-                    min(start_height, max(1.0, start_y - 8.0)),
-                ],
-                "target_top": 0.0,
-            }
+    page_geometry(start_page)
+    front_segments.extend(
+        boundary_page_segments(
+            [item for item in ordered if int(item["page"]) == start_page],
+            {str(item["id"]) for item in ordered[:start_index]},
+            page_records[start_page],
+            "front-original",
         )
+    )
 
     tail_segments: list[dict[str, Any]] = []
     if stop_element is not None:
         stop_page = int(stop_element["page"])
-        stop_width, stop_height = page_geometry(stop_page)
-        stop_y = float(stop_element["bbox"][1])
-        if stop_y <= stop_height * 0.22:
-            first_tail_bbox = [0.0, 0.0, stop_width, stop_height]
-            first_tail_mode = "full-page"
-            target_top = 0.0
-        else:
-            first_tail_bbox = [
-                0.0,
-                max(0.0, stop_y - 12.0),
-                stop_width,
-                stop_height,
-            ]
-            first_tail_mode = "partial-page"
-            target_top = 42.0
-        tail_segments.append(
-            {
-                "role": "tail-original",
-                "mode": first_tail_mode,
-                "source_page": stop_page,
-                "source_bbox": first_tail_bbox,
-                "target_top": target_top,
-            }
+        page_geometry(stop_page)
+        tail_segments.extend(
+            boundary_page_segments(
+                [item for item in ordered if int(item["page"]) == stop_page],
+                {str(item["id"]) for item in ordered[stop_index:]},
+                page_records[stop_page],
+                "tail-original",
+            )
         )
         for page_number in range(stop_page + 1, source_page_count + 1):
             width, height = page_geometry(page_number)
@@ -1512,13 +1630,14 @@ class FlowRenderer:
         source_page = self.source[source_page_number - 1]
         clip = pymupdf.Rect(segment["source_bbox"])
         target_top = float(segment.get("target_top") or 0.0)
+        target_left = float(segment.get("target_left") or 0.0)
         if start_new_page:
             self.new_page(source_page.rect.width, source_page.rect.height)
         assert self.page is not None
         target = pymupdf.Rect(
-            0.0,
+            target_left,
             target_top,
-            clip.width,
+            target_left + clip.width,
             target_top + clip.height,
         )
         if target.x1 > self.page.rect.width + 0.1:
@@ -1967,7 +2086,14 @@ def main() -> int:
     )
     try:
         for index, segment in enumerate(front_segments):
-            renderer.place_boundary_segment(segment, start_new_page=index > 0)
+            renderer.place_boundary_segment(
+                segment,
+                start_new_page=(
+                    index > 0
+                    and front_segments[index - 1]["source_page"]
+                    != segment["source_page"]
+                ),
+            )
         if front_segments:
             renderer.new_page()
         translation_page_start = renderer.page.number + 1
@@ -2006,8 +2132,15 @@ def main() -> int:
                 renderer.place_text(node, keep_with_height)
         renderer.flush_deferred_footnotes()
         translation_page_end = renderer.page.number + 1
-        for segment in tail_segments:
-            renderer.place_boundary_segment(segment, start_new_page=True)
+        for index, segment in enumerate(tail_segments):
+            renderer.place_boundary_segment(
+                segment,
+                start_new_page=(
+                    index == 0
+                    or tail_segments[index - 1]["source_page"]
+                    != segment["source_page"]
+                ),
+            )
         result = renderer.finish()
         result.set_metadata(
             {

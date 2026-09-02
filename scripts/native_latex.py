@@ -779,21 +779,30 @@ def _place_boundary_segment(
     output: pymupdf.Document,
     source: pymupdf.Document,
     segment: dict[str, Any],
+    start_new_page: bool = True,
 ) -> dict[str, Any]:
     source_page_number = int(segment["source_page"])
     source_page = source[source_page_number - 1]
     source_rect = pymupdf.Rect(segment["source_bbox"]) & source_page.rect
-    page = output.new_page(
-        width=source_page.rect.width,
-        height=source_page.rect.height,
+    page = (
+        output.new_page(
+            width=source_page.rect.width, height=source_page.rect.height
+        )
+        if start_new_page
+        else output[-1]
     )
     target_top = float(segment.get("target_top") or 0.0)
+    target_left = float(segment.get("target_left") or 0.0)
     target = pymupdf.Rect(
-        0.0,
+        target_left,
         target_top,
-        source_rect.width,
+        target_left + source_rect.width,
         target_top + source_rect.height,
     )
+    if source_rect.is_empty or not page.rect.contains(target):
+        raise ValueError(
+            f"Invalid original boundary geometry: source page {source_page_number}"
+        )
     page.show_pdf_page(
         target,
         source,
@@ -819,19 +828,32 @@ def compose_final_pdf(
 ) -> tuple[int, int, int, list[dict[str, Any]]]:
     result = pymupdf.open()
     boundary_placements: list[dict[str, Any]] = []
-    for segment in front_segments:
+    for index, segment in enumerate(front_segments):
         boundary_placements.append(
-            _place_boundary_segment(result, source, segment)
+            _place_boundary_segment(
+                result,
+                source,
+                segment,
+                start_new_page=index == 0
+                or front_segments[index - 1]["source_page"]
+                != segment["source_page"],
+            )
         )
     body = pymupdf.open(body_pdf)
     translation_start = len(result) + 1
     result.insert_pdf(body)
     translation_end = len(result)
-    body_page_count = len(body)
     body.close()
-    for segment in tail_segments:
+    for index, segment in enumerate(tail_segments):
         boundary_placements.append(
-            _place_boundary_segment(result, source, segment)
+            _place_boundary_segment(
+                result,
+                source,
+                segment,
+                start_new_page=index == 0
+                or tail_segments[index - 1]["source_page"]
+                != segment["source_page"],
+            )
         )
     result.set_metadata(
         {
