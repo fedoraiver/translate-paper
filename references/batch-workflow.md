@@ -9,6 +9,13 @@
 Use a batch ledger when the request names a paper list, asks for Zotero items
 without translations, or resumes a long multi-paper run.
 
+The ledger makes a run recoverable; it does not schedule one paper or stage per
+conversation turn. In one continuous run, repeat `next -> single-paper gates ->
+package -> Zotero verify/record -> next` until `next` reports `complete`. Persist
+each transition and emit progress updates, but do not yield for a manual
+"continue" between papers or stages. Stop only for a blocking condition defined
+by the completion and continuity contract in `SKILL.md`.
+
 ## Ledger
 
 Create `batch-run.json` beside the project artifacts:

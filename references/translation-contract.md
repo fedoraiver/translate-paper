@@ -85,6 +85,12 @@ Create `translations.jsonl` from the template. Fill only `translated_text` and
 save after every section. Export `中文翻译正文.md` from the completed JSONL so the
 translation remains auditable independently of PDF layout.
 
+Section saves are crash- and compaction-recovery checkpoints, not planned pause
+points. Validate the just-written records and continue with the next untranslated
+unit in the same turn. A partial final response is permitted only under the true
+blocking conditions in `SKILL.md`; remaining length or context pressure alone is
+not a blocker.
+
 Use [source-review.md](source-review.md) when a visual detector swallows prose,
 splits a multi-panel figure, leaves plot labels as headings/equations, or
 misclassifies a caption. Do not replace this persistent review with a

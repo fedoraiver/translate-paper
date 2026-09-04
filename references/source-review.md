@@ -10,6 +10,13 @@ Use `source-review.json` for reviewed extraction corrections that must survive
 reruns. Never create a paper-specific repair script when these operations can
 express the correction.
 
+Prefer one preparation pass followed by targeted inspection of reported pages.
+Represent page- or paper-specific corrections with the operations below and rerun
+preparation; do not repeatedly patch and execute temporary extractor copies. If a
+failure is genuinely general and cannot be represented here, minimize it against
+the skill script, add a regression test, fix the shared script once, and rerun only
+the affected pipeline stage.
+
 ## Gate and lifecycle
 
 `prepare_paper.py` creates this hash-bound skeleton in the work directory:

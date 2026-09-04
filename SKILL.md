@@ -1,6 +1,6 @@
 ---
 name: translate-paper
-description: Translate one or more academic-paper PDFs into Chinese with the active Codex model, preserve figures, tables, native mathematics, citations, appendices, references, and original bibliographic material, validate PDF/Markdown/summary artifacts, and safely organize them in Zotero by default. Use for single papers, paper lists or sections, Zotero missing-translation audits, resumable translation batches, layout-preserving output, summaries, ingestion, or exact-parent replacement.
+description: Translate one or more academic-paper PDFs into Chinese with the active Codex model, complete the requested workflow continuously end to end, preserve figures, tables, native mathematics, citations, appendices, references, and original bibliographic material, validate PDF/Markdown/summary artifacts, and safely organize them in Zotero by default. Use for single papers, paper lists or sections, Zotero missing-translation audits, resumable translation batches, layout-preserving output, summaries, ingestion, or exact-parent replacement.
 ---
 
 # Translate paper
@@ -10,6 +10,50 @@ translation API, browser translator, local translation model, machine-
 translation package, or delegated agent. Use scripts only for deterministic
 extraction, OCR, review replay, rendering, validation, packaging, and Zotero
 operations.
+
+## Completion and continuity
+
+Complete the user's requested outcome in the current turn by default. Translation
+batches, persisted JSONL, ledgers, and progress summaries are recovery checkpoints,
+not turn boundaries. After saving and validating each checkpoint, immediately
+continue with the next batch, unresolved formula, render, visual review, package,
+requested downstream edit, and Zotero step that remains in scope. Do not ask the
+user to type "continue" and do not send a final partial-completion response while
+safe, authorized work remains runnable.
+
+For long work, give concise progress updates without yielding the task. Before
+context pressure or compaction, finish the current atomic edit, persist it, and
+record the exact next unit or paper in the existing checkpoint; after compaction or
+resume, inspect that checkpoint and continue automatically without redoing passed
+work. Elapsed time, paper length, formula count, the number of remaining batches,
+or the existence of a resumable checkpoint are not blockers.
+
+Stop before completion only when further progress requires a material user choice,
+missing source or credentials, unavailable external state, authorization outside
+the request, or human evidence that cannot be obtained with the available tools.
+Report the exact blocker and the saved resume point. Ordinary extraction defects,
+validation failures with actionable diagnostics, and recoverable tool errors must
+be investigated and retried in the same turn.
+
+## Efficient execution
+
+- Use the skill scripts for deterministic work and the active model only for
+  translation and review decisions. Batch independent read-only inspections and
+  validations when this does not create competing writes.
+- Run preparation once, inspect its reports and only the pages they identify, then
+  rerun the narrow affected stage after a reviewed correction. Do not repeatedly
+  OCR, extract, or render the whole paper without new evidence.
+- Express paper-specific extraction corrections in `boundary-review.json`,
+  `source-review.json`, `math-review.json`, or `visual-layout.json`. Do not fork or
+  patch a helper under a project's temporary directory. Change a skill script only
+  for a demonstrated general defect, add a regression test, and preserve the
+  reviewed paper checkpoints.
+- Keep `translations.jsonl` as the canonical translation state. Temporary section
+  files may support an atomic edit, but merge and validate them immediately; do not
+  spend a later turn rediscovering or reconciling completed batches.
+- Wait for long-running extraction, OCR, compilation, and rendering commands and
+  continue when they finish. A normally running command is progress, not a reason
+  to return control to the user.
 
 ## Prepare
 
@@ -67,8 +111,8 @@ Copy `translations.template.jsonl` to `translations.jsonl`. Fill only
 - Preserve every `[[Pdddd]]`, `[[F...]]`, bold marker, and italic marker
   exactly once and in order.
 - Keep IDs and one JSON object per line.
-- Translate in section batches of at most about 4,000 source words and persist
-  every completed batch.
+- Translate in section batches of at most about 4,000 source words, persist and
+  validate every completed batch, then begin the next batch in the same turn.
 - Keep formal assumption/protocol/problem names in English when conventional;
   translate generic concepts into Chinese.
 - Use `glossary.json` only for within-paper consistency.
@@ -159,7 +203,9 @@ local final paths, target, parent key, and verified child titles.
 Create the source-hash-bound `batch-run.json` described in
 [references/batch-workflow.md](references/batch-workflow.md). Audit Zotero
 before translating, skip only parents whose four-child verification passes,
-and call `next` after every completion or resume.
+and call `next` after every completion or resume. Continue processing returned
+papers in the same turn until `next` reports `complete` or a true blocker from
+the continuity contract is reached.
 
 Process the returned paper through the single-paper gates, stage its artifacts
 under its work directory (or declare overrides), call `package`, ingest and
