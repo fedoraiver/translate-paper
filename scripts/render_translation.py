@@ -35,7 +35,7 @@ LIST_RE = re.compile(
     r"^\s*(?:[•●▪◦‣*-]|\(?\d{1,3}[.)、]|[（(]?[一二三四五六七八九十]+[)）、])\s*"
 )
 HEADING_NUMBER_RE = re.compile(r"^\s*(\d+(?:\.\d+)*)[.)]?\s+")
-PARAGRAPH_END_RE = re.compile(r"""[。！？.!?]["'”’）)\]]*\s*$""")
+PARAGRAPH_END_RE = re.compile(r"""[。！？.!?□∎]["'”’）)\]]*\s*$""")
 CONTROL_TOKEN_RE = re.compile(
     r"\[\[(?:[BIE][A-Za-z0-9_]*_(?:OPEN|CLOSE)|"
     r"F[A-Za-z0-9_]+|BR|PAR)\]\]"
@@ -642,6 +642,17 @@ def is_logical_continuation(
     previous_page = int(previous_element.get("page") or 0)
     current_page = int(element.get("page") or 0)
     previous_source = str(previous_element.get("source_text") or "").strip()
+    # A terminal superscript note is not part of the sentence ending.
+    # Otherwise "sentence.2" is mistaken for an unfinished paragraph.
+    for fragment in (previous_element.get("inline_fragments") or {}).values():
+        marker = str(fragment.get("text") or "").strip()
+        if (
+            fragment.get("kind") == "footnote-marker"
+            and fragment.get("footnote_id")
+            and marker
+            and previous_source.endswith(marker)
+        ):
+            previous_source = previous_source[:-len(marker)].rstrip()
     if not previous_source or PARAGRAPH_END_RE.search(previous_source):
         return False
     if current_page == previous_page + 1:
@@ -784,8 +795,15 @@ def build_flow_nodes(
             else normalize_body_text(raw_text)
         )
         role = flow_role(element, text)
-        if nodes and is_logical_continuation(nodes[-1], element, role):
-            previous = nodes[-1]
+        # Anchored notes are page furniture, not intervening body paragraphs.
+        previous_body = next(
+            (node for node in reversed(nodes)
+             if node.get("element", {}).get("kind") != "footnote"
+             or not node.get("element", {}).get("anchor_id")),
+            None,
+        )
+        if previous_body and is_logical_continuation(previous_body, element, role):
+            previous = previous_body
             previous["text"] = join_continuation(previous["text"], text)
             previous["ids"].append(element["id"])
             previous["elements"].append(element)
@@ -955,6 +973,17 @@ def partition_translation_body(
     stop_index = (
         positions.get(stop_id, len(ordered)) if stop_id else len(ordered)
     )
+    # Reviewed include_ids may extend the body beyond its initial boundary.
+    # Honor the resulting inventory instead of copying those translations into
+    # the original-language front or tail.
+    included_indices = [
+        index
+        for index, element in enumerate(ordered)
+        if element.get("translatable") and not element.get("render_suppressed")
+    ]
+    if included_indices:
+        start_index = min(start_index, min(included_indices))
+        stop_index = max(stop_index, max(included_indices) + 1)
     if stop_index <= start_index:
         raise ValueError(
             "Translation stop boundary precedes the start boundary."

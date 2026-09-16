@@ -5,6 +5,10 @@ import pymupdf
 
 
 class VisualAssociationTests(unittest.TestCase):
+    def test_chapter_hyphenated_figure_numbers_are_distinct(self):
+        self.assertEqual(prepare_paper.visual_label("Figure 5-1: First"), ("figure", "figure-5-1"))
+        self.assertEqual(prepare_paper.visual_label("Figure 5-3: Third"), ("figure", "figure-5-3"))
+
     @staticmethod
     def element(identifier, kind, bbox, text="", **extra):
         return {

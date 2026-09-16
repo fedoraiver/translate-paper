@@ -104,7 +104,7 @@ PROTECTED_RE = re.compile(
 VISUAL_LABEL_RE = re.compile(
     r"(?:(?:\b(?P<latin_kind>figure|fig\.?|table))|"
     r"(?P<cjk_kind>图|表))\s*"
-    r"(?P<number>[A-Z]?\d+(?:\.\d+)*)",
+    r"(?P<number>[A-Z]?\d+(?:[.\-]\d+)*)",
     re.IGNORECASE,
 )
 FOOTNOTE_PREFIX_RE = re.compile(r"^\s*(?P<number>\d{1,2}|[*⋆†‡])(?=\s|\D)")

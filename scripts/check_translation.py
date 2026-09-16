@@ -1026,6 +1026,13 @@ def validate_boundary_layout(
         )
         stop_id = str(source_boundary.get("post_body_stop_id") or "")
         stop = positions.get(stop_id, len(ordered))
+        included = [
+            index for index, item in enumerate(ordered)
+            if item.get("translatable") and not item.get("render_suppressed")
+        ]
+        if start is not None and included:
+            start = min(start, min(included))
+            stop = max(stop, max(included) + 1)
         if start is None or stop <= start:
             errors.append(
                 "Source boundary IDs are invalid for overlap validation."

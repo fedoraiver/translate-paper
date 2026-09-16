@@ -361,10 +361,11 @@ def latex_escape_text(value: str) -> str:
         "←": r"\(\leftarrow\)",
         "↔": r"\(\leftrightarrow\)",
         "↦": r"\(\mapsto\)",
+        "↪": r"\(\hookrightarrow\)",
         "−": r"\(-\)",
         "×": r"\(\times\)",
         "′": r"\(\prime\)",
-        "□": r"\(\rule{0.55em}{0.55em}\)",
+        "□": r"\(\square\)",
         "⊙": r"\(\odot\)",
         "⌈": r"\(\lceil\)",
         "⌉": r"\(\rceil\)",
@@ -484,7 +485,11 @@ def prose_to_latex(value: str, *, allow_auto_math: bool = False) -> str:
     cursor = 0
     for match in AUTO_MATH_TOKEN_RE.finditer(value):
         output.append(latex_escape_text(value[cursor : match.start()]))
-        output.append(r"\(" + _auto_math_tex(match.group(0)) + r"\)")
+        token = match.group(0)
+        if token in {"in", "an", "am"}:
+            output.append(latex_escape_text(token))
+        else:
+            output.append(r"\(" + _auto_math_tex(token) + r"\)")
         cursor = match.end()
     output.append(latex_escape_text(value[cursor:]))
     return "".join(output)
@@ -798,6 +803,19 @@ def source_clip_target_geometry(
     )
 
 
+def _caption_matches_clip(caption: dict[str, Any], clip: dict[str, Any]) -> bool:
+    """Use the reviewed association before applying adjacency-based keep rules."""
+    visual = clip.get("visual_layout") or {}
+    caption_id = str(visual.get("caption_id") or "")
+    if caption_id:
+        return caption_id in (caption.get("ids") or [caption["id"]])
+    caption_visual = str(caption["element"].get("visual_id") or "")
+    clip_visual = str(visual.get("visual_id") or clip["element"].get("visual_id") or "")
+    if caption_visual and clip_visual:
+        return caption_visual == clip_visual
+    return True
+
+
 def _caption_clip_needspace(
     source: pymupdf.Document,
     clip_node: dict[str, Any],
@@ -997,6 +1015,7 @@ def build_body_tex(
             str(node["element"].get("kind") or "") == "caption"
             and next_node is not None
             and _node_is_nonmath_clip(next_node)
+            and _caption_matches_clip(node, next_node)
         ):
             needspace = _caption_clip_needspace(source, next_node, profile)
             latex = rf"\Needspace{{{needspace:.2f}pt}}" + "\n" + latex
@@ -1004,6 +1023,7 @@ def build_body_tex(
             _node_is_nonmath_clip(node)
             and next_node is not None
             and str(next_node["element"].get("kind") or "") == "caption"
+            and _caption_matches_clip(next_node, node)
         ):
             needspace = _caption_clip_needspace(source, node, profile)
             latex = rf"\Needspace{{{needspace:.2f}pt}}" + "\n" + latex
@@ -1176,6 +1196,24 @@ def compose_final_pdf(
     front_segments: list[dict[str, Any]],
     tail_segments: list[dict[str, Any]],
 ) -> tuple[int, int, int, list[dict[str, Any]]]:
+    # Omit wholly empty printer-padding pages, while retaining scanned,
+    # vector-only, and annotated source pages. Keep reported segment counts
+    # consistent with the pages actually composed.
+    for segments in (front_segments, tail_segments):
+        kept = []
+        for segment in segments:
+            page = source[int(segment["source_page"]) - 1]
+            blank = (
+                segment.get("mode") == "full-page"
+                and not page.get_text().strip()
+                and not page.get_images()
+                and not page.get_drawings()
+                and not list(page.annots() or [])
+                and not page.get_links()
+            )
+            if not blank:
+                kept.append(segment)
+        segments[:] = kept
     result = pymupdf.open()
     boundary_placements: list[dict[str, Any]] = []
     for index, segment in enumerate(front_segments):

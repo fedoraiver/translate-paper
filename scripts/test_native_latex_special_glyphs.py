@@ -19,6 +19,24 @@ from typography import ZH_ACADEMIC_V1
 
 
 class NativeSpecialGlyphTests(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("lualatex"), "LuaLaTeX is unavailable")
+    def test_exercise_arrow_and_open_proof_square_render_as_native_text(self):
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            content = native_latex.latex_escape_text("Exercise ★ ↪ Proof □")
+            path = work / "exercise-symbols.tex"
+            path.write_text(
+                native_latex._document_preamble(ZH_ACADEMIC_V1)
+                + content + "\n" + r"\end{document}", encoding="utf-8"
+            )
+            pdf, metrics = native_latex.compile_body_tex(work, path)
+            self.assertEqual(metrics["missing_glyphs"], 0)
+            with pymupdf.open(pdf) as document:
+                text = "".join(page.get_text() for page in document)
+                self.assertIn("↪", text)
+                self.assertIn("□", text)
+                self.assertFalse(any(page.get_images() for page in document))
+
     def test_native_percentage_is_escaped_once(self):
         for raw, wanted in (("10%", r"10\%"), (r"10\%", r"10\%"),
                             (r"10\\%", r"10\\\%")):

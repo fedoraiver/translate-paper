@@ -25,6 +25,67 @@ def clip(unit_id, order, bbox):
 
 
 class NativeClipLayoutTests(unittest.TestCase):
+    def test_blank_source_padding_is_not_copied_to_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            body = pymupdf.open()
+            body.new_page().insert_text((50,50), "Translated body")
+            body.save(directory / "body.pdf")
+            body.close()
+            source = pymupdf.open()
+            source.new_page()
+            tail = [{"role":"tail-original", "mode":"full-page",
+                     "source_page":1, "source_bbox":[0,0,595,842], "target_top":0}]
+            native_latex.compose_final_pdf(directory / "result.pdf",
+                directory / "body.pdf", source, [], tail)
+            with pymupdf.open(directory / "result.pdf") as result:
+                self.assertEqual(len(result), 1)
+            self.assertEqual(tail, [])
+            source.close()
+
+    def test_anchored_note_does_not_split_cross_page_sentence(self):
+        first = {"id":"a", "order":1, "page":1, "bbox":[50,700,500,730],
+                 "kind":"body", "render_mode":"text", "translatable":True,
+                 "section":"Introduction", "source_text":"A sentence that continues", "font_size":10}
+        note = {**first, "id":"note", "order":2, "kind":"footnote",
+                "anchor_id":"a", "source_text":"1. Footnote."}
+        second = {**first, "id":"b", "order":3, "page":2,
+                  "bbox":[50,50,500,80], "source_text":"on the next page."}
+        nodes = render_translation.build_flow_nodes([first,note,second],
+            {"a":"这一句延续到", "note":"1. 脚注。", "b":"下一页。"})
+        self.assertEqual(nodes[0]["ids"], ["a","b"])
+        self.assertEqual(nodes[1]["ids"], ["note"])
+
+    def test_prose_in_next_to_math_is_not_an_automatic_subscript(self):
+        self.assertEqual(
+            native_latex.prose_to_latex("in an am xi x1", allow_auto_math=True),
+            r"in an am \(x_{i}\) \(x_{1}\)",
+        )
+
+    def test_caption_between_figures_stays_with_its_reviewed_figure(self):
+        first = clip("first", 1, [50, 50, 480, 530])
+        first["visual_id"] = "Figure 1"
+        caption = {"id": "caption-first", "order": 2, "page": 1,
+                   "bbox": [80, 540, 400, 555], "kind": "caption",
+                   "render_mode": "text", "source_text": "Figure 1. First",
+                   "font_size": 10.0, "visual_id": "Figure 1"}
+        second = clip("second", 3, [50, 570, 480, 720])
+        second["visual_id"] = "Figure 2"
+        nodes = render_translation.build_flow_nodes(
+            [first, caption, second], {"caption-first": caption["source_text"]}
+        )
+        nodes[0]["visual_layout"] = {"visual_id": "Figure 1", "caption_id": "caption-first"}
+        nodes[2]["visual_layout"] = {"visual_id": "Figure 2", "caption_id": "caption-second"}
+        with tempfile.TemporaryDirectory() as directory, pymupdf.open() as source:
+            source.new_page(width=612, height=792)
+            tex, _, _ = native_latex.build_body_tex(
+                nodes, {}, ZH_ACADEMIC_V1, source, Path(directory)
+            )
+        first_chunk = tex.split("% TP-NODE first\n", 1)[1].split("% TP-NODE", 1)[0]
+        caption_chunk = tex.split("% TP-NODE caption-first\n", 1)[1].split("% TP-NODE", 1)[0]
+        self.assertIn(r"\Needspace", first_chunk)
+        self.assertNotIn(r"\Needspace", caption_chunk)
+
     def test_disjoint_algorithms_never_form_a_page_sized_crop(self):
         elements = [clip("bottom-left", 1, [54, 576, 297, 718]),
                     clip("top-right", 2, [315, 68, 558, 268])]
