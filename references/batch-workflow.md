@@ -51,7 +51,8 @@ Paths are relative to the ledger unless absolute. `final_dir` is optional and
 defaults to `<output_root>/<slug>`. Use `output/pdf` as the default output root;
 honor a project-provided archive directory.
 
-Keep Zotero enabled by default. For an explicitly local-only request, set
+Keep Zotero enabled when allowed by the request and project instructions. For a
+local-only request or project, set
 `"zotero_enabled": false`; only then may `zotero_target` be omitted and the
 terminal local stage be `packaged`.
 
@@ -59,11 +60,12 @@ Each paper must have a stable order, slug, title, source PDF, work directory,
 and DOI, arXiv ID, or title plus year. Use an `artifacts` object to override
 staging paths for `translated_pdf`, `translated_markdown`, `summary`,
 `metadata`, `layout_report`, `strict_validation`, `quick_validation`,
-`summary_validation`, or `source_review_report`.
+`summary_validation`, `visual_review`, or `source_review_report`.
 
 ## Commands
 
-Before translating, audit the exact local Zotero parents:
+Before translating, audit the exact local Zotero parents. Skip this command for
+local-only batches:
 
 ```powershell
 python <skill-dir>\scripts\batch_workflow.py audit-zotero `
@@ -86,9 +88,14 @@ The script derives stages from source hashes and artifacts:
 `queued -> prepared -> translated -> strict_validated -> packaged -> zotero_verified`
 
 A changed source hash resets only that paper. The terminal states are
-`zotero_verified` and `skipped_existing`.
+`zotero_verified` and `skipped_existing`, or `packaged` for local-only batches.
 
-After strict, quick, and summary validation pass, package one paper:
+After strict, quick, summary, and independent visual review pass, package one
+paper. The default visual report is `<work-dir>/visual-review.json`; packaging
+and final-bundle audit require complete page coverage and matching source/output
+PDF hashes. A missing or stale visual report is not a reason to retranslate a
+completed paper: review the existing valid PDF and resume packaging. Do not
+fabricate a report for an older bundle that lacks review evidence.
 
 ```powershell
 python <skill-dir>\scripts\batch_workflow.py package `
@@ -119,5 +126,7 @@ python <skill-dir>\scripts\batch_workflow.py audit `
   --zotero
 ```
 
-Require a passing `batch-audit.json`. Never restart a completed paper merely
+For local-only batches, omit `--zotero`, skip `record-zotero`, and continue
+directly from `package` to `next`. Require a passing `batch-audit.json`.
+Never restart a completed paper merely
 because the conversation was compacted or resumed.

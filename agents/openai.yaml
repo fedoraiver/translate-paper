@@ -1,4 +1,7 @@
 interface:
   display_name: "Translate paper"
   short_description: "Complete paper translations and organize Zotero safely"
-  default_prompt: "Use $translate-paper to complete an academic-paper translation end to end in one continuous run, validate every artifact, and organize Zotero safely when in scope."
+  default_prompt: "Use $translate-paper with separate agents all using the latest verified flagship model (currently GPT-6 Astra) and role-specific reasoning effort to translate, render, visually inspect every final PDF page, validate artifacts, and organize Zotero when in scope."
+
+policy:
+  allow_implicit_invocation: false

@@ -10,16 +10,25 @@
 
 ## Translation engine
 
-The active Codex model must perform every translation decision and write every
-Chinese sentence. Do not use translation APIs, web or browser translation,
+Codex translation agents using the workflow's latest verified flagship model
+(currently `gpt-6-astra`) perform translation
+decisions and write the Chinese prose. The coordinator integrates their batches;
+an independent agent performs visual review. Follow
+[agent-workflow.md](agent-workflow.md) for roles, handoffs, and single-writer rules.
+Do not use translation APIs, web or browser translation,
 Google Translate, Microsoft Translator, DeepL, local translation models,
-machine-translation packages, or delegated agents.
+or machine-translation packages. Delegation to these Codex subagents is required
+when available; it does not authorize external translation services.
 
 OCR, PDF parsing, layout analysis, font shaping, export, and validation are
 allowed only as mechanical document-processing steps. OCR output is source
 text, not a translation.
 
 ## Content boundary
+
+The following is the default for a complete paper. For an explicitly requested
+chapter or excerpt, use [chapter-workflow.md](chapter-workflow.md) to define the
+range; do not invent Introduction/Conclusion sections or discard exercises.
 
 Translate:
 
@@ -81,8 +90,8 @@ deterministically.
 - `glossary.json`: persistent terminology map;
 - source previews and layout-aware extracted text.
 
-Create `translations.jsonl` from the template. Fill only `translated_text` and
-save after every section. Export `中文翻译正文.md` from the completed JSONL so the
+Initialize `translations.jsonl` from the template only if absent. Fill only
+`translated_text` and save after every section. Export `中文翻译正文.md` from the completed JSONL so the
 translation remains auditable independently of PDF layout.
 
 Section saves are crash- and compaction-recovery checkpoints, not planned pause
@@ -95,6 +104,32 @@ Use [source-review.md](source-review.md) when a visual detector swallows prose,
 splits a multi-panel figure, leaves plot labels as headings/equations, or
 misclassifies a caption. Do not replace this persistent review with a
 paper-specific repair script.
+
+### Batch checkpoints
+
+Write a batch as UTF-8 JSONL with exactly `id` and `translated_text` per record,
+using full tokens copied from `protected_text`. No TSV shorthand, token aliases,
+or translation produced by mechanical scripts/services. Save one batch with:
+
+```powershell
+uv run --script <skill-dir>\scripts\translation_checkpoint.py `
+  --manifest <work-dir>\manifest.json `
+  --translations <work-dir>\translations.jsonl `
+  --batch <work-dir>\batch-01.jsonl
+```
+
+The helper checks source hash, unique IDs, current source metadata, Chinese prose,
+and the exact protected/style-token sequence before any write. It retains all
+other records, atomically replaces the checkpoint, and reports completed count,
+remaining count, and `next_id`. Replaying identical text is harmless; changing
+completed text requires `--replace-completed` for a deliberate revision. Use one
+writer per checkpoint. Keep revision batches narrowly scoped.
+
+Omit `--batch` for a read-only resume check. Add `--require-complete` before
+export. A partial checkpoint can pass structural checks with `complete: false`;
+continue from `next_id`. This helper does not certify translation quality or
+replace source, math, PDF, or summary validation. A stale source record must go
+through source-review reconciliation, not have its metadata silently overwritten.
 
 ## Visual preservation
 
@@ -121,10 +156,11 @@ visual/content-width ratio in the target content area, record
 `automatic_fallback: true`, and emit a warning. This fallback does not permit a
 missing or duplicate object.
 
-After rendering, perform two visual reviews: first inspect the full contact
-sheet for global pagination, then inspect at high resolution every page with a
-figure, table, footnote, equation, mixed columns, or multiple source clips.
-Compare the source and output inventories during the second pass.
+After rendering, require an independent visual-review agent to inspect the full
+contact sheet and every output page image at readable resolution, comparing
+complex content to source pages. Follow [visual-review.md](visual-review.md) for
+the PDF-hash-bound report and repair/review loop. Strict validation alone does
+not satisfy this gate; any PDF change invalidates the prior visual acceptance.
 
 Retain source span typography in translatable prose. Render source bold and
 italic emphasis on the translated equivalent. Detect numeric bracket citations
@@ -132,11 +168,16 @@ before generic protected values and render body citations as superscripts;
 exclude bibliography entries and mathematical intervals. Reconstruct inline
 mathematics from recorded font, size, baseline, and spatially adjacent runs,
 including runs split across overlapping PDF text blocks. Merge display-equation
-spans into logical formulas. Render all mathematics as embedded LuaLaTeX text
-with Latin Modern Math, retaining real super/subscripts. SVG, raster, HTML
-image, source equation clip, and PDF image/Form fallback are forbidden for
-mathematical content. If reconstruction is not lossless, leave the review
+spans into logical formulas. Render inline and standalone mathematics as embedded
+LuaLaTeX text with Latin Modern Math, retaining real super/subscripts. SVG,
+raster, HTML image, source equation clip, and PDF image/Form fallback are
+forbidden for those equations. If reconstruction is not lossless, leave the review
 unresolved and abort export.
+
+A numbered figure may itself contain a syntax or inference-rule diagram. Keep
+that complete figure as the reviewed vector visual, including labels and caption;
+do not extract its internal formulas a second time. This figure-preservation rule
+does not permit converting standalone equations to figures to bypass math review.
 
 Treat a formula-only translatable body unit as an extraction error. Reclassify
 it as native display math or merge it with its actual surrounding prose; never

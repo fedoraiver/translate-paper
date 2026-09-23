@@ -73,6 +73,12 @@ Reclassify or restore one existing unit:
 changing `source_text`, include reviewed `span_runs` if rich inline mathematics
 must be retained.
 
+Correct all affected source and protection metadata before translating those
+units. If a later visual review reveals a defect in a completed unit, preserve
+the old checkpoint, review the exact changed unit, and deliberately retranslate
+only affected content; do not clear the whole checkpoint or falsify the source
+metadata to get past the reconciliation guard.
+
 Insert exact source prose swallowed by a visual detector:
 
 ```json
@@ -110,6 +116,12 @@ Group disconnected vector fragments and bind one caption:
 Omit `source_bbox` to use the union of member bounds. Set `caption_text` only
 when the exact source caption was verified. Each member may belong to only one
 reviewed visual.
+
+`caption_id` is required and must identify an existing caption, even when the
+visual is unnumbered. For a genuinely captionless object, use `replace_unit` to
+restore its kind and complete bounds, then suppress duplicated fragments; do not
+pass an empty caption ID or manufacture a caption. Review chapter-specific
+classification traps in [chapter-workflow.md](chapter-workflow.md).
 
 ## Safety
 

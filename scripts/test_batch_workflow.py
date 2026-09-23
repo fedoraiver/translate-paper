@@ -97,12 +97,14 @@ class BatchWorkflowTests(unittest.TestCase):
                 "metrics": {
                     "strict_invariants": True,
                     "invariant_text_misses": 0,
+                    "translated_pages": 1,
                 },
             },
         )
         write_json(
             work / "quick-validation.json",
-            {"status": "pass", "metrics": {"source_sha256": source_hash}},
+            {"status": "pass", "metrics": {"source_sha256": source_hash,
+             "pdf_sha256": sha256(work / "中文翻译.pdf"), "pages": 1}},
         )
         write_json(
             work / "summary-validation.json",
@@ -112,6 +114,39 @@ class BatchWorkflowTests(unittest.TestCase):
             work / "source-review-report.json",
             {"status": "pass", "applied_operations": 0},
         )
+        write_json(work / "visual-review.json", {
+            "schema_version": 1, "status": "pass", "page_count": 1, "source_sha256": source_hash,
+            "translated_sha256": sha256(work / "中文翻译.pdf"),
+            "reviewer": {"role": "visual-review", "agent_id": "test-reviewer", "mode": "subagent"},
+            "contact_sheet_reviewed": True, "open_issues": [],
+            "pages": [{"page": 1, "status": "pass", "image": "page-0001.png",
+                       "checks": ["Margins and text legible."], "findings": []}],
+        })
+
+    def test_visual_review_is_required_and_bound_to_packaged_pdf(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            ledger_path = self.make_batch(root)
+            self.make_validated_artifacts(root)
+            review = root / "work" / "visual-review.json"
+            valid = review.read_bytes()
+            review.unlink()
+            args = argparse.Namespace(ledger=ledger_path, slug="01-paper")
+            with self.assertRaises(batch_workflow.BatchWorkflowError):
+                batch_workflow.cmd_package(args)
+            review.write_bytes(valid)
+            with mock.patch("builtins.print"):
+                batch_workflow.cmd_package(args)
+            ledger, path = batch_workflow.load_ledger(ledger_path)
+            paths = batch_workflow._paper_paths(ledger, path, ledger["papers"][0])
+            final_pdf = paths["final_dir"] / "中文翻译.pdf"
+            accepted_bytes = final_pdf.read_bytes()
+            paths["translated_pdf"].write_bytes(b"unreviewed staging revision")
+            with self.assertRaises(batch_workflow.BatchWorkflowError):
+                batch_workflow.cmd_package(args)
+            self.assertEqual(final_pdf.read_bytes(), accepted_bytes)
+            (paths["final_dir"] / "中文翻译.pdf").write_bytes(b"changed after review")
+            self.assertFalse(batch_workflow._final_bundle_complete(paths))
 
     def test_next_resumes_first_nonterminal_paper(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

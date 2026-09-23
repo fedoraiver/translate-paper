@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 import zotero_ingest
+from check_visual_review import check_review_bundle
 
 SCHEMA_VERSION = 1
 STAGES = (
@@ -39,6 +40,7 @@ FINAL_NAMES = {
     "strict_validation": "translation-validation.json",
     "quick_validation": "quick-validation.json",
     "summary_validation": "summary-validation.json",
+    "visual_review": "visual-review.json",
     "source_review_report": "source-review-report.json",
 }
 REQUIRED_ARTIFACTS = tuple(
@@ -170,6 +172,7 @@ def _paper_paths(
         "strict_validation": work_dir / "translated-preview" / "validation-report.json",
         "quick_validation": work_dir / "quick-validation.json",
         "summary_validation": work_dir / "summary-validation.json",
+        "visual_review": work_dir / "visual-review.json",
         "source_review_report": work_dir / "source-review-report.json",
     }
     artifacts = {
@@ -248,6 +251,10 @@ def _strict_validation_passes(paths: dict[str, Path]) -> bool:
         and int(strict_metrics.get("invariant_text_misses") or 0) == 0
         and quick_metrics.get("source_sha256") == sha256_file(paths["source_pdf"])
         and all(paths[key].is_file() for key in REQUIRED_ARTIFACTS)
+        and not check_review_bundle(
+            _read_json(paths["visual_review"]), paths["source_pdf"],
+            paths["translated_pdf"], strict, quick,
+        )
     )
 
 
@@ -281,7 +288,15 @@ def _final_bundle_complete(paths: dict[str, Path]) -> bool:
         if not ok:
             return False
     strict = _read_json(final_dir / "translation-validation.json")
-    return (strict.get("metrics") or {}).get("strict_invariants") is True
+    return (
+        (strict.get("metrics") or {}).get("strict_invariants") is True
+        and not check_review_bundle(
+            _read_json(final_dir / FINAL_NAMES["visual_review"]),
+            final_dir / FINAL_NAMES["source_pdf"],
+            final_dir / FINAL_NAMES["translated_pdf"],
+            strict, _read_json(final_dir / "quick-validation.json"),
+        )
+    )
 
 
 def refresh_paper(
@@ -482,6 +497,11 @@ def cmd_package(args: argparse.Namespace) -> int:
         )
     paths = _paper_paths(ledger, path, paper)
     final_dir = paths["final_dir"]
+    if not _strict_validation_passes(paths):
+        raise BatchWorkflowError(
+            f"{paper['slug']}: current staging artifacts require passing structural "
+            "and visual reviews before copying."
+        )
     source_destination = final_dir / FINAL_NAMES["source_pdf"]
     if (
         source_destination.exists()
