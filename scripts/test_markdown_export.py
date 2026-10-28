@@ -102,6 +102,22 @@ class MarkdownMathTests(unittest.TestCase):
                 "[[B0001_OPEN]][[B0002_OPEN]]value[[B0001_CLOSE]][[B0002_CLOSE]]",
             )
 
+    def test_block_italic_excludes_source_bold_labels_and_keeps_math(self) -> None:
+        unit = {**self.unit({"[[Fvalue]]": {
+            "kind": "math", "tex": "x_i", "review_status": "manually_reviewed",
+        }}), "block_style": "italic", "style_tokens": {"Blabel": "bold"}}
+        output = exporter.rich_text_to_markdown(unit,
+            "[[Blabel_OPEN]]Named result[[Blabel_CLOSE]] Assume [[Fvalue]] holds.")
+        self.assertEqual(output, "**Named result**<em> Assume $x_i$ holds.</em>")
+        self.assertEqual(exporter.rich_text_to_markdown(self.unit(), "Following paragraph."),
+                         "Following paragraph.")
+
+    def test_block_italic_resumes_after_a_bold_span_inside_prose(self) -> None:
+        unit = {**self.unit(), "block_style": "italic", "style_tokens": {"Blabel": "bold"}}
+        output = exporter.rich_text_to_markdown(unit,
+            "Before [[Blabel_OPEN]]upright[[Blabel_CLOSE]] after.")
+        self.assertEqual(output, "<em>Before </em>**upright**<em> after.</em>")
+
 
 if __name__ == "__main__":
     unittest.main()

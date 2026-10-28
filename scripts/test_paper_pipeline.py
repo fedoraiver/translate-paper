@@ -31,6 +31,26 @@ import source_review
 
 
 class PaperPipelineTests(unittest.TestCase):
+    def test_composite_proof_square_ends_paragraph(self) -> None:
+        previous = {"flow_role": "paragraph-start", "render_mode": "text",
+                    "elements": [{"translatable": True, "section": "proof",
+                                  "page": 1, "source_text": "Thus proved. ⊓⊔"}]}
+        current = {"section": "proof", "page": 2}
+        self.assertFalse(render_translation.is_logical_continuation(
+            previous, current, "paragraph-start"))
+
+    def test_source_proof_square_components_are_recognized(self) -> None:
+        for source_text in ("Proof ends ⊓⊔", "Proof ends ⊓\n⊔", "Proof ends □"):
+            with self.subTest(source_text=source_text):
+                self.assertTrue(quick_validate.source_contains_glyph("□", source_text))
+                self.assertTrue(check_translation.source_contains_glyph("□", source_text))
+
+    def test_unmatched_suspicious_glyphs_remain_rejected(self) -> None:
+        for marker, source_text in (("□", "ordinary prose"), ("□", "⊓ x ⊔"),
+                                    ("■", "⊓⊔"), ("\ufffd", "⊓⊔")):
+            with self.subTest(marker=marker, source_text=source_text):
+                self.assertFalse(quick_validate.source_contains_glyph(marker, source_text))
+
     def test_quick_validate_accepts_searchable_pdf(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "paper.pdf"
@@ -1132,6 +1152,10 @@ class PaperPipelineTests(unittest.TestCase):
             source, table, render_translation.PROFILE
         )
         self.assertGreater(needspace, 340.0)
+        table.setdefault("visual_layout", {})["layout_needspace_pt"] = 500.0
+        self.assertEqual(native_latex._caption_clip_needspace(
+            source, table, render_translation.PROFILE
+        ), 500.0)
         source.close()
 
     def test_native_source_clip_location_uses_exact_visual_marker(self) -> None:

@@ -77,7 +77,8 @@ MATH_CHARS = set(
     "+−-*/^·∈∉←→↔⊥∗◦"
 )
 CITATION_RE = re.compile(
-    r"\[(?:\d{1,4}(?:\s*[-–,]\s*\d{1,4})*)\]"
+    r"\[(?:\d{1,4}(?:\s*[-–,]\s*\d{1,4})*|"
+    r"[A-Za-z]{2,}\+?\d{2,4}[a-z]?(?:\s*,\s*[A-Za-z]{2,}\+?\d{2,4}[a-z]?)*)\]"
 )
 RICH_TOKEN_RE = re.compile(
     r"\[\[(?:[BIE][A-Za-z0-9_]*_(?:OPEN|CLOSE)|"
@@ -85,6 +86,10 @@ RICH_TOKEN_RE = re.compile(
 )
 MATH_FONT_RE = re.compile(
     r"(?:^|[-+])(CMMI|CMSY|CMEX|MSAM|MSBM)|MATH|SYMBOL",
+    re.IGNORECASE,
+)
+MONOSPACE_FONT_RE = re.compile(
+    r"CONSOLAS|COURIER|MONO|CMTT|LMTT|MENLO|INCONSOLATA|SOURCECODE",
     re.IGNORECASE,
 )
 LIST_MARKER_RE = re.compile(r"^[•·▪●◦‣⁃–—\-]$")
@@ -729,6 +734,12 @@ def math_run_tex(run: dict[str, Any]) -> str:
     """Decode the source font's glyph slots into portable TeX."""
     value = str(run.get("text") or "")
     font = str(run.get("font") or "")
+    if font == "Lucida New Math Symbol":
+        return "".join(rf"\mathcal{{{character}}}" if character.isascii() and character.isupper()
+                       else character for character in value)
+    if font == "Lucida New Math Arrows":
+        return "".join(rf"\mathbb{{{character}}}" if character in "BN"
+                       else character for character in value)
     if re.match(r"TeX-matha\d*$", font):
         return "".join(MATHA_TEX.get(character, character) for character in value)
     if re.match(r"TeX-mathb\d*$", font):
@@ -992,10 +1003,18 @@ def math_render_strategy(runs: list[dict[str, Any]], markdown: str) -> str:
     return "tex-vector"
 
 
+def is_code_run(run: dict[str, Any]) -> bool:
+    """Respect source monospace evidence before symbol-based math guesses."""
+    font = str(run.get("font") or "")
+    if run.get("style") == "math" or MATH_FONT_RE.search(font):
+        return False
+    return bool(int(run.get("flags") or 0) & 8 or MONOSPACE_FONT_RE.search(font))
+
+
 def looks_like_math_run(run: dict[str, Any]) -> bool:
     """Recognize symbol-heavy expressions even when PDF font flags say bold."""
     value = str(run.get("text") or "").strip()
-    if not value or len(value) > 120:
+    if not value or len(value) > 120 or is_code_run(run):
         return False
     # PDF text spans often end at a font change immediately after "(i.e.,"
     # or "(by". Punctuation does not turn these short prose words into math.
@@ -1071,7 +1090,34 @@ def build_rich_protection(
     )
 
     atomic: list[dict[str, Any]] = []
+    for run in located:
+        if not is_code_run(run):
+            continue
+        start, end = int(run["start"]), int(run["end"])
+        # Join font-size splits (for example small caps) without absorbing
+        # punctuation from adjacent prose or crossing an emphasis boundary.
+        previous = atomic[-1] if atomic else None
+        if (
+            previous is not None
+            and int(previous["end"]) == start
+            and run.get("style") == "text"
+            and previous["runs"][-1].get("style") == "text"
+            and run.get("line") == previous["runs"][-1].get("line")
+        ):
+            previous["end"] = end
+            previous["text"] = source_text[int(previous["start"]):end]
+            previous["runs"].append(run)
+        else:
+            atomic.append({"start": start, "end": end, "kind": "code",
+                           "text": source_text[start:end], "runs": [run]})
     for match in CITATION_RE.finditer(source_text):
+        if any(match.start() < item["end"] and match.end() > item["start"]
+               for item in atomic):
+            continue
+        # A numeric range after a membership/map symbol is an interval,
+        # even when its brackets and endpoints use an upright text font.
+        if re.search(r"[∈∉→↦]\s*$", source_text[: match.start()]):
+            continue
         atomic.append(
             {
                 "start": match.start(),
@@ -1085,9 +1131,17 @@ def build_rich_protection(
     math_runs = [
         run
         for run in located
-        if not (
+        if not is_code_run(run)
+        and run.get("semantic_kind") != "prose"
+        and not (
             LIST_MARKER_RE.fullmatch(str(run.get("text") or "").strip())
             and not source_text[: int(run["start"])].rsplit("\n", 1)[-1].strip()
+        )
+        and not (
+            re.fullmatch(r"\d+[.)]", str(run.get("text") or "").strip())
+            and not source_text[:int(run["start"])].strip()
+            and run.get("style") != "math"
+            and re.match(r"\s*\n\s*[A-Za-z]{2,}\b", source_text[int(run["end"]):])
         )
         and (
             run.get("style") == "math"
@@ -1132,6 +1186,7 @@ def build_rich_protection(
         if (
             re.fullmatch(r"[A-Za-zΑ-ω][,.;:]?", compact_fragment)
             and not decorated_singleton
+            and not any(run.get("semantic_kind") == "math" for run in group)
         ):
             following = source_text[end : end + 1]
             if not (
@@ -1254,12 +1309,12 @@ def build_rich_protection(
             return value
         parts: list[str] = []
         cursor = 0
-        for match in PROTECTED_RE.finditer(value):
-            parts.append(value[cursor : match.start()])
+        for start, end, literal in _protected_literal_spans(value):
+            parts.append(value[cursor:start])
             token = f"[[P{len(protected_tokens) + 1:04d}]]"
-            protected_tokens[token] = match.group(0)
+            protected_tokens[token] = literal
             parts.append(token)
-            cursor = match.end()
+            cursor = end
         parts.append(value[cursor:])
         return "".join(parts)
 
@@ -1923,16 +1978,37 @@ def extract_ocr_page(
     return merged, columns, confidence
 
 
+def _protected_literal_spans(value: str) -> list[tuple[int, int, str]]:
+    spans: list[tuple[int, int, str]] = []
+    for match in PROTECTED_RE.finditer(value):
+        literal = match.group(0)
+        bracket_prose = (
+            literal.startswith("[")
+            and len(re.findall(r"[A-Za-z][A-Za-z'-]*", literal)) > 1
+            and not CITATION_RE.fullmatch(literal)
+        )
+        parenthetical_prose = (
+            literal.startswith("(") and re.match(r"\(\s*[a-z]", literal)
+        )
+        if bracket_prose or parenthetical_prose:
+            for start, end, inner in _protected_literal_spans(literal[1:-1]):
+                spans.append((match.start() + 1 + start,
+                              match.start() + 1 + end, inner))
+        else:
+            spans.append((match.start(), match.end(), literal))
+    return spans
+
+
 def protect_text(text: str) -> tuple[str, dict[str, str]]:
     protected: dict[str, str] = {}
     parts: list[str] = []
     cursor = 0
-    for match in PROTECTED_RE.finditer(text):
-        parts.append(text[cursor : match.start()])
+    for start, end, literal in _protected_literal_spans(text):
+        parts.append(text[cursor:start])
         token = f"[[P{len(protected) + 1:04d}]]"
-        protected[token] = match.group(0)
+        protected[token] = literal
         parts.append(token)
-        cursor = match.end()
+        cursor = end
     parts.append(text[cursor:])
     return "".join(parts), protected
 
@@ -2242,6 +2318,7 @@ def apply_reviewed_boundary(
         "needs_boundary_review": False,
         "seen_conclusion_before_stop": conclusion_id is not None,
         "manual_review": True,
+        "include_ids": sorted(include_ids),
         "review_reason": str(review["reason"]),
     }
 
@@ -2637,6 +2714,119 @@ def build_visual_layout(
 
     used: set[str] = set()
     visuals: list[dict[str, Any]] = []
+    def add_visual(visual: dict[str, Any], caption: dict[str, Any] | None) -> None:
+        page_number = int(visual["page"])
+        caption_kind, label = (
+            visual_label(str(caption.get("source_text") or ""))
+            if caption is not None else (str(visual["kind"]), "")
+        )
+        visual_id = str(visual.get("review_visual_id") or label or f"unlabelled-{visual['id']}")
+        used.add(str(visual["id"]))
+        visual_rect = pymupdf.Rect(visual["bbox"])
+        # Captionless objects use the complete reviewed envelope; duplicate
+        # fragments must be suppressed explicitly by the source review.
+        visual_parts = [visual] if caption is None else [
+            element
+            for element in elements
+            if int(element["page"]) == page_number
+            and element.get("render_mode") == "source_clip"
+            and not element.get("render_suppressed")
+            and element.get("kind") != "equation"
+            and (
+                element is visual
+                or intersection_ratio(
+                    pymupdf.Rect(element["bbox"]), visual_rect
+                )
+                >= 0.5
+            )
+        ]
+        for part in visual_parts:
+            visual_rect |= pymupdf.Rect(part["bbox"])
+            if part in candidates:
+                used.add(str(part["id"]))
+        visual["bbox"] = rect_list(visual_rect)
+        internal_size = visual_internal_font_size(
+            document, page_number, visual_rect
+        )
+        source_width = _source_content_width(page_map[page_number], elements)
+        if internal_size is not None:
+            scale = ZH_ACADEMIC_V1.body_font_size / body_size
+            target_internal = internal_size * scale
+            basis = "internal-font-ratio"
+            fallback = False
+        else:
+            scale = output_width / max(source_width, 1.0)
+            target_internal = None
+            basis = "source-width-ratio"
+            fallback = True
+            warnings.append(
+                f"{visual_id}: internal font size was unavailable; "
+                "used source visual/content width ratio."
+            )
+        target_width = min(output_width, visual_rect.width * scale)
+        scale = target_width / max(visual_rect.width, 1.0)
+        if internal_size is not None:
+            target_internal = internal_size * scale
+        target_height = target_width * visual_rect.height / max(
+            visual_rect.width, 1.0
+        )
+        if target_height > output_height * 0.72:
+            height_scale = output_height * 0.72 / target_height
+            target_width *= height_scale
+            target_height *= height_scale
+            scale *= height_scale
+            if target_internal is not None:
+                target_internal *= height_scale
+        reviewed_source_ids = [
+            str(value)
+            for value in visual.get("review_visual_source_ids") or []
+        ]
+        entry = {
+            "visual_id": visual_id,
+            "label": label,
+            "kind": caption_kind,
+            "page": page_number,
+            "source_ids": reviewed_source_ids
+            or [str(part["id"]) for part in visual_parts],
+            "caption_id": str(caption["id"]) if caption is not None else None,
+            "source_bbox": rect_list(visual_rect),
+            "source_body_font_pt": round(body_size, 3),
+            "source_internal_font_pt": (
+                round(internal_size, 3) if internal_size is not None else None
+            ),
+            "target_internal_font_pt": (
+                round(target_internal, 3)
+                if target_internal is not None
+                else None
+            ),
+            "target_width_pt": round(target_width, 3),
+            "target_height_pt": round(target_height, 3),
+            "target_scale": round(scale, 6),
+            "aspect_ratio": round(
+                visual_rect.width / max(visual_rect.height, 1.0), 6
+            ),
+            "scale_basis": basis,
+            "automatic_fallback": fallback,
+        }
+        if caption is None:
+            entry["captionless"] = True
+            entry["source_review_reason"] = visual["source_review_reason"]
+        visuals.append(entry)
+        for element in visual_parts + ([caption] if caption is not None else []):
+            element["visual_id"] = visual_id
+        for reviewed_id in reviewed_source_ids:
+            reviewed_element = next(
+                (
+                    element
+                    for element in elements
+                    if str(element.get("id")) == reviewed_id
+                ),
+                None,
+            )
+            if reviewed_element is not None:
+                reviewed_element["visual_id"] = visual_id
+        visual["visual_layout"] = entry
+
     for caption in captions:
         caption_kind, label = visual_label(
             str(caption.get("source_text") or "")
@@ -2684,110 +2874,15 @@ def build_visual_layout(
                     ),
                 ),
             )
-        used.add(str(visual["id"]))
-        visual_rect = pymupdf.Rect(visual["bbox"])
-        visual_parts = [
-            element
-            for element in elements
-            if int(element["page"]) == page_number
-            and element.get("render_mode") == "source_clip"
-            and not element.get("render_suppressed")
-            and element.get("kind") != "equation"
-            and (
-                element is visual
-                or intersection_ratio(
-                    pymupdf.Rect(element["bbox"]), visual_rect
-                )
-                >= 0.5
-            )
-        ]
-        for part in visual_parts:
-            visual_rect |= pymupdf.Rect(part["bbox"])
-            if part in candidates:
-                used.add(str(part["id"]))
-        visual["bbox"] = rect_list(visual_rect)
-        internal_size = visual_internal_font_size(
-            document, page_number, visual_rect
-        )
-        source_width = _source_content_width(page_map[page_number], elements)
-        if internal_size is not None:
-            scale = ZH_ACADEMIC_V1.body_font_size / body_size
-            target_internal = internal_size * scale
-            basis = "internal-font-ratio"
-            fallback = False
-        else:
-            scale = output_width / max(source_width, 1.0)
-            target_internal = None
-            basis = "source-width-ratio"
-            fallback = True
-            warnings.append(
-                f"{label}: internal font size was unavailable; "
-                "used source visual/content width ratio."
-            )
-        target_width = min(output_width, visual_rect.width * scale)
-        scale = target_width / max(visual_rect.width, 1.0)
-        if internal_size is not None:
-            target_internal = internal_size * scale
-        target_height = target_width * visual_rect.height / max(
-            visual_rect.width, 1.0
-        )
-        if target_height > output_height * 0.72:
-            height_scale = output_height * 0.72 / target_height
-            target_width *= height_scale
-            target_height *= height_scale
-            scale *= height_scale
-            if target_internal is not None:
-                target_internal *= height_scale
-        visual_id = str(visual.get("review_visual_id") or label)
-        reviewed_source_ids = [
-            str(value)
-            for value in visual.get("review_visual_source_ids") or []
-        ]
-        entry = {
-            "visual_id": visual_id,
-            "label": label,
-            "kind": caption_kind,
-            "page": page_number,
-            "source_ids": reviewed_source_ids
-            or [str(part["id"]) for part in visual_parts],
-            "caption_id": str(caption["id"]),
-            "source_bbox": rect_list(visual_rect),
-            "source_body_font_pt": round(body_size, 3),
-            "source_internal_font_pt": (
-                round(internal_size, 3) if internal_size is not None else None
-            ),
-            "target_internal_font_pt": (
-                round(target_internal, 3)
-                if target_internal is not None
-                else None
-            ),
-            "target_width_pt": round(target_width, 3),
-            "target_height_pt": round(target_height, 3),
-            "target_scale": round(scale, 6),
-            "aspect_ratio": round(
-                visual_rect.width / max(visual_rect.height, 1.0), 6
-            ),
-            "scale_basis": basis,
-            "automatic_fallback": fallback,
-        }
-        visuals.append(entry)
-        for element in [*visual_parts, caption]:
-            element["visual_id"] = visual_id
-        for reviewed_id in reviewed_source_ids:
-            reviewed_element = next(
-                (
-                    element
-                    for element in elements
-                    if str(element.get("id")) == reviewed_id
-                ),
-                None,
-            )
-            if reviewed_element is not None:
-                reviewed_element["visual_id"] = visual_id
-        visual["visual_layout"] = entry
+        add_visual(visual, caption)
 
     for candidate in candidates:
         if str(candidate["id"]) in used:
+            continue
+        # replace_unit is the reviewed path for genuinely captionless objects.
+        # group_visual still requires its explicit caption association.
+        if candidate.get("source_review_reason") and not candidate.get("review_visual_id"):
+            add_visual(candidate, None)
             continue
         candidate["visual_id"] = f"unlabelled-{candidate['id']}"
         errors.append(

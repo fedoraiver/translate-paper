@@ -27,6 +27,7 @@ CONTROL_TOKEN_RE = re.compile(
 )
 HAN_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
 FOOTNOTE_PREFIX_RE = re.compile(r"^\s*(?:\d{1,2}|[*⋆†‡])(?=\s|\D)")
+URL_RE = re.compile(r"https?://[^\s<>\[\]\u3000-\u303f\u3400-\u9fff]+", re.IGNORECASE)
 AUTO_MATH_TOKEN_RE = re.compile(
     r"[ˆ˙˜¯][A-Za-zΑ-ω]+"
     r"|[A-Za-zΑ-ω]′[A-Za-z0-9Α-ω]*"
@@ -479,6 +480,21 @@ def _auto_math_tex(token: str) -> str:
 
 
 def prose_to_latex(value: str, *, allow_auto_math: bool = False) -> str:
+    output: list[str] = []
+    cursor = 0
+    for match in URL_RE.finditer(value):
+        output.append(_plain_prose_to_latex(
+            value[cursor:match.start()], allow_auto_math=allow_auto_math))
+        # Keep the current text font and exact characters, including TeX
+        # specials. Invisible breakpoints also prevent automatic URL hyphens
+        # and work safely inside heading/style macro arguments without links.
+        output.append(r"\allowbreak{}".join(latex_escape_text(char) for char in match.group(0)))
+        cursor = match.end()
+    output.append(_plain_prose_to_latex(value[cursor:], allow_auto_math=allow_auto_math))
+    return "".join(output)
+
+
+def _plain_prose_to_latex(value: str, *, allow_auto_math: bool = False) -> str:
     if not allow_auto_math:
         return latex_escape_text(value)
     output: list[str] = []
@@ -513,6 +529,26 @@ def rich_text_to_latex(
     footnotes_by_id: dict[str, str] | None = None,
     suppress_footnote_markers: bool = False,
 ) -> str:
+    style_runs = list(node.get("text_style_runs") or [])
+    if len(style_runs) > 1:
+        # Flow may join source-page continuations with different block styles.
+        # Scope each run without creating paragraphs or touching math fragments.
+        text = str(node.get("text") or "")
+        parts: list[str] = []
+        for index, run in enumerate(style_runs):
+            end = (int(style_runs[index + 1]["start"])
+                   if index + 1 < len(style_runs) else len(text))
+            child = {**node, "text": text[int(run["start"]):end],
+                     "text_style_runs": [], "_native_block_style": run["block_style"]}
+            parts.append(rich_text_to_latex(
+                child, reviews, math_statuses, footnotes_by_id,
+                suppress_footnote_markers,
+            ))
+        return "".join(parts)
+    block_style = str(node.get("_native_block_style") or (
+        style_runs[0].get("block_style") if style_runs
+        else node.get("element", {}).get("block_style")
+    ) or "normal")
     fragments, styles = node_rich_metadata(node)
     allow_auto_math = any(
         str(fragment.get("kind") or "") == "math"
@@ -595,6 +631,12 @@ def rich_text_to_latex(
                         + latex_escape_text(str(fragment.get("text") or ""))
                         + "}"
                     )
+            elif kind == "code":
+                code = latex_escape_text(str(fragment.get("text") or ""))
+                code = code.replace(",", r",\allowbreak{}").replace(";", r";\allowbreak{}")
+                output.append(
+                    r"\texttt{" + code + "}"
+                )
             elif kind == "math":
                 tex, status = resolve_inline_math(fragment, reviews)
                 math_statuses[status] += 1
@@ -611,7 +653,7 @@ def rich_text_to_latex(
             edge = style_match.group(2)
             if style == "bold":
                 output.append(
-                    r"{\sffamily\bfseries " if edge == "OPEN" else "}"
+                    r"{\sffamily\bfseries\upshape " if edge == "OPEN" else "}"
                 )
             else:
                 output.append(r"{\itshape " if edge == "OPEN" else "}")
@@ -619,7 +661,8 @@ def rich_text_to_latex(
     output.append(
         prose_to_latex(text[cursor:], allow_auto_math=allow_auto_math)
     )
-    return "".join(output)
+    rendered = "".join(output)
+    return r"{\itshape " + rendered + "}" if block_style == "italic" else rendered
 
 
 def _node_is_display_math(node: dict[str, Any]) -> bool:
@@ -684,7 +727,53 @@ def prepare_native_clip_nodes(
             ):
                 node["element"]["layout_target_text_scale"] = text_scale
             result.append(node)
-    return result
+    return preserve_reviewed_caption_nodes(result)
+
+
+def preserve_reviewed_caption_nodes(
+    nodes: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Export each reviewed visual and its source caption as one vector asset."""
+    replacements: dict[int, dict[str, Any]] = {}
+    consumed: set[int] = set()
+    for index, node in enumerate(nodes):
+        if not _node_is_nonmath_clip(node):
+            continue
+        visual = node.get("visual_layout") or node["element"].get("visual_layout") or {}
+        caption_id = str(visual.get("caption_id") or "")
+        if visual.get("captionless") or not caption_id:
+            continue
+        if caption_id in (node.get("ids") or [node["id"]]):
+            continue
+        matches = [i for i, candidate in enumerate(nodes)
+                   if caption_id in (candidate.get("ids") or [candidate["id"]])]
+        if len(matches) != 1:
+            raise ValueError(f"{node['id']}: reviewed caption {caption_id} missing or duplicated")
+        caption_index = matches[0]
+        caption = nodes[caption_index]
+        parts = list(caption.get("elements") or [caption["element"]])
+        if (
+            caption_index in consumed
+            or abs(caption_index - index) != 1
+            or any(part.get("kind") != "caption" for part in parts)
+            or any(int(part["page"]) != int(node["element"]["page"]) for part in parts)
+        ):
+            raise ValueError(f"{node['id']}: reviewed caption requires a contiguous same-page source crop")
+        # Keep source classifications intact; only the rendering node is combined.
+        combined = {**node, "element": dict(node["element"])}
+        combined["elements"] = list(node.get("elements") or [node["element"]]) + parts
+        combined["ids"] = list(node.get("ids") or [node["id"]]) + list(
+            caption.get("ids") or [caption["id"]])
+        combined["composite_parts"] = len(combined["elements"])
+        combined["source_caption_ids"] = [part["id"] for part in parts]
+        bounds = pymupdf.Rect(node["element"]["bbox"])
+        for part in parts:
+            bounds |= pymupdf.Rect(part["bbox"])
+        combined["element"]["bbox"] = list(bounds)
+        replacements[index] = combined
+        consumed.add(caption_index)
+    return [replacements.get(index, node) for index, node in enumerate(nodes)
+            if index not in consumed]
 
 
 def footnote_body_without_number(node: dict[str, Any]) -> str:
@@ -746,7 +835,21 @@ def _source_clip_rect(
     if calibrated_bbox:
         calibrated = pymupdf.Rect(calibrated_bbox) & source_page.rect
         if not calibrated.is_empty:
-            return calibrated
+            # Calibration describes the visual itself. A merged vector caption
+            # is also part of the exported asset and must not be clipped away.
+            for part in node.get("elements") or []:
+                if (
+                    part.get("render_mode") == "source_clip"
+                    or (
+                        part.get("kind") == "caption"
+                        and (
+                            str(part.get("id")) == str(visual_layout.get("caption_id"))
+                            or part.get("id") in node.get("source_caption_ids", [])
+                        )
+                    )
+                ):
+                    calibrated |= pymupdf.Rect(part["bbox"]) & source_page.rect
+            return calibrated & source_page.rect
     clip = pymupdf.Rect(node["element"]["bbox"]) & source_page.rect
     if (
         clip.is_empty
@@ -781,6 +884,10 @@ def source_clip_target_geometry(
     )
     if float(layout.get("target_width_pt") or 0.0) > 0:
         target_width = float(layout["target_width_pt"])
+        if layout.get("source_bbox"):
+            calibrated = pymupdf.Rect(layout["source_bbox"]) & source_page.rect
+            if not calibrated.is_empty:
+                target_width *= clip.width / calibrated.width
     elif float(node["element"].get("layout_target_text_scale") or 0.0) > 0:
         target_width = clip.width * float(
             node["element"]["layout_target_text_scale"]
@@ -806,6 +913,8 @@ def source_clip_target_geometry(
 def _caption_matches_clip(caption: dict[str, Any], clip: dict[str, Any]) -> bool:
     """Use the reviewed association before applying adjacency-based keep rules."""
     visual = clip.get("visual_layout") or {}
+    if visual.get("captionless") is True:
+        return False
     caption_id = str(visual.get("caption_id") or "")
     if caption_id:
         return caption_id in (caption.get("ids") or [caption["id"]])
@@ -831,7 +940,9 @@ def _caption_clip_needspace(
     # Reserve the clip plus both center/smallskip wrappers and one complete
     # caption line.  The extra headroom matters when a large table begins near
     # the page foot: the graphic can fit by itself while its caption cannot.
-    return min(text_height, display_height + 72.0)
+    visual = clip_node.get("visual_layout") or clip_node.get("element", {}).get("visual_layout") or {}
+    reviewed_needspace = float(visual.get("layout_needspace_pt") or 0.0)
+    return min(text_height, max(display_height + 72.0, reviewed_needspace))
 
 
 def _document_preamble(profile: Any) -> str:
@@ -964,7 +1075,12 @@ def _node_to_latex(
             "text",
         )
     paragraphs = [part.strip() for part in content.split("\n\n") if part.strip()]
-    return "\n\n".join(rf"\par {part}\par" for part in paragraphs), "text"
+    return "\n\n".join(
+        rf"\par\noindent {part}\par"
+        if index == 0 and role == "paragraph-continuation"
+        else rf"\par {part}\par"
+        for index, part in enumerate(paragraphs)
+    ), "text"
 
 
 def build_body_tex(
@@ -1048,6 +1164,12 @@ def build_body_tex(
                 "anchor_id": node["element"].get("anchor_id"),
                 "visual_id": node["element"].get("visual_id"),
             }
+        if node.get("continuation_of"):
+            placement.update({
+                "continuation_of": node["continuation_of"],
+                "continuation_across_visual_ids": node["continuation_across_visual_ids"],
+                "text_indent": 0,
+            })
         if _node_is_nonmath_clip(node):
             clip, target_width, target_height, actual_scale = (
                 source_clip_target_geometry(source, node, profile)
@@ -1060,6 +1182,7 @@ def build_body_tex(
             placement.update(
                 {
                     "source_bbox": list(clip),
+                    "visual_source_bbox": visual.get("source_bbox"),
                     "target_width_pt": round(target_width, 3),
                     "target_height_pt": round(target_height, 3),
                     "actual_scale": round(actual_scale, 6),
@@ -1080,6 +1203,30 @@ def build_body_tex(
         placement_stubs.append(placement)
     chunks.append(r"\end{document}" + "\n")
     return "\n".join(chunks), placement_stubs, math_statuses
+
+
+def visual_placement_report(placement: dict[str, Any]) -> dict[str, Any]:
+    """Report the calibrated visual separately from its combined caption crop."""
+    report = {key: placement.get(key) for key in (
+        "id", "visual_id", "visual_label", "target_width_pt", "target_height_pt",
+        "actual_scale", "source_internal_font_pt", "target_internal_font_pt",
+        "aspect_ratio", "scale_basis", "caption_id", "output_page", "bbox",
+    )}
+    if placement.get("visual_source_bbox"):
+        visual = pymupdf.Rect(placement["visual_source_bbox"])
+        crop = pymupdf.Rect(placement["source_bbox"])
+        target = pymupdf.Rect(placement["bbox"])
+        scale = float(placement["actual_scale"])
+        left = target.x0 + (visual.x0 - crop.x0) * scale
+        top = target.y0 + (visual.y0 - crop.y0) * scale
+        width, height = visual.width * scale, visual.height * scale
+        report.update({
+            "source_bbox": list(visual),
+            "target_width_pt": round(width, 3),
+            "target_height_pt": round(height, 3),
+            "bbox": [left, top, left + width, top + height],
+        })
+    return report
 
 
 def compile_body_tex(build_dir: Path, tex_path: Path) -> tuple[Path, dict[str, Any]]:
@@ -1454,24 +1601,7 @@ def render_native_latex(
         if placement.get("flow_role") == "footnote"
     ]
     visual_placements = [
-        {
-            key: placement.get(key)
-            for key in (
-                "id",
-                "visual_id",
-                "visual_label",
-                "target_width_pt",
-                "target_height_pt",
-                "actual_scale",
-                "source_internal_font_pt",
-                "target_internal_font_pt",
-                "aspect_ratio",
-                "scale_basis",
-                "caption_id",
-                "output_page",
-                "bbox",
-            )
-        }
+        visual_placement_report(placement)
         for placement in placements
         if placement.get("render_mode") == "source_clip"
         and placement.get("visual_id")

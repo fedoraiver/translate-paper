@@ -34,6 +34,23 @@ inspection. Assign it to the independent visual-review agent described in
    and all pages again; pagination may have shifted. Do not change only the hash
    on an old report. A byte-identical copy of the reviewed PDF needs no new review.
 
+Keep each review round immutable. Report a serious finding promptly, but finish
+the remaining readable pages and return one consolidated repair list before the
+producer rerenders. This avoids a full review round for each separately discovered
+defect. If the candidate is unreadable throughout, report that blocker instead.
+Do not start an idle reviewer in advance merely to wait for production.
+
+Use one concise content-specific observation per passing page and detailed
+evidence for defects; do not repeat a long checklist on every page. Open pages in
+small groups, preserving readable resolution. Ask for high-resolution crops only
+where the standard preview is insufficient. The coordinator inspects defect
+images as needed rather than repeating the reviewer's entire successful review.
+
+Check the **whole** caption, including its last line and continuation onto the
+next page; a table and the first caption line on one page are insufficient. Check
+the rightmost symbols/limits in long inline lists and new paragraphs after proof
+end markers. A structural pass can miss all three of these visual defects.
+
 Do not mark a page checked from extracted text, a script's pass status, a stale
 preview, or another agent's assurance. Never fabricate a completed report to
 unblock packaging. If no usable image-viewing tool is available, save progress

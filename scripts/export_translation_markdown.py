@@ -78,6 +78,7 @@ def rich_text_to_markdown(
     output: list[str] = []
     pending_math: list[str] = []
     style_stack: list[str] = []
+    block_italic = unit.get("block_style") == "italic"
     matches = list(CONTROL_TOKEN_RE.finditer(text))
     coalesced_style_edges: set[int] = set()
     for index, (left, right) in enumerate(pairwise(matches)):
@@ -132,6 +133,10 @@ def rich_text_to_markdown(
                 output.append(f"<sup>{value}</sup>")
             elif kind == "footnote-marker":
                 output.append(f"<sup>{value}</sup>")
+            elif kind == "code":
+                fence = "`" * (max((len(run) for run in re.findall(r"`+", value)), default=0) + 1)
+                padding = " " if value.startswith("`") or value.endswith("`") else ""
+                output.append(f"{fence}{padding}{value}{padding}{fence}")
             else:
                 output.append(value)
         else:
@@ -139,13 +144,19 @@ def rich_text_to_markdown(
             if not style_match or style_match.group(1) not in styles:
                 raise ValueError(f"{unit['id']}: unknown rich token {token}")
             key, edge = style_match.groups()
+            was_bold = any(styles[item] == "bold" for item in style_stack)
             if edge == "OPEN":
                 style_stack.append(key)
             elif not style_stack or style_stack.pop() != key:
                 raise ValueError(f"{unit['id']}: reversed or crossed style token {token}")
             if index not in coalesced_style_edges:
+                is_bold = any(styles[item] == "bold" for item in style_stack)
+                if block_italic and not was_bold and is_bold:
+                    output.append("</em>")
                 marker = "**" if styles[key] == "bold" else "*"
                 output.append(marker)
+                if block_italic and was_bold and not is_bold:
+                    output.append("<em>")
         cursor = match.end()
     flush_math()
     output.append(text[cursor:])
@@ -154,8 +165,9 @@ def rich_text_to_markdown(
     rendered = "".join(output)
     if CONTROL_TOKEN_RE.search(rendered) or "[[UNRESOLVED:" in rendered:
         raise ValueError(f"{unit['id']}: unresolved rich token")
-    if unit.get("block_style") == "italic":
+    if block_italic:
         rendered = f"<em>{rendered}</em>"
+        rendered = re.sub(r"<em>(\s*)</em>", r"\1", rendered)
     return rendered.strip()
 
 
@@ -164,6 +176,7 @@ def export_markdown(
     units: list[dict[str, Any]],
     translations: list[dict[str, Any]],
     math_review: dict[str, Any] | None = None,
+    listing_layout: dict[str, Any] | None = None,
 ) -> str:
     translation_map: dict[str, dict[str, Any]] = {}
     for record in translations:
@@ -195,11 +208,36 @@ def export_markdown(
         str(boundary.get("post_body_stop_id") or ""),
         len(ordered_units),
     )
+    listings: dict[str, dict[str, Any]] = {}
+    if listing_layout is not None:
+        if not manifest.get("source_sha256") or listing_layout.get("source_sha256") != manifest["source_sha256"]:
+            raise ValueError("Code listing inventory does not match the source PDF.")
+        body_units = {str(unit["id"]): unit for unit in ordered_units[start:stop]}
+        for entry in listing_layout.get("listings") or []:
+            unit_id = str(entry.get("id") or "")
+            if entry.get("semantic_kind") not in {"code-listing", "code-expression"}:
+                raise ValueError(f"{unit_id}: inventory entry is not a reviewed code listing")
+            if unit_id in listings:
+                raise ValueError(f"{unit_id}: duplicate code listing")
+            unit = body_units.get(unit_id)
+            if unit is None:
+                raise ValueError(f"{unit_id}: code listing is missing from the selected body")
+            if (unit.get("translatable") or unit.get("render_suppressed")
+                    or unit.get("render_mode") != "source_clip"
+                    or unit.get("kind") == "equation"
+                    or not str(unit.get("source_text") or "").strip()):
+                raise ValueError(f"{unit_id}: code listing must be a nonempty invariant source clip")
+            listings[unit_id] = unit
     review_entries = dict((math_review or {}).get("entries") or {})
     consumed_display_ids: set[str] = set()
     for unit in ordered_units[start:stop]:
         unit_id = str(unit["id"])
         if unit_id in consumed_display_ids or unit.get("render_suppressed"):
+            continue
+        if unit_id in listings:
+            source = str(unit["source_text"])
+            fence = "`" * max(3, max((len(run) for run in re.findall(r"`+", source)), default=0) + 1)
+            lines.extend((fence, source, fence, ""))
             continue
         display = dict(review_entries.get(unit_id) or {})
         if display.get("kind") == "display" or unit.get("kind") == "equation":
@@ -240,6 +278,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--translations", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--title", help="Override the source title in Markdown only.")
+    parser.add_argument("--listing-layout", type=Path,
+                        help="Source-hash-bound inventory of reviewed invariant code listings.")
     return parser.parse_args()
 
 
@@ -271,6 +311,7 @@ def main() -> int:
         read_jsonl(units_path),
         read_jsonl(translations_path),
         math_review,
+        json.loads(args.listing_layout.read_text(encoding="utf-8")) if args.listing_layout else None,
     )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(markdown, encoding="utf-8", newline="\n")

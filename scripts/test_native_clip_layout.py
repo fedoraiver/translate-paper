@@ -9,12 +9,14 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import json
 from pathlib import Path
 
 import pymupdf
 
 import native_latex
 import render_translation
+import check_translation
 from typography import ZH_ACADEMIC_V1
 
 
@@ -25,6 +27,112 @@ def clip(unit_id, order, bbox):
 
 
 class NativeClipLayoutTests(unittest.TestCase):
+    def composite_caption(self, caption_bbox=None):
+        figure = {**clip("figure", 1, [50, 100, 250, 200]),
+                  "kind": "figure", "visual_id": "figure-1"}
+        caption = {**clip("caption", 2, caption_bbox or [50, 210, 250, 240]),
+                   "kind": "caption", "visual_id": "figure-1",
+                   "source_text": "Figure 1: Caption retained in source vector."}
+        nodes = render_translation.build_flow_nodes([figure, caption], {})
+        nodes[0]["visual_layout"] = {
+            "visual_id": "figure-1", "caption_id": "caption", "page": 1,
+            "source_bbox": figure["bbox"], "source_ids": ["figure"],
+            "target_width_pt": 230, "target_height_pt": 115,
+            "target_scale": 1.15, "aspect_ratio": 2,
+            "source_internal_font_pt": 9, "target_internal_font_pt": 10.35}
+        return nodes[0], figure, caption
+
+    def test_calibrated_composite_clip_includes_source_caption_and_keeps_scale(self):
+        for caption_bbox in ([50, 210, 250, 240], [40, 210, 270, 240],
+                             [50, 60, 250, 90]):
+            with self.subTest(caption_bbox=caption_bbox):
+                node, figure, caption = self.composite_caption(caption_bbox)
+                with tempfile.TemporaryDirectory() as directory, pymupdf.open() as source:
+                    page = source.new_page(width=612, height=792)
+                    page.insert_text((60, 140), "FIGURE CONTENT")
+                    page.insert_text((caption_bbox[0] + 5, caption_bbox[1] + 12),
+                                     "CAPTION VISIBLE", fontsize=9)
+                    crop, width, height, scale = native_latex.source_clip_target_geometry(
+                        source, node, ZH_ACADEMIC_V1)
+                    expected = pymupdf.Rect(figure["bbox"]) | pymupdf.Rect(caption_bbox)
+                    self.assertEqual(list(crop), list(expected))
+                    self.assertAlmostEqual(scale, 1.15)
+                    self.assertAlmostEqual(width / height, crop.width / crop.height)
+                    asset = native_latex._create_source_clip_asset(source, node, Path(directory))
+                    with pymupdf.open(asset) as clipped:
+                        self.assertEqual(list(clipped[0].rect), [0, 0, crop.width, crop.height])
+                        # Inspect visible text coordinates: PDF forms retain out-of-clip text.
+                        visible = clipped[0].get_text(clip=clipped[0].rect)
+                        self.assertIn("FIGURE CONTENT", visible)
+                        self.assertIn("CAPTION VISIBLE", visible)
+                    _, placements, _ = native_latex.build_body_tex(
+                        [node], {}, ZH_ACADEMIC_V1, source, Path(directory))
+                placement = {**placements[0], "output_page": 1,
+                             "bbox": [100, 100, 100 + width, 100 + height]}
+                report = native_latex.visual_placement_report(placement)
+                self.assertAlmostEqual(report["target_width_pt"], 230)
+                self.assertAlmostEqual(report["target_height_pt"], 115)
+                self.assertEqual(report["aspect_ratio"], 2)
+
+    def test_visual_validator_rejects_caption_id_outside_actual_crop(self):
+        node, figure, caption = self.composite_caption()
+        with tempfile.TemporaryDirectory() as directory, pymupdf.open() as output:
+            root = Path(directory)
+            output.new_page(width=595.276, height=841.89)
+            (root / "visual-layout.json").write_text(json.dumps({
+                "source_sha256": "hash", "visuals": [node["visual_layout"]]}), encoding="utf-8")
+            (root / "units.jsonl").write_text(
+                "\n".join(json.dumps(e) for e in [figure, caption]), encoding="utf-8")
+            manifest = {"source_sha256": "hash", "paths": {
+                "visual_layout": "visual-layout.json", "translation_units": "units.jsonl"}}
+            placement = {"id": "figure", "ids": ["figure", "caption"],
+                         "render_mode": "source_clip", "source_page": 1,
+                         "source_bbox": figure["bbox"], "output_page": 1}
+            visual = {**node["visual_layout"], "actual_scale": 1.15,
+                      "output_page": 1, "bbox": [100, 100, 330, 215]}
+            layout = {"placements": [placement], "visual_layout": {"placements": [visual]}}
+            errors, _, _ = check_translation.validate_visual_layout(
+                manifest, root / "manifest.json", layout, output)
+            self.assertTrue(any("caption source region" in error for error in errors), errors)
+            placement["source_bbox"] = [50, 100, 250, 240]
+            errors, _, _ = check_translation.validate_visual_layout(
+                manifest, root / "manifest.json", layout, output)
+            self.assertEqual(errors, [])
+            placement["source_page"] = 2
+            errors, _, _ = check_translation.validate_visual_layout(
+                manifest, root / "manifest.json", layout, output)
+            self.assertTrue(any("caption source region" in error for error in errors), errors)
+
+    def test_composite_width_clamp_uses_canonical_caption_envelope(self):
+        node, figure, caption = self.composite_caption([40, 210, 560, 240])
+        with tempfile.TemporaryDirectory() as directory, pymupdf.open() as source:
+            root = Path(directory)
+            source.new_page(width=612, height=792)
+            _, stubs, _ = native_latex.build_body_tex(
+                [node], {}, ZH_ACADEMIC_V1, source, root)
+            stub = stubs[0]
+            self.assertAlmostEqual(stub["target_width_pt"], 489.276)
+            self.assertLess(stub["actual_scale"], 1.15)
+            placement = {**stub, "output_page": 1,
+                         "bbox": [53, 100, 542.276, 100 + stub["target_height_pt"]]}
+            visual = native_latex.visual_placement_report(placement)
+            (root / "visual-layout.json").write_text(json.dumps({
+                "source_sha256": "hash", "visuals": [node["visual_layout"]]}), encoding="utf-8")
+            (root / "units.jsonl").write_text(
+                "\n".join(json.dumps(e) for e in [figure, caption]), encoding="utf-8")
+            manifest = {"source_sha256": "hash", "paths": {
+                "visual_layout": "visual-layout.json", "translation_units": "units.jsonl"}}
+            layout = {"placements": [placement], "visual_layout": {"placements": [visual]}}
+            with pymupdf.open() as output:
+                output.new_page(width=595.276, height=841.89)
+                errors, _, _ = check_translation.validate_visual_layout(
+                    manifest, root / "manifest.json", layout, output)
+                self.assertEqual(errors, [])
+                visual["actual_scale"] *= 0.8
+                errors, _, _ = check_translation.validate_visual_layout(
+                    manifest, root / "manifest.json", layout, output)
+                self.assertTrue(any("font calibration" in e for e in errors), errors)
+
     def test_blank_source_padding_is_not_copied_to_output(self):
         with tempfile.TemporaryDirectory() as directory:
             directory = Path(directory)

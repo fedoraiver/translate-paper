@@ -628,16 +628,27 @@ def is_logical_continuation(
 ) -> bool:
     if role != "paragraph-start":
         return False
-    if previous_node.get("flow_role") != "paragraph-start":
+    if previous_node.get("flow_role") not in {
+        "paragraph-start", "paragraph-continuation", "list-item",
+    }:
         return False
     if previous_node.get("render_mode") != "text":
         return False
     previous_element = previous_node["elements"][-1]
     if not previous_element.get("translatable"):
         return False
-    if str(previous_element.get("section") or "") != str(
-        element.get("section") or ""
+    if str(previous_element.get("flow_section", previous_element.get("section")) or "") != str(
+        element.get("flow_section", element.get("section")) or ""
     ):
+        return False
+    protected_text = str(element.get("protected_text") or "")
+    label = re.match(
+        r"^\s*\[\[(B[A-Za-z0-9_]*)_OPEN\]\](.*?)\[\[\1_CLOSE\]\]",
+        protected_text,
+        flags=re.DOTALL,
+    )
+    if label and (not protected_text[label.end():].strip()
+                  or re.search(r"[.:：。]\s*$", label.group(2))):
         return False
     previous_page = int(previous_element.get("page") or 0)
     current_page = int(element.get("page") or 0)
@@ -653,7 +664,8 @@ def is_logical_continuation(
             and previous_source.endswith(marker)
         ):
             previous_source = previous_source[:-len(marker)].rstrip()
-    if not previous_source or PARAGRAPH_END_RE.search(previous_source):
+    if (not previous_source or PARAGRAPH_END_RE.search(previous_source)
+            or re.search(r"⊓\s*⊔\s*$", previous_source)):
         return False
     if current_page == previous_page + 1:
         return True
@@ -667,7 +679,18 @@ def is_logical_continuation(
         float(element.get("font_size") or 10.0),
     )
     same_left_edge = abs(current_rect.x0 - previous_rect.x0) <= font_size * 2.0
-    return -font_size * 0.5 <= gap <= font_size * 2.2 and same_left_edge
+    if (previous_node.get("flow_role") in {"paragraph-start", "paragraph-continuation"}
+            and -font_size * 0.5 <= gap <= font_size * 2.2 and same_left_edge):
+        return True
+    # Reading order can wrap from the foot of a left column to the top of
+    # its neighboring right column, including a short final sentence line.
+    column_gap = current_rect.x0 - previous_rect.x1
+    return (
+        previous_rect.width >= font_size * 8.0
+        and 0 <= column_gap <= font_size * 4.0
+        and current_rect.y0 < previous_rect.y0 - font_size
+        and current_rect.y1 < previous_rect.y1 - font_size
+    )
 
 
 def join_continuation(left: str, right: str) -> str:
@@ -684,6 +707,26 @@ def join_continuation(left: str, right: str) -> str:
     ):
         return left + right
     return left + " " + right
+
+
+def append_text_continuation(
+    node: dict[str, Any], text: str, element: dict[str, Any]
+) -> None:
+    """Join prose while retaining block-style boundaries in the joined text."""
+    joined = join_continuation(str(node.get("text") or ""), text)
+    right = text.lstrip()
+    boundary = len(joined) - len(right)
+    runs = node.get("text_style_runs") or [{
+        "start": 0, "block_style": node["element"].get("block_style") or "normal",
+    }]
+    # Joining can remove trailing whitespace or a source-page hyphen. A style
+    # boundary in the removed suffix must not survive into the next unit.
+    runs = [dict(run) for run in runs if int(run["start"]) < boundary]
+    style = str(element.get("block_style") or "normal")
+    if right and (not runs or runs[-1]["block_style"] != style):
+        runs.append({"start": boundary, "block_style": style})
+    node["text"] = joined
+    node["text_style_runs"] = runs
 
 
 def is_caption_continuation(
@@ -710,25 +753,66 @@ def is_caption_continuation(
     return -font_size * 0.5 <= gap <= font_size * 2.5
 
 
+def continuation_after_visuals(
+    nodes: list[dict[str, Any]], element: dict[str, Any], role: str,
+) -> dict[str, Any]:
+    """Keep a page-spanning sentence flush left without moving its visual."""
+    if role != "paragraph-start":
+        return {}
+    visual_nodes: list[dict[str, Any]] = []
+    for previous in reversed(nodes):
+        previous_element = previous["element"]
+        if previous_element.get("kind") == "footnote" and previous_element.get("anchor_id"):
+            continue
+        if (previous.get("render_mode") == "source_clip"
+                and previous_element.get("visual_id")
+                and all(part.get("kind") in {"figure", "table", "figure-text", "caption"}
+                        for part in previous.get("elements") or [previous_element])):
+            visual_nodes.insert(0, previous)
+            continue
+        last_element = previous["elements"][-1]
+        if (not visual_nodes
+                or previous.get("flow_role") not in {"paragraph-start", "paragraph-continuation"}
+                or int(element.get("page") or 0) != int(last_element.get("page") or 0) + 1
+                or not is_logical_continuation(previous, element, role)):
+            return {}
+        first_run = next((run for run in element.get("span_runs") or []
+                          if str(run.get("text") or "").strip()), None)
+        if first_run and first_run.get("bbox"):
+            indent = float(first_run["bbox"][0]) - float(element["bbox"][0])
+            if indent >= float(element.get("font_size") or 10.0) * 0.75:
+                return {}
+        return {
+            "flow_role": "paragraph-continuation",
+            "continuation_of": last_element["id"],
+            "continuation_across_visual_ids": [unit_id for visual in visual_nodes
+                                               for unit_id in visual["ids"]],
+        }
+    return {}
+
+
 def build_flow_nodes(
     elements: list[dict[str, Any]], rendered_text: dict[str, str]
 ) -> list[dict[str, Any]]:
     nodes: list[dict[str, Any]] = []
+    flow_section: str | None = None
     for element in sorted(elements, key=lambda item: int(item["order"])):
         if (
             element.get("kind") in {"header", "footer"}
             or element.get("render_suppressed")
         ):
             continue
+        if element.get("kind") == "heading":
+            flow_section = str(element["id"])
+        if flow_section is not None:
+            element = {**element, "flow_section": flow_section}
         if element.get("render_mode") == "source_clip":
             if nodes and is_caption_continuation(nodes[-1], element):
                 previous = nodes[-1]
                 continuation = normalize_body_text(
                     str(rendered_text[element["id"]])
                 )
-                previous["text"] = join_continuation(
-                    previous["text"], continuation
-                )
+                append_text_continuation(previous, continuation, element)
                 previous["ids"].append(element["id"])
                 previous["elements"].append(element)
                 previous["joined_continuations"] = len(previous["ids"]) - 1
@@ -804,7 +888,7 @@ def build_flow_nodes(
         )
         if previous_body and is_logical_continuation(previous_body, element, role):
             previous = previous_body
-            previous["text"] = join_continuation(previous["text"], text)
+            append_text_continuation(previous, text, element)
             previous["ids"].append(element["id"])
             previous["elements"].append(element)
             previous["joined_continuations"] = len(previous["ids"]) - 1
@@ -819,7 +903,12 @@ def build_flow_nodes(
                 "render_mode": "text",
                 "flow_role": role,
                 "text": text,
+                "text_style_runs": [{
+                    "start": 0,
+                    "block_style": str(element.get("block_style") or "normal"),
+                }],
                 "joined_continuations": 0,
+                **continuation_after_visuals(nodes, element, role),
             }
         )
     return nodes
@@ -846,6 +935,8 @@ def boundary_page_segments(
         included: list[pymupdf.Rect] = []
         excluded: list[pymupdf.Rect] = []
         for element in page_elements:
+            if element.get("render_suppressed"):
+                continue
             rect = pymupdf.Rect(element["bbox"]) & lane
             if rect.is_empty:
                 continue
@@ -976,10 +1067,12 @@ def partition_translation_body(
     # Reviewed include_ids may extend the body beyond its initial boundary.
     # Honor the resulting inventory instead of copying those translations into
     # the original-language front or tail.
+    explicit_include_ids = set(boundary.get("include_ids") or [])
     included_indices = [
         index
         for index, element in enumerate(ordered)
-        if element.get("translatable") and not element.get("render_suppressed")
+        if (element.get("translatable") or element["id"] in explicit_include_ids)
+        and not element.get("render_suppressed")
     ]
     if included_indices:
         start_index = min(start_index, min(included_indices))
@@ -1340,6 +1433,8 @@ def rich_text_to_html(node: dict[str, Any]) -> str:
                     + html.escape(str(fragment.get("text") or ""))
                     + "</sup>"
                 )
+            elif kind == "code":
+                output.append("<code>" + html.escape(str(fragment.get("text") or "")) + "</code>")
             elif kind == "math":
                 if fragment.get("asset_path"):
                     asset_name = Path(str(fragment["asset_path"])).name

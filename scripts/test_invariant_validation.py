@@ -72,6 +72,37 @@ class InvariantValidationTests(unittest.TestCase):
             corpus = checker.original_boundary_output_text(document, layout)
             self.assertEqual(checker.missing_invariant_ids([unit], checker.normalize_text(corpus), layout), ["missing-original"])
 
+    def test_original_clip_keeps_native_and_sorted_extraction_orders(self) -> None:
+        lines = [
+            "The first logical sentence introduces the retained argument.",
+            "A second statement gives a distinct explanation of its premise.",
+            "Next comes the third logical step with an independent detail.",
+            "The fourth step establishes the necessary intermediate result.",
+            "Finally the original paragraph reaches its stated conclusion.",
+        ]
+        with pymupdf.open() as document:
+            page = document.new_page(width=500, height=400)
+            for y, line in zip((160, 80, 240, 120, 200), lines):
+                page.insert_text((20, y), line, fontsize=9)
+            source_text = "\n".join(lines)
+            self.assertTrue(checker.invariant_present(
+                source_text, checker.normalize_text(page.get_text(sort=False))))
+            self.assertFalse(checker.invariant_present(
+                source_text, checker.normalize_text(page.get_text(sort=True))))
+            layout = {"boundary_layout": {"segments": [{
+                "role": "tail-original", "mode": "partial-page",
+                "source_page": 1, "output_page": 1,
+                "target_bbox": [0, 0, 500, 400],
+            }]}}
+            corpus = checker.normalize_text(
+                checker.original_boundary_output_text(document, layout))
+            present = self.unit("retained", [0, 0, 500, 400], source_text=source_text)
+            absent = self.unit("absent", [0, 0, 500, 400])
+            self.assertEqual(
+                checker.missing_invariant_ids([present, absent], corpus, layout),
+                ["absent"],
+            )
+
     def test_union_of_distant_algorithms_rejects_swallowed_prose(self) -> None:
         units = [
             self.unit("left-bottom", [10, 250, 190, 350], render_mode="source_clip"),

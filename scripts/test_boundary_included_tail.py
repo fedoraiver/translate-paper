@@ -11,6 +11,74 @@ from check_translation import validate_boundary_layout
 
 
 class IncludedTailTests(unittest.TestCase):
+    def test_explicitly_included_final_caption_stays_in_body(self):
+        elements = [
+            {"id": "intro", "order": 1, "page": 1,
+             "bbox": [50, 50, 450, 90], "translatable": True,
+             "kind": "body", "render_mode": "text"},
+            {"id": "figure", "order": 2, "page": 1,
+             "bbox": [50, 100, 450, 400], "translatable": False,
+             "kind": "figure", "render_mode": "source_clip"},
+            {"id": "caption", "order": 3, "page": 1,
+             "bbox": [50, 410, 450, 430], "translatable": False,
+             "kind": "caption", "render_mode": "text"},
+        ]
+        manifest = {
+            "boundary": {"introduction_id": "intro",
+                         "post_body_stop_id": "caption",
+                         "include_ids": ["caption"]},
+            "pages": [{"page": 1, "width": 500, "height": 700, "columns": 1}],
+            "page_count": 1,
+        }
+        body, front, tail = partition_translation_body(elements, manifest)
+        self.assertEqual([item["id"] for item in body],
+                         ["intro", "figure", "caption"])
+        self.assertEqual(front, [])
+        self.assertEqual(tail, [])
+
+        with pymupdf.open() as source, pymupdf.open() as output:
+            source.new_page(width=500, height=700)
+            output.new_page(width=500, height=700)
+            errors, metrics = validate_boundary_layout(source, output, {
+                "boundary_layout": {
+                    "profile": "original-front-translated-body-original-tail",
+                    "translation_page_start": 1, "translation_page_end": 1,
+                    "segments": [],
+                }
+            }, elements, manifest)
+        self.assertEqual(errors, [])
+        self.assertEqual(metrics["original_units_checked"], 0)
+
+    def test_suppressed_folio_does_not_create_original_front_page(self):
+        elements = [
+            {"id": "folio", "order": 1, "page": 1,
+             "bbox": [50, 20, 60, 30], "translatable": False,
+             "render_suppressed": True},
+            {"id": "intro", "order": 2, "page": 1,
+             "bbox": [50, 50, 450, 90], "translatable": True,
+             "kind": "heading", "render_mode": "text"},
+        ]
+        manifest = {
+            "boundary": {"introduction_id": "intro"},
+            "pages": [{"page": 1, "width": 500, "height": 700, "columns": 1}],
+            "page_count": 1,
+        }
+        _, front, tail = partition_translation_body(elements, manifest)
+        self.assertEqual(front, [])
+        self.assertEqual(tail, [])
+        with pymupdf.open() as source, pymupdf.open() as output:
+            source.new_page(width=500, height=700)
+            output.new_page(width=500, height=700)
+            errors, metrics = validate_boundary_layout(source, output, {
+                "boundary_layout": {
+                    "profile": "original-front-translated-body-original-tail",
+                    "translation_page_start": 1, "translation_page_end": 1,
+                    "segments": [],
+                }
+            }, elements, manifest)
+        self.assertEqual(errors, [])
+        self.assertEqual(metrics["original_units_checked"], 0)
+
     def test_terminal_footnote_does_not_join_the_next_paragraph(self):
         previous = {
             "translatable": True, "section": "Safety", "page": 1,

@@ -8,6 +8,7 @@ import tempfile
 from pathlib import Path
 import threading
 import unittest
+import urllib.parse
 
 import zotero_ingest as ingest
 
@@ -131,15 +132,6 @@ class ZoteroIngestTests(unittest.TestCase):
         self.assertNotIn("_private", item)
         self.assertNotIn("_sourceParentKey", item)
 
-    def test_summary_html_has_one_fixed_title_and_escapes_text(self) -> None:
-        rendered = ingest.summary_markdown_to_html(
-            "# 中文论文总结\n\n## 研究问题\n\nA < B\n\n- 一\n- 二"
-        )
-        self.assertEqual(rendered.count("<h1>中文论文总结</h1>"), 1)
-        self.assertIn("<h3>研究问题</h3>", rendered)
-        self.assertIn("A &lt; B", rendered)
-        self.assertIn("<ul><li>一</li><li>二</li></ul>", rendered)
-
     def test_pdf_signature_check(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             good = Path(directory) / "good.pdf"
@@ -149,6 +141,15 @@ class ZoteroIngestTests(unittest.TestCase):
             ingest.validate_pdf(good, "good")
             with self.assertRaises(ingest.ZoteroError):
                 ingest.validate_pdf(bad, "bad")
+
+    def test_markdown_upload_url_retains_extension_for_connector(self) -> None:
+        for source in ("https://eprint.iacr.org/1996/004",
+                       "https://example.test/paper.pdf?download=1#page=3"):
+            url = ingest.markdown_attachment_url(source, "中文论文总结.md")
+            parsed = urllib.parse.urlsplit(url)
+            self.assertTrue(parsed.path.endswith(".md"))
+            self.assertTrue(urllib.parse.unquote(parsed.path).endswith("中文论文总结.md"))
+            self.assertEqual(parsed.query, "")
 
     def test_generated_child_verification(self) -> None:
         children = [
@@ -182,8 +183,11 @@ class ZoteroIngestTests(unittest.TestCase):
             {
                 "key": "SUMMARY1",
                 "data": {
-                    "itemType": "note",
-                    "note": "<h1>中文论文总结</h1><p>内容</p>",
+                    "itemType": "attachment",
+                    "title": ingest.SUMMARY_ATTACHMENT_TITLE,
+                    "linkMode": "imported_file",
+                    "contentType": "text/markdown",
+                    "filename": "中文论文总结.md",
                 },
             },
         ]
@@ -195,6 +199,17 @@ class ZoteroIngestTests(unittest.TestCase):
             }
         ]
         self.assertFalse(ingest.verify_generated_children(extra)["ok"])
+        legacy = children[:-1] + [{"data": {
+            "itemType": "note", "note": "<h1>中文论文总结</h1><p>内容</p>"
+        }}]
+        self.assertFalse(ingest.verify_generated_children(legacy)["ok"])
+        for field, value in (("filename", "summary.html"),
+                             ("linkMode", "linked_file"),
+                             ("contentType", "text/html")):
+            with self.subTest(field=field):
+                invalid = children[:-1] + [{"data": {**children[-1]["data"], field: value}}]
+                self.assertFalse(ingest.verify_generated_children(invalid)["ok"])
+
 
     def test_streams_pdf_to_connector_with_required_headers(self) -> None:
         observed: dict[str, object] = {}

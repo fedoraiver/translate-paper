@@ -9,6 +9,8 @@
 Use `source-review.json` for reviewed extraction corrections that must survive
 reruns. Never create a paper-specific repair script when these operations can
 express the correction.
+Use [rendering-contract.md](rendering-contract.md) for the native-math and visual
+preservation rules when deciding classifications and reviewed geometry.
 
 Prefer one preparation pass followed by targeted inspection of reported pages.
 Represent page- or paper-specific corrections with the operations below and rerun
@@ -16,6 +18,20 @@ preparation; do not repeatedly patch and execute temporary extractor copies. If 
 failure is genuinely general and cannot be represented here, minimize it against
 the skill script, add a regression test, fix the shared script once, and rerun only
 the affected pipeline stage.
+
+Triage unresolved math, flagged units, boundaries, and visual/caption associations
+first. Inspect the exact source pages/crops and return proposed corrections by ID.
+Do not retranscribe correct `auto_validated` TeX merely to relabel it
+`manually_reviewed`. Automated status is not semantic evidence: when source
+comparison reveals a systematic notation/extraction error, expand inspection to
+all affected entries/pages. Keep correct reviewed entries unchanged and merge a
+complete set of related source corrections before replaying preparation once.
+
+For text inspection, select `id`, `page`, `kind`, `source_text`, `protected_text`,
+and the relevant math entry; load `span_runs` or geometry only for the specific
+reconstruction being diagnosed. Do not print the entire manifest or all hundreds
+of math records. After replay, inspect the report delta and changed units instead
+of rereading the complete accepted source inventory.
 
 ## Gate and lifecycle
 

@@ -2,8 +2,8 @@
 """Safely replace and ingest translated papers in Zotero.
 
 Reads/deletes use the Zotero Web API and a key stored by
-``zotero_credentials.py``. Creation, stored PDF attachment upload, note
-creation, and collection placement use Zotero Desktop's Connector server.
+``zotero_credentials.py``. Creation, stored PDF/Markdown attachment uploads,
+and collection placement use Zotero Desktop's Connector server.
 The script never edits zotero.sqlite or Zotero's storage directory.
 """
 
@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
-import html
 import http.client
 import json
 import os
@@ -39,7 +38,7 @@ LOCAL_BASE = os.environ.get("ZOTERO_LOCAL_BASE_URL", "http://127.0.0.1:23119")
 USER_AGENT = "translate-paper/2.0"
 CONNECTOR_HEADERS = {"X-Zotero-Connector-API-Version": "3"}
 API_HEADERS = {"Zotero-API-Version": "3"}
-NOTE_TITLE = "中文论文总结"
+SUMMARY_ATTACHMENT_TITLE = "中文论文总结"
 SOURCE_ATTACHMENT_TITLE = "原文 PDF"
 TRANSLATION_ATTACHMENT_TITLE = "中文翻译 PDF"
 TRANSLATION_MARKDOWN_TITLE = "中文翻译 Markdown"
@@ -585,6 +584,18 @@ def connector_item(metadata: dict[str, Any], connector_id: str) -> dict[str, Any
     return result
 
 
+def markdown_attachment_url(base_url: str, filename: str) -> str:
+    # Connector derives the stored extension from the URL path; a fragment is
+    # insufficient when Zotero's MIME service has no extension for text/markdown.
+    # This URL identifies generated content; saveAttachment uploads the bytes.
+    parts = urllib.parse.urlsplit(base_url)
+    return urllib.parse.urlunsplit(parts._replace(
+        path=parts.path.rstrip("/") + "/" + urllib.parse.quote(filename),
+        query="",
+        fragment="codex-generated",
+    ))
+
+
 def validate_pdf(path: Path, label: str) -> None:
     if not path.is_file():
         raise ZoteroError(f"{label} does not exist: {path}")
@@ -592,51 +603,6 @@ def validate_pdf(path: Path, label: str) -> None:
         signature = stream.read(5)
     if path.stat().st_size < 5 or signature != b"%PDF-":
         raise ZoteroError(f"{label} is not a valid PDF: {path}")
-
-
-def summary_markdown_to_html(markdown: str) -> str:
-    lines = markdown.replace("\r\n", "\n").replace("\r", "\n").split("\n")
-    while lines and not lines[0].strip():
-        lines.pop(0)
-    if lines and re.fullmatch(r"#\s*中文论文总结\s*", lines[0].strip()):
-        lines.pop(0)
-
-    output = [f"<h1>{NOTE_TITLE}</h1>"]
-    paragraph: list[str] = []
-    list_items: list[str] = []
-
-    def flush_paragraph() -> None:
-        if paragraph:
-            output.append("<p>" + "<br/>".join(paragraph) + "</p>")
-            paragraph.clear()
-
-    def flush_list() -> None:
-        if list_items:
-            output.append("<ul>" + "".join(list_items) + "</ul>")
-            list_items.clear()
-
-    for raw_line in lines:
-        line = raw_line.strip()
-        if not line:
-            flush_paragraph()
-            flush_list()
-            continue
-        heading = re.match(r"^(#{1,6})\s+(.+)$", line)
-        bullet = re.match(r"^[-*]\s+(.+)$", line)
-        if heading:
-            flush_paragraph()
-            flush_list()
-            level = min(len(heading.group(1)) + 1, 6)
-            output.append(f"<h{level}>{html.escape(heading.group(2))}</h{level}>")
-        elif bullet:
-            flush_paragraph()
-            list_items.append(f"<li>{html.escape(bullet.group(1))}</li>")
-        else:
-            flush_list()
-            paragraph.append(html.escape(line))
-    flush_paragraph()
-    flush_list()
-    return "".join(output)
 
 
 def fetch_web_children(
@@ -718,11 +684,11 @@ def verify_generated_children(children: list[dict[str, Any]]) -> dict[str, Any]:
         if item_data(child).get("itemType") == "attachment"
         and item_data(child).get("title") == TRANSLATION_MARKDOWN_TITLE
     ]
-    notes = [
+    summaries = [
         child
         for child in children
-        if item_data(child).get("itemType") == "note"
-        and NOTE_TITLE in str(item_data(child).get("note") or "")
+        if item_data(child).get("itemType") == "attachment"
+        and item_data(child).get("title") == SUMMARY_ATTACHMENT_TITLE
     ]
     errors: list[str] = []
     if len(children) != 4:
@@ -737,15 +703,18 @@ def verify_generated_children(children: list[dict[str, Any]]) -> dict[str, Any]:
         errors.append(
             f"expected one {TRANSLATION_MARKDOWN_TITLE}, found {len(markdown)}"
         )
-    if len(notes) != 1:
-        errors.append(f"expected one {NOTE_TITLE} note, found {len(notes)}")
+    if len(summaries) != 1:
+        errors.append(
+            f"expected one {SUMMARY_ATTACHMENT_TITLE} Markdown attachment, "
+            f"found {len(summaries)}"
+        )
     for attachment in source + translation:
         data = item_data(attachment)
         if not str(data.get("linkMode") or "").startswith("imported_"):
             errors.append(f"attachment {data.get('title')} is not stored")
         if data.get("contentType") != "application/pdf":
             errors.append(f"attachment {data.get('title')} is not a PDF")
-    for attachment in markdown:
+    for attachment in markdown + summaries:
         data = item_data(attachment)
         if not str(data.get("linkMode") or "").startswith("imported_"):
             errors.append(f"attachment {data.get('title')} is not stored")
@@ -753,6 +722,9 @@ def verify_generated_children(children: list[dict[str, Any]]) -> dict[str, Any]:
             errors.append(
                 f"attachment {data.get('title')} is not readable Markdown"
             )
+    for attachment in summaries:
+        if Path(str(item_data(attachment).get("filename") or "")).suffix.lower() != ".md":
+            errors.append("summary attachment filename must end in .md")
     return {"ok": not errors, "errors": errors, "children": summarized}
 
 
@@ -923,6 +895,8 @@ def cmd_ingest(args: argparse.Namespace) -> int:
     markdown_text = translated_markdown.read_text(encoding="utf-8")
     if not normalize_space(markdown_text):
         raise ZoteroError("Translated Markdown is empty.")
+    if summary_path.suffix.lower() != ".md":
+        raise ZoteroError("Summary must be a Markdown (.md) file.")
     if not summary_path.is_file():
         raise ZoteroError(f"Summary does not exist: {summary_path}")
     summary = summary_path.read_text(encoding="utf-8")
@@ -995,18 +969,17 @@ def cmd_ingest(args: argparse.Namespace) -> int:
             session_id=session_id,
             parent_item_id=connector_id,
             title=TRANSLATION_MARKDOWN_TITLE,
-            url=base_url + "#codex-chinese-translation-markdown",
+            url=markdown_attachment_url(base_url, translated_markdown.name),
             content_type="text/markdown",
         )
 
-        connector_request(
-            "/connector/updateSession",
-            json_body={
-                "sessionID": session_id,
-                "target": args.target_id,
-                "tags": [],
-                "note": summary_markdown_to_html(summary),
-            },
+        connector_upload_file(
+            summary_path,
+            session_id=session_id,
+            parent_item_id=connector_id,
+            title=SUMMARY_ATTACHMENT_TITLE,
+            url=markdown_attachment_url(base_url, summary_path.name),
+            content_type="text/markdown",
         )
 
         matches = wait_for_unique_local_match(metadata)
@@ -1111,7 +1084,7 @@ def build_parser() -> argparse.ArgumentParser:
         "ingest",
         help=(
             "Preview or create a parent, two stored PDFs, one stored "
-            "Markdown attachment, and a note"
+            "translation Markdown attachment, and one stored summary Markdown attachment"
         ),
     )
     ingest.add_argument("--metadata", required=True)

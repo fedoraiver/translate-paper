@@ -29,6 +29,9 @@ from typing import Any
 import pymupdf
 from PIL import Image, ImageDraw, ImageOps
 from typography import ZH_ACADEMIC_V1
+from quick_validate import (
+    reviewed_proof_square_count, source_contains_glyph, suspicious_glyphs,
+)
 
 
 HAN_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
@@ -200,9 +203,13 @@ def original_boundary_output_text(
         rectangle = pymupdf.Rect(segment.get("target_bbox") or [])
         if rectangle.is_empty:
             continue
-        texts.append(
-            document[page_index].get_text("text", clip=rectangle, sort=True)
-        )
+        # Native content-stream order can preserve legacy Type3 prose whose
+        # geometry-based sorting interleaves glyphs. Both remain actual output
+        # evidence; neither source strings nor coverage declarations enter it.
+        for sort in (False, True):
+            texts.append(
+                document[page_index].get_text("text", clip=rectangle, sort=sort)
+            )
     return "\n".join(texts)
 
 
@@ -631,7 +638,7 @@ def validate_typography(
         metrics["latin_fonts"] = dict(latin_fonts)
         metrics["math_fonts"] = dict(math_fonts)
         metrics["paragraphs_checked"] = sum(
-            placement.get("flow_role") in {"paragraph-start", "list-item"}
+            placement.get("flow_role") in {"paragraph-start", "paragraph-continuation", "list-item"}
             for placement in placements
         )
         metrics["headings_checked"] = sum(
@@ -1026,9 +1033,11 @@ def validate_boundary_layout(
         )
         stop_id = str(source_boundary.get("post_body_stop_id") or "")
         stop = positions.get(stop_id, len(ordered))
+        explicit_include_ids = set(source_boundary.get("include_ids") or [])
         included = [
             index for index, item in enumerate(ordered)
-            if item.get("translatable") and not item.get("render_suppressed")
+            if (item.get("translatable") or item["id"] in explicit_include_ids)
+            and not item.get("render_suppressed")
         ]
         if start is not None and included:
             start = min(start, min(included))
@@ -1132,6 +1141,8 @@ def validate_boundary_layout(
                 )
         metrics["segments_checked"] += 1
     for unit, role in original_units:
+        if unit.get("render_suppressed"):
+            continue
         if not rectangle_covered_by_regions(
             pymupdf.Rect(unit["bbox"]),
             source_regions.get((int(unit["page"]), role), []),
@@ -1209,6 +1220,11 @@ def validate_visual_layout(
         for unit_id in item.get("ids") or [item.get("id")]
         if unit_id
     }
+    units_name = str((manifest.get("paths") or {}).get("translation_units") or "")
+    source_units = {
+        str(unit["id"]): unit
+        for unit in read_jsonl(manifest_path.parent / units_name)
+    } if units_name else {}
     checked = 0
     fallback_count = 0
     original_boundary_visuals = 0
@@ -1240,6 +1256,28 @@ def validate_visual_layout(
         width = float(item.get("target_width_pt") or 0.0)
         height = float(item.get("target_height_pt") or 0.0)
         expected_width = float(source_item.get("target_width_pt") or 0.0)
+        page_number = int(item.get("output_page") or 0)
+        caption = placements.get(str(source_item.get("caption_id") or ""))
+        source_caption = source_units.get(str(source_item.get("caption_id") or ""))
+        calibration_factor = 1.0
+        if (caption and source_caption and caption.get("id") == item.get("id")
+                and source_caption.get("render_mode") == "source_clip"
+                and source_item.get("source_bbox") and expected_width
+                and 1 <= page_number <= len(output_document)):
+            visual_rect = pymupdf.Rect(source_item["source_bbox"])
+            combined = visual_rect | pymupdf.Rect(source_caption["bbox"])
+            if not visual_rect.is_empty and not combined.is_empty:
+                page_rect = output_document[page_number - 1].rect
+                content_width = page_rect.width - ZH_ACADEMIC_V1.margin_left - ZH_ACADEMIC_V1.margin_right
+                content_height = page_rect.height - ZH_ACADEMIC_V1.margin_top - ZH_ACADEMIC_V1.margin_bottom
+                base_scale = expected_width / visual_rect.width
+                # Only the canonical combined envelope can justify reducing the
+                # calibrated visual scale to fit its preserved vector caption.
+                calibration_factor = min(
+                    1.0, content_width / (combined.width * base_scale),
+                    content_height * 0.72 / (combined.height * base_scale),
+                )
+                expected_width *= calibration_factor
         if expected_width and abs(width - expected_width) > 0.6:
             errors.append(
                 f"{visual_id}: rendered width {width:.2f}pt differs from "
@@ -1250,7 +1288,6 @@ def validate_visual_layout(
         if expected_ratio and abs(actual_ratio - expected_ratio) > 0.003:
             errors.append(f"{visual_id}: rendered aspect ratio changed.")
         bbox = pymupdf.Rect(item.get("bbox") or [])
-        page_number = int(item.get("output_page") or 0)
         if page_number < 1 or page_number > len(output_document):
             errors.append(f"{visual_id}: output page is invalid.")
         elif (
@@ -1263,16 +1300,35 @@ def validate_visual_layout(
             errors.append(
                 f"{visual_id}: rendered visual exceeds content width."
             )
-        caption = placements.get(str(source_item.get("caption_id") or ""))
-        if not caption:
+        reviewed_captionless = (
+            source_item.get("captionless") is True
+            and bool(source_item.get("source_review_reason"))
+            and not source_item.get("caption_id")
+        )
+        if not caption and not reviewed_captionless:
             errors.append(f"{visual_id}: caption placement is missing.")
-        elif int(caption.get("output_page") or 0) != page_number:
+        elif caption and int(caption.get("output_page") or 0) != page_number:
             errors.append(
                 f"{visual_id}: visual and caption are on different pages."
             )
+        if caption and (
+            caption.get("render_mode") == "source_clip"
+            or (source_caption or {}).get("render_mode") == "source_clip"
+        ):
+            if not source_caption or (
+                caption.get("render_mode") != "source_clip"
+                or pymupdf.Rect(source_caption.get("bbox") or []).is_empty
+                or int(caption.get("source_page") or 0) != int(source_caption.get("page") or 0)
+                or not rectangle_covered_by_regions(
+                    pymupdf.Rect(source_caption.get("bbox") or []),
+                    [pymupdf.Rect(caption.get("source_bbox") or [])],
+                )
+            ):
+                errors.append(f"{visual_id}: caption source region is not covered by its actual crop.")
         source_internal = source_item.get("source_internal_font_pt")
         target_internal = source_item.get("target_internal_font_pt")
         if source_internal is not None and target_internal is not None:
+            target_internal = float(target_internal) * calibration_factor
             actual_internal = float(source_internal) * float(
                 item.get("actual_scale") or 0.0
             )
@@ -1622,9 +1678,14 @@ def main() -> int:
             )
         finally:
             source_glyph_document.close()
-    for marker in ("\ufffd", "\u25a1", "\u25a0"):
-        if marker in output_text and marker not in source_glyph_text:
-            errors.append(f"Rendered PDF text contains suspicious glyph {marker!r}")
+    math_review_name = (manifest.get("paths") or {}).get("math_review")
+    reviewed_squares = reviewed_proof_square_count(
+        manifest_path.parent / math_review_name if math_review_name else None,
+        source,
+    )
+    metrics["reviewed_proof_squares"] = reviewed_squares
+    for marker in suspicious_glyphs(output_text, source_glyph_text, reviewed_squares):
+        errors.append(f"Rendered PDF text contains suspicious glyph {marker!r}")
 
     normalized_output = normalize_text(output_text + "\n" + boundary_invariant_text)
     invariant_missing = missing_invariant_ids(units, normalized_output, layout)
