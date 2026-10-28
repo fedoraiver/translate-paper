@@ -19,7 +19,9 @@
 - 中文 PDF 生成后逐页实际看图，修复问题并复查；视觉报告绑定最终 PDF 哈希，未通过不得交付。
 - 保留原论文的非正文材料，并翻译从 Introduction 到 Conclusion 的正文。
 - 通过哈希绑定的 `source-review.json` 重放人工核对过的视觉清单和提取修复。
+- 翻译前检查源文段落、列表和公式归属，编译数学清单与高风险样张；任务包拒绝缺失或失效的检查结果。
 - 使用统一检查点工具校验并原子合并译文批次，报告下一未译单元，避免覆盖已有译文。
+- 以 `run-state.json` 定位当前修订；局部源文修复先报告影响，再创建保留原检查点的隔离副本。
 - 输出原始 PDF、中文翻译 PDF、中文正文 Markdown、中文总结和 Zotero 元数据。
 - 验证翻译完整性、版面结构、字体、公式、图表和 Zotero 附件结构。
 
@@ -65,6 +67,10 @@ output/pdf/<paper-slug>/
 
 ```powershell
 uv run --script scripts/prepare_paper.py --help
+uv run --script scripts/paper_preflight.py --help
+uv run --script scripts/paper_repair.py --help
+python scripts/paper_state.py --help
+python scripts/review_readiness.py --help
 uv run --script scripts/render_translation.py --help
 uv run --script scripts/check_translation.py --help
 python scripts/batch_workflow.py --help
@@ -73,6 +79,10 @@ python scripts/check_visual_review.py --help
 ```
 
 这些脚本不会自行做出翻译决策。
+准备和审查通过后运行 `paper_preflight.py --manifest <manifest> --report
+<work-dir>/paper-preflight.json`，实际查看诊断样张，再生成翻译任务包。
+新任务合并译文时同时传入 `translation_checkpoint.py --batch <batch>
+--packet <assigned-context>`；具体门禁、恢复及视觉验收规则见引用文档。
 
 ## 测试
 

@@ -18,6 +18,56 @@ class VisualAssociationTests(unittest.TestCase):
         self.assertEqual(prepare_paper.visual_label("Figure 5-1: First"), ("figure", "figure-5-1"))
         self.assertEqual(prepare_paper.visual_label("Figure 5-3: Third"), ("figure", "figure-5-3"))
 
+    def test_algorithm_and_listing_labels_keep_distinct_numbering(self):
+        for caption, expected in (
+            ("Figure 1. Plot", ("figure", "figure-1")),
+            ("Fig. A2.1: Plot", ("figure", "figure-A2.1")),
+            ("图 1：图示", ("figure", "figure-1")),
+            ("Table 1. Cells", ("table", "table-1")),
+            ("表 1：数据", ("table", "table-1")),
+            ("Algorithm 1 Effect tracking", ("figure", "algorithm-1")),
+            ("ALGORITHM A2-3: Recovery", ("figure", "algorithm-A2-3")),
+            ("算法 1：效应追踪", ("figure", "algorithm-1")),
+            ("Listing 1. Code", ("figure", "listing-1")),
+            ("listing 2.3: Code", ("figure", "listing-2.3")),
+        ):
+            with self.subTest(caption=caption):
+                self.assertEqual(prepare_paper.visual_label(caption), expected)
+
+    def test_reviewed_algorithms_and_listings_bind_without_figure_number_collision(self):
+        with pymupdf.open() as document:
+            document.new_page(width=600, height=800)
+            units = []
+            for index, (label, kind, caption) in enumerate((
+                ("figure-1", "figure", "Figure 1. Plot"),
+                ("table-1", "table", "Table 1. Data"),
+                ("algorithm-1", "figure", "Algorithm 1 Effect tracking"),
+                ("listing-1", "figure", "Listing 1. Code"),
+            )):
+                top = 60 + index * 160
+                units.extend([
+                    self.element(
+                        label, kind, [50, top, 550, top + 80],
+                        render_mode="source_clip", review_visual_id=label,
+                    ),
+                    self.element(
+                        f"cap-{label}", "caption", [50, top + 90, 550, top + 110],
+                        caption, visual_id=label, source_review_reason="Reviewed pairing",
+                    ),
+                ])
+            result = prepare_paper.build_visual_layout(
+                document, units, [{"page": 1, "width": 600, "height": 800}], "hash"
+            )
+            self.assertEqual(result["status"], "pass", result["errors"])
+            self.assertEqual(
+                {item["visual_id"]: (item["label"], item["kind"], item["caption_id"])
+                 for item in result["visuals"]},
+                {label: (label, kind, f"cap-{label}") for label, kind in (
+                    ("figure-1", "figure"), ("table-1", "table"),
+                    ("algorithm-1", "figure"), ("listing-1", "figure"),
+                )},
+            )
+
     @staticmethod
     def element(identifier, kind, bbox, text="", **extra):
         return {

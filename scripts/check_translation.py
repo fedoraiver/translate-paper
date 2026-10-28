@@ -111,6 +111,32 @@ def expected_native_math_count(layout: dict[str, Any]) -> int:
     )
 
 
+def validate_display_ownership(
+    manifest: dict[str, Any], units: list[dict[str, Any]],
+    layout: dict[str, Any], reviews: dict[str, dict[str, Any]],
+) -> list[str]:
+    """Require every active display review to produce exactly one placement."""
+    from display_plan import build_display_plan, select_body_units, validate_display_consumption
+
+    try:
+        plan = build_display_plan(select_body_units(units, manifest), reviews)
+        placements = list(layout.get("placements") or [])
+        validate_display_consumption(plan, placements)
+        actual = [item for item in placements if item.get("render_mode") == "native-math"]
+        report = dict((layout.get("rich_text") or {}).get("math_review") or {})
+        expected_reviews = [str(item["math_review_id"]) for item in actual]
+        expected_sources = [str(unit_id) for item in actual for unit_id in item["ids"]]
+        if report.get("display_review_ids") != expected_reviews:
+            return ["Display review consumption summary differs from native-math placements."]
+        if report.get("display_source_ids") != expected_sources:
+            return ["Display source ownership summary differs from native-math placements."]
+        if int(((layout.get("rich_text") or {}).get("math_render_strategies") or {}).get("native-display-font") or 0) != len(plan):
+            return ["Native display count differs from exact source ownership."]
+    except (ValueError, TypeError, KeyError) as error:
+        return [str(error)]
+    return []
+
+
 def is_expected_latin_font(value: str) -> bool:
     normalized = normalize_font_name(value)
     return (
@@ -636,9 +662,11 @@ def validate_typography(
                             math_fonts[font] += max(1, len(text))
         metrics["han_fonts"] = dict(han_fonts)
         metrics["latin_fonts"] = dict(latin_fonts)
+        latin_prose_fonts = {name: count for name, count in latin_fonts.items()
+                             if "math" not in name.casefold() and "mono" not in name.casefold()}
         metrics["math_fonts"] = dict(math_fonts)
         metrics["paragraphs_checked"] = sum(
-            placement.get("flow_role") in {"paragraph-start", "paragraph-continuation", "list-item"}
+            placement.get("flow_role") in {"paragraph-start", "paragraph-continuation", "list-item", "list-continuation"}
             for placement in placements
         )
         metrics["headings_checked"] = sum(
@@ -656,10 +684,10 @@ def validate_typography(
             errors.append("Native LuaLaTeX body does not embed SimSun text.")
         if not any("simhei" in name.casefold() for name in han_fonts):
             errors.append("Native LuaLaTeX headings do not embed SimHei text.")
-        if not any(
+        if latin_prose_fonts and not any(
             "lmroman" in normalize_font_name(name)
             or "latinmodernroman" in normalize_font_name(name)
-            for name in latin_fonts
+            for name in latin_prose_fonts
         ):
             errors.append(
                 "Native LuaLaTeX Latin prose does not use Latin Modern Roman."
@@ -1076,11 +1104,13 @@ def validate_boundary_layout(
                 f"source page {source_page_index + 1}"
             )
             continue
-        if not source_document[source_page_index].rect.contains(source_rect):
+        source_bounds = source_document[source_page_index].rect + (-0.01, -0.01, 0.01, 0.01)
+        target_bounds = output_document[output_page_index].rect + (-0.01, -0.01, 0.01, 0.01)
+        if not source_bounds.contains(source_rect):
             errors.append(
                 f"Boundary source crop exceeds page {source_page_index + 1}."
             )
-        if not output_document[output_page_index].rect.contains(target_rect):
+        if not target_bounds.contains(target_rect):
             errors.append(
                 f"Boundary target crop exceeds page {output_page_index + 1}."
             )
@@ -1261,7 +1291,11 @@ def validate_visual_layout(
         source_caption = source_units.get(str(source_item.get("caption_id") or ""))
         calibration_factor = 1.0
         if (caption and source_caption and caption.get("id") == item.get("id")
-                and source_caption.get("render_mode") == "source_clip"
+                and caption.get("render_mode") == "source_clip"
+                and int(caption.get("source_page") or 0) == int(source_caption.get("page") or 0)
+                and rectangle_covered_by_regions(
+                    pymupdf.Rect(source_caption.get("bbox") or []),
+                    [pymupdf.Rect(caption.get("source_bbox") or [])])
                 and source_item.get("source_bbox") and expected_width
                 and 1 <= page_number <= len(output_document)):
             visual_rect = pymupdf.Rect(source_item["source_bbox"])
@@ -1502,6 +1536,16 @@ def main() -> int:
         except (OSError, json.JSONDecodeError) as error:
             errors.append(f"Typography layout report could not be read: {error}")
     if layout is not None and int(manifest.get("schema_version") or 1) >= 2:
+        if layout.get("render_backend") == "native-lualatex-v1":
+            try:
+                review_name = str((manifest.get("paths") or {}).get("math_review") or "math-review.json")
+                review_payload = json.loads((manifest_path.parent / review_name).read_text(encoding="utf-8"))
+                if review_payload.get("source_sha256") != manifest.get("source_sha256"):
+                    errors.append("Math review does not match the source PDF.")
+                else:
+                    errors.extend(validate_display_ownership(manifest, units, layout, dict(review_payload.get("entries") or {})))
+            except (OSError, ValueError, TypeError) as error:
+                errors.append(f"Display ownership review could not be checked: {error}")
         rich = dict(layout.get("rich_text") or {})
         actual_inline = Counter(dict(rich.get("inline_fragments") or {}))
         actual_styles = Counter(dict(rich.get("styles") or {}))

@@ -34,6 +34,8 @@ from typing import Any, Iterable
 
 import pymupdf
 import source_review
+import source_structure
+from display_plan import default_display_groups, select_body_units
 from typography import ZH_ACADEMIC_V1
 
 
@@ -107,8 +109,8 @@ PROTECTED_RE = re.compile(
     r"bps|bp|dB|°C|K))?(?![A-Za-z])"
 )
 VISUAL_LABEL_RE = re.compile(
-    r"(?:(?:\b(?P<latin_kind>figure|fig\.?|table))|"
-    r"(?P<cjk_kind>图|表))\s*"
+    r"(?:(?:\b(?P<latin_kind>figure|fig\.?|table|algorithm|listing))|"
+    r"(?P<cjk_kind>图|表|算法))\s*"
     r"(?P<number>[A-Z]?\d+(?:[.\-]\d+)*)",
     re.IGNORECASE,
 )
@@ -661,22 +663,10 @@ def merge_fragmented_text_blocks(
 def locate_span_runs(
     source_text: str, span_runs: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:
-    """Map source spans onto the cleaned block text without guessing failures."""
-    located: list[dict[str, Any]] = []
-    cursor = 0
-    for run in span_runs:
-        needle = re.sub(r"\s+", " ", str(run.get("text") or "")).strip()
-        if not needle:
-            continue
-        start = source_text.find(needle, cursor)
-        if start < 0:
-            continue
-        item = dict(run)
-        item["start"] = start
-        item["end"] = start + len(needle)
-        item["text"] = needle
-        located.append(item)
-        cursor = start + len(needle)
+    """Match source runs; source review separately gates alignment diagnostics."""
+    located, _ = source_structure.locate_source_spans(source_text, span_runs)
+    for run in located:
+        run.pop("_source_run_index", None)
     return located
 
 
@@ -730,10 +720,28 @@ MATHX_TEX = {
 }
 
 
+def escape_literal_math_braces(value: str) -> str:
+    """Keep source set delimiters visible without escaping TeX arguments."""
+    if re.search(r"\\[A-Za-z]+", value):
+        return value
+    return re.sub(r"(?<!\\)([{}])", lambda match: "\\" + match.group(), value)
+
+
 def math_run_tex(run: dict[str, Any]) -> str:
     """Decode the source font's glyph slots into portable TeX."""
     value = str(run.get("text") or "")
     font = str(run.get("font") or "")
+    if (
+        re.fullmatch(r"(?:NewCM|LatinModern|STIXTwo|Cambria)Math(?:-(?:Book|Regular))?", font)
+        and not int(run.get("flags") or 0) & 2
+        and run.get("style") != "italic"
+        and "\\" not in value
+    ):
+        # Unicode math fonts encode italic alphabets separately. Basic Latin
+        # words in a non-italic span are upright; preserve their glyph style
+        # without inferring operator semantics or adding operator spacing.
+        return re.sub(r"[A-Za-z]{2,}", lambda match: rf"\mathrm{{{match.group()}}}",
+                      escape_literal_math_braces(value))
     if font == "Lucida New Math Symbol":
         return "".join(rf"\mathcal{{{character}}}" if character.isascii() and character.isupper()
                        else character for character in value)
@@ -795,7 +803,7 @@ def math_run_tex(run: dict[str, Any]) -> str:
         value = value.replace("ˆ", r"\widehatmark{}")
         if re.fullmatch(r"[A-Za-z]{2,}", value):
             return rf"\mathrm{{{value}}}"
-    return value
+    return escape_literal_math_braces(value)
 
 
 def normalize_math_tex(tex: str) -> str:
@@ -1076,6 +1084,8 @@ def expand_math_fragment_bounds(
 def build_rich_protection(
     source_text: str,
     span_runs: list[dict[str, Any]] | None = None,
+    *,
+    source_marker: str = "",
 ) -> tuple[str, dict[str, str], dict[str, dict[str, Any]], dict[str, str]]:
     """Protect exact values plus source typography using controlled tokens."""
     located = locate_span_runs(source_text, span_runs or [])
@@ -1090,6 +1100,12 @@ def build_rich_protection(
     )
 
     atomic: list[dict[str, Any]] = []
+    if source_marker:
+        marker_start = len(source_text) - len(source_text.lstrip())
+        if source_text.startswith(source_marker, marker_start):
+            atomic.append({"start": marker_start,
+                           "end": marker_start + len(source_marker),
+                           "kind": "list-marker", "text": source_marker, "runs": []})
     for run in located:
         if not is_code_run(run):
             continue
@@ -1099,6 +1115,7 @@ def build_rich_protection(
         previous = atomic[-1] if atomic else None
         if (
             previous is not None
+            and previous.get("kind") == "code"
             and int(previous["end"]) == start
             and run.get("style") == "text"
             and previous["runs"][-1].get("style") == "text"
@@ -1296,6 +1313,8 @@ def build_rich_protection(
             if key not in {"start", "end"}
         }
         fragment["token"] = token
+        fragment["source_start"] = int(item["start"])
+        fragment["source_end"] = int(item["end"])
         inline_fragments[token] = fragment
         item["token"] = token
         atomic_by_start[int(item["start"])] = item
@@ -2023,6 +2042,7 @@ def protect_element(element: dict[str, Any]) -> None:
     ) = build_rich_protection(
         str(element.get("source_text") or ""),
         span_runs,
+        source_marker=str(element.get("source_marker") or ""),
     )
     prose_runs = [
         run
@@ -2413,18 +2433,74 @@ def render_source_previews(
         pixmap.save(preview_dir / f"page-{page_index + 1:04d}.png")
 
 
+def _math_source_fingerprint(value: dict[str, Any]) -> str:
+    return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True,
+                                     separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def _reconcile_math_entry(
+    generated: dict[str, Any], previous: dict[str, Any], *, same_pdf: bool,
+) -> dict[str, Any]:
+    """Refresh only proven generated TeX; retain source-bound human decisions."""
+    entry = dict(generated)
+    for field in ("reason", "reviewer", "reviewed_at", "notes"):
+        if field in previous:
+            entry[field] = previous[field]
+    generated_tex = str(generated.get("tex") or "")
+    entry["generated_provenance"] = {
+        "generator": "prepare_paper.math/1",
+        "generator_sha256": sha256_file(Path(__file__)),
+        "source_fingerprint": generated["source_fingerprint"],
+        "tex_sha256": hashlib.sha256(generated_tex.encode("utf-8")).hexdigest(),
+    }
+    if not previous:
+        return entry
+    same_source = same_pdf and (
+        previous.get("source_fingerprint") == generated["source_fingerprint"]
+        if previous.get("source_fingerprint") else
+        all(previous[field] == generated.get(field)
+            for field in ("kind", "source_page", "source_text", "source_bbox", "source_ids")
+            if field in previous)
+    )
+    if not same_source:
+        entry["review_status"] = "unresolved"
+        entry["review_invalidation"] = "Source fingerprint changed; review the current source mathematics."
+        entry["previous_review_tex"] = str(previous.get("tex") or "")
+        return entry
+    status = str(previous.get("review_status") or "unresolved")
+    if status == "auto_validated":
+        provenance = previous.get("generated_provenance") or {}
+        proven_generated = (
+            provenance.get("generator") == "prepare_paper.math/1"
+            and provenance.get("source_fingerprint") == previous.get("source_fingerprint")
+            and provenance.get("tex_sha256") == hashlib.sha256(
+                str(previous.get("tex") or "").encode("utf-8")).hexdigest()
+        )
+        if proven_generated:
+            return entry
+        entry["tex"] = str(previous.get("tex") or generated_tex)
+        entry["review_status"] = "unresolved"
+        entry["review_invalidation"] = "Previous automatic TeX lacks matching generated provenance."
+        return entry
+    entry["tex"] = str(previous.get("tex") or generated_tex)
+    entry["review_status"] = status
+    return entry
+
+
 def build_math_review(
     elements: list[dict[str, Any]],
     source_sha256: str,
     existing: dict[str, Any] | None = None,
+    *,
+    boundary: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Create a hash-bound native-math review gate without losing decisions."""
     previous_entries = (
         dict(existing.get("entries") or {})
         if isinstance(existing, dict)
-        and existing.get("source_sha256") == source_sha256
         else {}
     )
+    same_pdf = isinstance(existing, dict) and existing.get("source_sha256") == source_sha256
     entries: dict[str, dict[str, Any]] = {}
     translatable_orders = [
         int(element["order"])
@@ -2452,102 +2528,82 @@ def build_math_review(
             fragment["display"] = False
             fragment["source_page"] = int(element.get("page") or 0)
             status = str(fragment.get("review_status") or "unresolved")
-            previous = dict(previous_entries.get(token) or {})
-            if (
-                previous
-                and (
-                    int(previous.get("source_page") or 0)
-                    != int(element.get("page") or 0)
-                    or str(previous.get("source_text") or "")
-                    != str(fragment.get("text") or "")
-                )
-            ):
-                previous = {}
-            entries[token] = {
+            generated = {
                 "kind": "inline",
                 "display": False,
                 "source_page": int(element.get("page") or 0),
                 "source_bbox": fragment.get("source_bbox"),
                 "source_text": str(fragment.get("text") or ""),
-                "tex": str(previous.get("tex") or fragment.get("tex") or ""),
-                "review_status": str(
-                    previous.get("review_status") or status
-                ),
+                "tex": str(fragment.get("tex") or ""),
+                "review_status": status,
+                "source_fingerprint": _math_source_fingerprint({
+                    "source_sha256": source_sha256, "unit_id": element["id"],
+                    "unit_source_text": str(element.get("source_text") or ""),
+                    "source_text": fragment.get("text"),
+                    "source_page": element.get("page"),
+                    "source_bbox": fragment.get("source_bbox"),
+                    "source_runs": fragment.get("runs") or [],
+                }),
             }
+            entries[token] = _reconcile_math_entry(
+                generated, dict(previous_entries.get(token) or {}), same_pdf=same_pdf)
 
-    groups: list[list[dict[str, Any]]] = []
-    current: list[dict[str, Any]] = []
-    for element in sorted(elements, key=lambda item: int(item["order"])):
+    body: list[dict[str, Any]] = []
+    for element in elements:
         order = int(element["order"])
         is_in_translation = (
             translation_start is None
             or translation_stop is None
             or translation_start <= order <= translation_stop
         )
-        is_clip = (
-            is_in_translation
-            and not element.get("render_suppressed")
-            and element.get("render_mode") == "source_clip"
-            and element.get("kind") == "equation"
-        )
-        same_page = (
-            current
-            and int(current[-1]["page"]) == int(element.get("page") or 0)
-        )
-        same_visual_group = (
-            current
-            and str(current[-1].get("visual_id") or "")
-            == str(element.get("visual_id") or "")
-        )
-        if is_clip and (not current or (same_page and same_visual_group)):
-            current.append(element)
-            continue
-        if current:
-            groups.append(current)
-            current = []
-        if is_clip:
-            current = [element]
-    if current:
-        groups.append(current)
-
+        if is_in_translation:
+            body.append(element)
+    if boundary is not None:
+        body = select_body_units(elements, {"boundary": boundary})
+    invalidations: list[dict[str, Any]] = []
+    groups = default_display_groups(body, previous_entries if same_pdf else None,
+                                    invalidations=invalidations)
+    for invalidation in invalidations:
+        previous = previous_entries.get(str(invalidation["review_id"])) or {}
+        invalidation["previous_review_tex"] = str(previous.get("tex") or "")
     for group in groups:
-        if not any(item.get("kind") == "equation" for item in group):
-            continue
-        entry_id = str(group[0]["id"])
+        owner = next(item for item in group if item.get("kind") == "equation"
+                     and not item.get("render_suppressed"))
+        entry_id = str(owner["id"])
         source_box = pymupdf.Rect(group[0]["bbox"])
         for item in group[1:]:
             source_box |= pymupdf.Rect(item["bbox"])
-        previous = dict(previous_entries.get(entry_id) or {})
         source_ids = [str(item["id"]) for item in group]
         source_text = " ".join(
             str(item.get("source_text") or "").strip()
             for item in group
             if str(item.get("source_text") or "").strip()
         )
-        if previous and (
-            list(previous.get("source_ids") or []) != source_ids
-            or int(previous.get("source_page") or 0) != int(group[0]["page"])
-            or str(previous.get("source_text") or "") != source_text
-        ):
-            previous = {}
-        entries[entry_id] = {
+        generated = {
             "kind": "display",
             "display": True,
             "source_page": int(group[0]["page"]),
             "source_bbox": rect_list(source_box),
             "source_ids": source_ids,
             "source_text": source_text,
-            "tex": str(previous.get("tex") or ""),
-            "review_status": str(
-                previous.get("review_status") or "unresolved"
-            ),
+            "tex": "",
+            "review_status": "unresolved",
+            "source_fingerprint": _math_source_fingerprint({
+                "source_sha256": source_sha256,
+                "source_units": [{field: item.get(field) for field in
+                                  ("id", "page", "bbox", "source_text", "span_runs",
+                                   "kind", "render_suppressed")} for item in group],
+            }),
         }
+        entries[entry_id] = _reconcile_math_entry(
+            generated, dict(previous_entries.get(entry_id) or {}), same_pdf=same_pdf)
 
     return {
         "schema_version": 1,
         "source_sha256": source_sha256,
         "math_profile": "native-lualatex-v1",
         "entries": entries,
+        "invalidated_reviews": invalidations,
     }
 
 
@@ -2617,9 +2673,14 @@ def visual_label(text: str) -> tuple[str, str] | None:
     raw_kind = str(
         match.group("latin_kind") or match.group("cjk_kind") or ""
     ).casefold()
-    kind = "table" if raw_kind in {"table", "表"} else "figure"
+    label_kind = {
+        "table": "table", "表": "table",
+        "algorithm": "algorithm", "算法": "algorithm",
+        "listing": "listing",
+    }.get(raw_kind, "figure")
+    kind = "table" if label_kind == "table" else "figure"
     number = str(match.group("number")).upper()
-    return kind, f"{kind}-{number}"
+    return kind, f"{label_kind}-{number}"
 
 
 def source_body_font_size(elements: list[dict[str, Any]]) -> float:
@@ -2974,6 +3035,7 @@ def main() -> int:
         )
 
     repeated_headers = mark_repeated_running_text(all_elements, page_records)
+    source_structure.annotate_source_flow(all_elements)
     boundary = apply_translation_boundary(all_elements)
     review_path = (
         args.boundary_review.expanduser().resolve()
@@ -3003,10 +3065,8 @@ def main() -> int:
                 raise SystemExit(f"Invalid boundary review: {error}") from error
     else:
         review_path.parent.mkdir(parents=True, exist_ok=True)
-        json_dump(
-            review_path,
-            make_boundary_review(all_elements, boundary, source_hash_before),
-        )
+        review = make_boundary_review(all_elements, boundary, source_hash_before)
+        json_dump(review_path, review)
     source_review_path = (
         args.source_review.expanduser().resolve()
         if args.source_review
@@ -3044,6 +3104,7 @@ def main() -> int:
         all_elements,
         source_hash_before,
         existing_math_review,
+        boundary=boundary,
     )
     json_dump(math_review_path, math_review)
     footnote_links = link_footnote_anchors(all_elements)
@@ -3064,6 +3125,8 @@ def main() -> int:
         source_errors,
         source_warnings,
     )
+    source_review_report["issues"] = source_review.structured_source_issues(all_elements, visual_layout)
+    source_review_report["math_review_invalidations"] = math_review["invalidated_reviews"]
     source_review_report_path = work_dir / "source-review-report.json"
     json_dump(source_review_report_path, source_review_report)
     units_path = work_dir / "translation-units.jsonl"
@@ -3080,6 +3143,7 @@ def main() -> int:
                 "protected_tokens": element["protected_tokens"],
                 "inline_fragments": element.get("inline_fragments", {}),
                 "style_tokens": element.get("style_tokens", {}),
+                **source_structure.flow_metadata(element),
                 "translated_text": "",
             }
             for element in all_elements
@@ -3106,6 +3170,7 @@ def main() -> int:
 
     manifest = {
         "schema_version": 5,
+        "assignment_protocol_version": 1,
         "created_by": "prepare_paper.py",
         "translation_engine": "active-codex-model-only",
         "source_pdf": str(source),
@@ -3118,6 +3183,7 @@ def main() -> int:
         "partial_run": process_count != page_count,
         "pages": page_records,
         "boundary": boundary,
+        "boundary_review_sha256": _math_source_fingerprint(review),
         "translatable_unit_count": sum(
             1 for element in all_elements if element["translatable"]
         ),

@@ -57,8 +57,8 @@ not permit concurrent writes to a canonical checkpoint or shared review file.
 
 ## Dependencies and safe parallel work
 
-1. Resolve the source and content boundary, then freeze the reviewed source
-   units and protected tokens before assigning translation. Source-review
+1. Resolve the source boundary, source flow, display ownership and glossary;
+   pass `paper_preflight.py`, then freeze units and tokens. Source-review
    inspection can run alongside independent metadata inspection; their proposed
    corrections still merge through the coordinator.
 2. Assign one translation agent by default. For a large document, independent
@@ -96,12 +96,33 @@ findings. Do not paste translated batches or full logs into agent messages.
 After handoff the owner stays idle until a repair or next batch is assigned;
 the coordinator does not request duplicate completion summaries or hashes.
 
+Prefer completion notifications and bounded waits of 30–60 seconds when no
+independent work remains. Read logs/status for a concrete new question, failure,
+or completion, rather than requesting unchanged summaries. Give cross-file
+generator defects to a diagnostic role under reasoning-policy.md; do not
+escalate the whole paper merely because routine production found a hard bug.
+
 Use the existing per-paper checkpoint (and batch ledger when applicable), recording
 the stage/next action, source and relevant input hashes, exact pending batch IDs,
 worker/output ownership, accepted artifact/report paths, and open findings. These
 are recovery metadata, not a second translation state. `translations.jsonl`
 remains authoritative. Record elapsed time, repair rounds, and token usage only
 when measured; do not manufacture token counts from characters or file size.
+
+## Recovery pointer
+
+Use one `<paper-root>/run-state.json`, or configure the existing equivalent via
+`manifest.paths.run_state`. `paper_state.py --manifest <manifest>` reads it;
+`--stage <stage> --next-action "..."` updates it. Optional `--fields <json>` accepts
+assignments, input hashes, accepted reports, open findings, repair revision and
+batch progress. This is metadata, never a duplicate Chinese-text ledger.
+
+Record the source hash, active revision manifest, stage, role/output ownership,
+accepted artifact identities, open findings and exact next action. Update after
+accepted batches, stage transitions, accepted repair revisions and before
+compaction. New checkpoint merges update progress automatically. Source repair
+publishes a new isolated revision and moves the same pointer; previous candidates
+remain available. Resume via `active_manifest` before reading root-level text.
 
 ## Continuity and unavailable tools
 

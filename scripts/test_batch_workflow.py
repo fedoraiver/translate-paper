@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest import mock
 
 import batch_workflow
+from test_paper_preflight import add_readiness_inputs, write_ready_report
 
 
 def write_json(path: Path, payload: dict) -> None:
@@ -122,6 +123,28 @@ class BatchWorkflowTests(unittest.TestCase):
             "pages": [{"page": 1, "status": "pass", "image": "page-0001.png",
                        "checks": ["Margins and text legible."], "findings": []}],
         })
+        add_readiness_inputs(work / "manifest.json")
+
+    def test_prepared_stage_requires_current_passing_preflight(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_batch(root)
+            self.make_validated_artifacts(root)
+            work = root / "work"
+            source_hash = sha256(root / "source.pdf")
+            self.assertTrue(batch_workflow._manifest_prepared(work, source_hash))
+            report = work / "paper-preflight.json"
+            report.unlink()
+            self.assertFalse(batch_workflow._manifest_prepared(work, source_hash))
+            write_ready_report(work / "manifest.json")
+            payload = json.loads(report.read_text(encoding="utf-8"))
+            payload["status"] = "fail"
+            write_json(report, payload)
+            self.assertFalse(batch_workflow._manifest_prepared(work, source_hash))
+            write_ready_report(work / "manifest.json")
+            units = work / "translation-units.jsonl"
+            units.write_text(units.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+            self.assertFalse(batch_workflow._manifest_prepared(work, source_hash))
 
     def test_visual_review_is_required_and_bound_to_packaged_pdf(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

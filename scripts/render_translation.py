@@ -610,10 +610,42 @@ def normalize_body_text(text: str) -> str:
     return re.sub(r"[ \t]+", " ", text).strip()
 
 
+def preserve_list_breaks(text: str, element: dict[str, Any]) -> str:
+    """Mark source list item boundaries before prose whitespace is normalized."""
+    fragments = element.get("inline_fragments") or {}
+    def prose_after_list(match: re.Match[str]) -> str:
+        remaining = text[match.end():]
+        if re.search(r"\n\s*[•●▪◦‣*\-]", remaining):
+            return match.group(0)
+        return "[[PAR]]"
+    text = re.sub(r"(?<=。)\s*\n+\s*(?=[\u3400-\u9fff])", prose_after_list, text)
+    def boundary(match: re.Match[str]) -> str:
+        marker = match.group(1)
+        label = str(fragments.get(marker, {}).get("text") or marker)
+        if re.match(r"^(?:[•●▪◦‣*-]|\d{1,3}[.)、])", label):
+            return "[[PAR]]" + marker
+        return match.group(0)
+    text = re.sub(r"\s*\n+\s*(\[\[F[A-Za-z0-9_]+\]\]|[•●▪◦‣*\-]|\d{1,3}[.)、])",
+                  boundary, text)
+    def numbered_after_equation(match: re.Match[str]) -> str:
+        equation, marker = match.group(1), match.group(3)
+        previous = str(fragments.get(equation, {}).get("text") or "")
+        label = str(fragments.get(marker, {}).get("text") or "")
+        if re.fullmatch(r"\(\d+\)", previous.strip()) and re.match(r"^\d{1,3}[.)、]", label):
+            return equation + "[[PAR]]"
+        return equation + match.group(2)
+    return re.sub(r"(\[\[F[A-Za-z0-9_]+\]\])(\s+)(?=(\[\[F[A-Za-z0-9_]+\]\]))",
+                  numbered_after_equation, text)
+
+
 def flow_role(element: dict[str, Any], text: str) -> str:
     if element.get("kind") == "heading":
         return "heading"
     if element.get("translatable") and element.get("kind") == "body":
+        source_role = element.get("flow_role")
+        if source_role in {"paragraph", "list_item", "list_continuation"}:
+            return {"paragraph": "paragraph-start", "list_item": "list-item",
+                    "list_continuation": "list-continuation"}[source_role]
         source = str(element.get("source_text") or "")
         if LIST_RE.match(text) or LIST_RE.match(source):
             return "list-item"
@@ -626,6 +658,13 @@ def flow_role(element: dict[str, Any], text: str) -> str:
 def is_logical_continuation(
     previous_node: dict[str, Any], element: dict[str, Any], role: str
 ) -> bool:
+    source_role = element.get("flow_role")
+    if source_role in {"list_item", "list_continuation"} or (
+        source_role == "paragraph" and element.get("flow_reviewed")
+    ):
+        return False
+    if source_role == "paragraph" and previous_node.get("flow_role") in {"list-item", "list-continuation"}:
+        return False
     if role != "paragraph-start":
         return False
     if previous_node.get("flow_role") not in {
@@ -757,7 +796,7 @@ def continuation_after_visuals(
     nodes: list[dict[str, Any]], element: dict[str, Any], role: str,
 ) -> dict[str, Any]:
     """Keep a page-spanning sentence flush left without moving its visual."""
-    if role != "paragraph-start":
+    if role != "paragraph-start" or (element.get("flow_role") == "paragraph" and element.get("flow_reviewed")):
         return {}
     visual_nodes: list[dict[str, Any]] = []
     for previous in reversed(nodes):
@@ -792,11 +831,30 @@ def continuation_after_visuals(
 
 
 def build_flow_nodes(
-    elements: list[dict[str, Any]], rendered_text: dict[str, str]
+    elements: list[dict[str, Any]], rendered_text: dict[str, str],
+    display_plan: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     nodes: list[dict[str, Any]] = []
     flow_section: str | None = None
+    display_owners = {group["review_id"]: group for group in display_plan or []}
+    display_members = {unit_id for group in display_plan or [] for unit_id in group["source_ids"]}
     for element in sorted(elements, key=lambda item: int(item["order"])):
+        unit_id = str(element["id"])
+        if unit_id in display_members:
+            if unit_id not in display_owners:
+                continue
+            group = display_owners[unit_id]
+            parts = list(group["elements"])
+            union = pymupdf.Rect(parts[0]["bbox"])
+            for part in parts[1:]:
+                union |= pymupdf.Rect(part["bbox"])
+            nodes.append({
+                "id": unit_id, "ids": list(group["source_ids"]), "elements": parts,
+                "element": {**element, "bbox": list(union)},
+                "render_mode": "source_clip", "flow_role": "display-math",
+                "math_review_id": group["review_id"], "composite_parts": len(parts),
+            })
+            continue
         if (
             element.get("kind") in {"header", "footer"}
             or element.get("render_suppressed")
@@ -839,12 +897,10 @@ def build_flow_nodes(
                     )
                 )
                 and (
-                    any(
-                        str(part.get("kind") or "") == "equation"
-                        for part in nodes[-1].get("elements", [])
-                    )
+                    # Equations are grouped only by explicit reviewed ownership.
+                    element.get("kind") != "equation"
+                    and not any(part.get("kind") == "equation" for part in nodes[-1].get("elements", []))
                 )
-                == (str(element.get("kind") or "") == "equation")
             ):
                 previous = nodes[-1]
                 union = pymupdf.Rect(previous["element"]["bbox"])
@@ -873,12 +929,15 @@ def build_flow_nodes(
             continue
 
         raw_text = str(rendered_text[element["id"]])
+        if flow_role(element, raw_text) == "list-item" and not element.get("flow_role"):
+            raw_text = preserve_list_breaks(raw_text, element)
         text = (
             normalize_heading_text(raw_text)
             if element.get("kind") == "heading"
             else normalize_body_text(raw_text)
         )
         role = flow_role(element, text)
+        structured = element.get("flow_role") in {"paragraph", "list_item", "list_continuation"}
         # Anchored notes are page furniture, not intervening body paragraphs.
         previous_body = next(
             (node for node in reversed(nodes)
@@ -886,7 +945,13 @@ def build_flow_nodes(
              or not node.get("element", {}).get("anchor_id")),
             None,
         )
-        if previous_body and is_logical_continuation(previous_body, element, role):
+        list_continuation = (
+            structured and role == "list-continuation" and previous_body
+            and previous_body.get("flow_role") in {"list-item", "list-continuation"}
+            and previous_body.get("list_id") == element.get("list_id")
+            and previous_body.get("list_level") == element.get("list_level")
+        )
+        if previous_body and (list_continuation or is_logical_continuation(previous_body, element, role)):
             previous = previous_body
             append_text_continuation(previous, text, element)
             previous["ids"].append(element["id"])
@@ -908,6 +973,11 @@ def build_flow_nodes(
                     "block_style": str(element.get("block_style") or "normal"),
                 }],
                 "joined_continuations": 0,
+                **({"source_flow_role": element["flow_role"],
+                    "flow_reviewed": bool(element.get("flow_reviewed")),
+                    "list_id": element.get("list_id"), "list_level": element.get("list_level"),
+                    "source_marker": element.get("source_marker", "")}
+                   if structured else {}),
                 **continuation_after_visuals(nodes, element, role),
             }
         )
@@ -2114,6 +2184,17 @@ def main() -> int:
             "Translation boundaries require review. Correct the JSONL and "
             "manifest before rendering."
         )
+    from paper_preflight import assert_source_ready
+    from paper_state import read_state, state_path, update_state
+
+    try:
+        readiness = assert_source_ready(manifest_path)
+        track_state = (int(manifest.get("assignment_protocol_version") or 0) >= 1
+                       or state_path(manifest_path, manifest).exists())
+        if track_state:
+            read_state(manifest_path)
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
 
     source_path = Path(manifest["source_pdf"])
     if sha256_file(source_path) != manifest["source_sha256"]:
@@ -2164,10 +2245,14 @@ def main() -> int:
     except ValueError as error:
         source.close()
         raise SystemExit(str(error)) from error
-    nodes = build_flow_nodes(body_elements, rendered_text)
-    from native_latex import MathReviewError, render_native_latex
+    from native_latex import MathReviewError, load_math_review, render_native_latex
+    from display_plan import build_display_plan
 
     try:
+        review_path = manifest_path.parent / str((manifest.get("paths") or {}).get("math_review") or "math-review.json")
+        reviews = load_math_review(review_path, str(manifest["source_sha256"]))
+        display_plan = build_display_plan(body_elements, reviews)
+        nodes = build_flow_nodes(body_elements, rendered_text, display_plan=display_plan)
         render_native_latex(
             manifest=manifest,
             manifest_path=manifest_path,
@@ -2182,6 +2267,7 @@ def main() -> int:
             profile=PROFILE,
             typography_profile=TYPOGRAPHY_PROFILE,
             columns=columns,
+            display_plan=display_plan,
         )
     except (MathReviewError, RuntimeError, ValueError) as error:
         source.close()
@@ -2191,6 +2277,15 @@ def main() -> int:
         output.unlink(missing_ok=True)
         output.with_suffix(".layout.json").unlink(missing_ok=True)
         raise SystemExit("Source PDF changed while rendering; output removed.")
+    if track_state:
+        input_hashes = dict(read_state(manifest_path).get("input_hashes") or {})
+        input_hashes.update((readiness.get("source_fingerprint") or {}).get("inputs") or {})
+        input_hashes.update({"translations": sha256_file(translations_path),
+                             "produced_pdf": sha256_file(output),
+                             "produced_layout": sha256_file(output.with_suffix(".layout.json"))})
+        update_state(manifest_path, stage="produced",
+                     next_action="Run strict/quick checks and producer repair-locus inspection",
+                     input_hashes=input_hashes)
     print(output)
     return 0
 

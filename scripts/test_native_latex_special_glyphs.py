@@ -21,6 +21,91 @@ from typography import ZH_ACADEMIC_V1
 
 
 class NativeSpecialGlyphTests(unittest.TestCase):
+    def test_sentence_within_bullet_stays_with_item_before_next_bullet(self):
+        element = {"id": "list", "order": 1, "page": 1, "bbox": [0, 0, 400, 100],
+                   "kind": "body", "render_mode": "text", "translatable": True,
+                   "source_text": "• Config.\nIn particular details;\n• Disabled."}
+        node = render_translation.build_flow_nodes(
+            [element], {"list": "• 配置。\n特别地，配置更新；\n• 禁用。"})[0]
+        content, _ = native_latex._node_to_latex(node, {}, Counter(), None, Path("."), ZH_ACADEMIC_V1, {})
+        self.assertEqual(content.count(r"\hangindent"), 2, content)
+        self.assertNotIn(r"\par 特别地", content)
+
+    def test_prose_after_finished_bullet_is_normal_paragraph(self):
+        element = {"id": "list", "order": 1, "page": 1, "bbox": [0, 0, 400, 100],
+                   "kind": "body", "render_mode": "text", "translatable": True,
+                   "source_text": "• Item.\nNext paragraph."}
+        node = render_translation.build_flow_nodes(
+            [element], {"list": "• 一项。\n随后继续论证。"})[0]
+        content, _ = native_latex._node_to_latex(node, {}, Counter(), None, Path("."), ZH_ACADEMIC_V1, {})
+        self.assertIn("\\par 随后继续论证。\\par", content)
+        self.assertEqual(content.count(r"\hangindent"), 1)
+
+    def test_item_after_extracted_equation_number_starts_new_paragraph(self):
+        fragments = {key: {"kind": "math", "text": label, "tex": label,
+                           "review_status": "auto_validated"}
+                     for key, label in [("[[Fone]]", "1."), ("[[Feq]]", "x=y"),
+                                        ("[[Fnum]]", "(39)"), ("[[Ftwo]]", "2.")]}
+        element = {"id": "list", "order": 1, "page": 1, "bbox": [0, 0, 400, 100],
+                   "kind": "body", "render_mode": "text", "translatable": True,
+                   "source_text": "1. First equation (39) 2. Second",
+                   "inline_fragments": fragments}
+        text = "[[Fone]] First\n[[Feq]] [[Fnum]] [[Ftwo]] Second"
+        node = render_translation.build_flow_nodes([element], {"list": text})[0]
+        content, _ = native_latex._node_to_latex(node, {}, Counter(), None, Path("."), ZH_ACADEMIC_V1, {})
+        self.assertEqual(content.count(r"\par\noindent"), 2, content)
+        self.assertIn(r"\((39)\)\par", content)
+
+    def test_list_boundaries_survive_full_flow_normalization(self):
+        for text, fragments, count in [
+            ("• One\n• Two", {}, 2),
+            ("[[Fone]] One\n[[Ftwo]] Two", {
+                "[[Fone]]": {"kind": "math", "text": "1.", "tex": "1.",
+                             "review_status": "auto_validated"},
+                "[[Ftwo]]": {"kind": "math", "text": "2.", "tex": "2.",
+                             "review_status": "auto_validated"}}, 2),
+        ]:
+            element = {"id": "list", "order": 1, "page": 1,
+                       "bbox": [50, 50, 400, 100], "kind": "body",
+                       "render_mode": "text", "translatable": True,
+                       "source_text": "1. One\n2. Two", "inline_fragments": fragments}
+            nodes = render_translation.build_flow_nodes([element], {"list": text})
+            content, _ = native_latex._node_to_latex(
+                nodes[0], {}, Counter(), None, Path("."), ZH_ACADEMIC_V1, {})
+            self.assertEqual(content.count(r"\par\noindent"), count, content)
+
+    def test_list_items_start_separate_paragraphs_including_tokenized_numbers(self):
+        element = {"inline_fragments": {"[[Ftwo]]": {
+            "kind": "math", "text": "2.", "tex": "2.",
+            "review_status": "auto_validated"}}}
+        node = {"id": "list", "flow_role": "list-item", "element": element,
+                "text": "• Parent\n• Next\n‣ Nested\n[[Ftwo]]Numbered"}
+        content, _ = native_latex._node_to_latex(
+            node, {}, Counter(), None, Path("."), ZH_ACADEMIC_V1, {})
+        self.assertEqual(content.count(r"\par\noindent"), 4)
+        self.assertIn(r"\hspace*{23pt}\hangindent=46pt", content)
+        self.assertIn(r"\(2.\)Numbered", content)
+
+    @unittest.skipUnless(shutil.which("lualatex"), "LuaLaTeX is unavailable")
+    def test_nested_triangular_bullet_is_preserved_without_missing_glyphs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            node = {"id": "list", "flow_role": "list-item", "element": {},
+                    "text": "• Parent\n‣ Child"}
+            content, _ = native_latex._node_to_latex(
+                node, {}, Counter(), None, work, ZH_ACADEMIC_V1, {})
+            self.assertIn(r"\hangindent=23pt", content)
+            self.assertIn(r"\TPTextSymbol{‣}", content)
+            path = work / "nested-list.tex"
+            path.write_text(native_latex._document_preamble(ZH_ACADEMIC_V1)
+                            + content + r"\end{document}", encoding="utf-8")
+            pdf, metrics = native_latex.compile_body_tex(work, path)
+            self.assertEqual(metrics["missing_glyphs"], 0)
+            with pymupdf.open(pdf) as document:
+                text = "".join(page.get_text() for page in document)
+                self.assertIn("‣", text)
+                self.assertIn("Child", text)
+
     def test_url_path_is_not_reinterpreted_as_automatic_mathematics(self):
         url = "https://example.test/a1/ui/b2?x=1&y=2#part"
         self.assertEqual(native_latex.prose_to_latex(url, allow_auto_math=True),

@@ -1,0 +1,15 @@
+{
+  "flow": [
+    {"id":"intro", "order":1, "source_text":"The following source cases are distinct.", "bbox":[50,70,350,82], "expected_role":"paragraph", "expected_level":0},
+    {"id":"first", "order":2, "source_text":"1. First source item.", "bbox":[50,90,350,102], "marker":"1.", "content_x":66, "expected_role":"list_item", "expected_level":0},
+    {"id":"continuation", "order":3, "source_text":"Its source explanation continues here.", "bbox":[66,106,350,118], "expected_role":"list_continuation", "expected_level":0},
+    {"id":"nested", "order":4, "source_text":"(a) Nested source item.", "bbox":[80,124,350,136], "marker":"(a)", "content_x":101, "expected_role":"list_item", "expected_level":1},
+    {"id":"second", "order":5, "source_text":"2. Second source item.", "bbox":[50,142,350,154], "marker":"2.", "content_x":66, "expected_role":"list_item", "expected_level":0},
+    {"id":"after", "order":6, "source_text":"The argument resumes as an ordinary paragraph.", "bbox":[50,172,350,184], "expected_role":"paragraph", "expected_level":0}
+  ],
+  "mixed": [
+    {"source_text":"1. First item.\n2. Second item.", "lines":["1. First item.","2. Second item."]},
+    {"source_text":"The cases follow.\n• First item.", "lines":["The cases follow.","• First item."]},
+    {"source_text":"1. First item. 2. Second item.", "lines":["1. First item. 2. Second item."]}
+  ]
+}

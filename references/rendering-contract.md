@@ -86,6 +86,12 @@ acknowledgements, appendices, or references from extracted text.
 
 ## Default Chinese typography
 
+Use reviewed source flow metadata for list items, continuations and ordinary
+paragraphs. Do not infer list termination from Chinese punctuation. Standalone
+display equations retain their exact reviewed source ownership even when the
+extractor placed suppressed labels between adjacent equations. All exporters
+and validators must agree on that ownership; report each consumed review ID.
+
 Use the general `zh-academic-v1` profile for translated PDFs:
 
 - A4 pages with 53pt left/right, 48.5pt top, and 55.5pt bottom margins;

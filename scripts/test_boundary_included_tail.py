@@ -11,6 +11,25 @@ from check_translation import validate_boundary_layout
 
 
 class IncludedTailTests(unittest.TestCase):
+    def test_boundary_rounding_tolerance_rejects_real_overflow(self):
+        with pymupdf.open() as source, pymupdf.open() as output:
+            source.new_page(width=595.2755737, height=841.8897705)
+            output.new_page(width=595.2755737, height=841.8897705)
+            output.new_page()
+            segment = {"role": "front-original", "mode": "full-page",
+                       "source_page": 1, "output_page": 1,
+                       "source_bbox": [0, 0, 595.276, 841.89],
+                       "target_bbox": [0, 0, 595.276, 841.89]}
+            layout = {"boundary_layout": {"profile": "original-front-translated-body-original-tail",
+                      "translation_page_start": 2, "translation_page_end": 2,
+                      "segments": [segment]}}
+            errors, _ = validate_boundary_layout(source, output, layout)
+            self.assertFalse(any("crop exceeds" in e for e in errors), errors)
+            segment["source_bbox"][2] += 0.1
+            segment["target_bbox"][2] += 0.1
+            errors, _ = validate_boundary_layout(source, output, layout)
+            self.assertEqual(sum("crop exceeds" in e for e in errors), 2)
+
     def test_explicitly_included_final_caption_stays_in_body(self):
         elements = [
             {"id": "intro", "order": 1, "page": 1,

@@ -133,6 +133,36 @@ class NativeClipLayoutTests(unittest.TestCase):
                     manifest, root / "manifest.json", layout, output)
                 self.assertTrue(any("font calibration" in e for e in errors), errors)
 
+    def test_text_caption_merged_into_tall_clip_calibrates_combined_envelope(self):
+        node, figure, caption = self.composite_caption([50, 600, 250, 640])
+        caption["render_mode"] = "text"
+        node["elements"][1]["render_mode"] = "text"
+        with tempfile.TemporaryDirectory() as directory, pymupdf.open() as source:
+            root = Path(directory)
+            source.new_page(width=612, height=792)
+            _, stubs, _ = native_latex.build_body_tex([node], {}, ZH_ACADEMIC_V1, source, root)
+            stub = stubs[0]
+            placement = {**stub, "output_page": 1,
+                         "bbox": [100, 100, 100 + stub["target_width_pt"],
+                                  100 + stub["target_height_pt"]]}
+            visual = native_latex.visual_placement_report(placement)
+            (root / "visual-layout.json").write_text(json.dumps({
+                "source_sha256": "hash", "visuals": [node["visual_layout"]]}), encoding="utf-8")
+            (root / "units.jsonl").write_text(
+                "\n".join(json.dumps(e) for e in [figure, caption]), encoding="utf-8")
+            manifest = {"source_sha256": "hash", "paths": {
+                "visual_layout": "visual-layout.json", "translation_units": "units.jsonl"}}
+            layout = {"placements": [placement], "visual_layout": {"placements": [visual]}}
+            with pymupdf.open() as output:
+                output.new_page(width=595.276, height=841.89)
+                errors, _, _ = check_translation.validate_visual_layout(
+                    manifest, root / "manifest.json", layout, output)
+                self.assertEqual(errors, [])
+                placement["source_bbox"] = figure["bbox"]
+                errors, _, _ = check_translation.validate_visual_layout(
+                    manifest, root / "manifest.json", layout, output)
+                self.assertTrue(any("caption source region" in e for e in errors), errors)
+
     def test_blank_source_padding_is_not_copied_to_output(self):
         with tempfile.TemporaryDirectory() as directory:
             directory = Path(directory)

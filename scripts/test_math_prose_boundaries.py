@@ -22,6 +22,88 @@ def span(text: str, style: str = "text", font: str = "Times-Roman", **kw):
 
 
 class MathProseBoundariesTests(unittest.TestCase):
+    def test_literal_set_braces_survive_raw_math_span_decoding(self):
+        for font in ("NewCMMath-Book", "CMR10", "CMMI10", "UnknownMath-Regular"):
+            with self.subTest(font=font):
+                self.assertEqual(
+                    prepare_paper.math_run_tex(span("{1,…,n}", "math", font)),
+                    r"\{1,…,n\}",
+                )
+        self.assertEqual(
+            prepare_paper.math_run_tex(span("{dom(𝜎)}", "math", "NewCMMath-Book")),
+            r"\{\mathrm{dom}(𝜎)\}",
+        )
+        _, markdown = prepare_paper.math_markup([
+            span("{1,…,n}", "math", "NewCMMath-Book")])
+        self.assertEqual(markdown, r"$\{1,…,n\}$")
+
+    def test_literal_brace_escaping_preserves_tex_commands_and_glyphs(self):
+        for value in (r"\mathrm{track}", r"\sqrt{x+y}", r"\{x\}",
+                      r"\left\{x\right\}", r"\Gamma", "𝑥+𝜎"):
+            with self.subTest(value=value):
+                self.assertEqual(
+                    prepare_paper.math_run_tex(span(value, "math", "NewCMMath-Book")), value)
+        self.assertEqual(
+            prepare_paper.math_run_tex(span("A", "math", "CMSY10")), r"\mathcal{A}")
+        self.assertEqual(
+            prepare_paper.math_run_tex(span("ˆ", "math", "CMR10")), r"\widehatmark{}")
+
+    def test_unicode_math_fonts_keep_basic_latin_names_upright(self):
+        for font in ("NewCMMath-Book", "LatinModernMath-Regular", "STIXTwoMath-Regular", "CambriaMath"):
+            for name in ("track", "pr", "id", "dom", "installed", "target", "anotherName"):
+                with self.subTest(font=font, name=name):
+                    self.assertEqual(
+                        prepare_paper.math_run_tex(span(name, "math", font, flags=4)),
+                        rf"\mathrm{{{name}}}",
+                    )
+        self.assertEqual(
+            prepare_paper.math_run_tex(span("𝑘∈dom(𝜎)", "math", "NewCMMath-Book", flags=4)),
+            r"𝑘∈\mathrm{dom}(𝜎)",
+        )
+        _, markdown = prepare_paper.math_markup([
+            span("track", "math", "NewCMMath-Book", flags=4),
+            span("Γ", "math", "NewCMMath-Book", flags=5, size=7, origin=[25, 12]),
+        ])
+        self.assertEqual(markdown, r"$\mathrm{track}_{\Gamma}$")
+
+    def test_upright_name_decoding_does_not_reinterpret_variables_or_tex(self):
+        for value, font, flags in (
+            ("track", "CMMI10", 4),
+            ("xy", "CMMI10", 4),
+            ("track", "NewCMMath-Book", 6),
+            ("track", "NewCMMath-Italic", 4),
+            ("track", "UnknownMath-Regular", 4),
+            ("𝑡𝑟𝑎𝑐𝑘", "NewCMMath-Book", 4),
+            ("𝒯𝔽𝑥", "NewCMMath-Book", 4),
+            ("x+y", "NewCMMath-Book", 4),
+            (r"\operatorname{track}", "NewCMMath-Book", 4),
+        ):
+            with self.subTest(value=value, font=font, flags=flags):
+                self.assertEqual(
+                    prepare_paper.math_run_tex(span(value, "math", font, flags=flags)), value)
+
+    def test_span_location_normalizes_nbsp_without_reusing_earlier_word(self):
+        source = "Earlier effects. See\u00a01. effectiter"
+        runs = [span("Earlier effects."), span("See\u00a01. "),
+                span("effect", "math", "NewCMMath-Book"),
+                span("iter", "math", "NewCMMath-Book", size=7)]
+        located = prepare_paper.locate_span_runs(source, runs)
+        self.assertEqual(len(located), len(runs))
+        self.assertEqual(located[1]["text"], "See\u00a01.")
+        self.assertEqual(located[2]["start"], source.rindex("effect"))
+        for run in located:
+            self.assertEqual(source[run["start"]:run["end"]], run["text"])
+
+    def test_span_location_preserves_offsets_across_collapsed_whitespace(self):
+        source = "Intro\t \u00a0term\r\n  x"
+        located = prepare_paper.locate_span_runs(
+            source, [span("Intro term"), span("x", "math")]
+        )
+        self.assertEqual(located[0]["start"], 0)
+        self.assertEqual(located[0]["end"], source.index("\r"))
+        self.assertEqual(located[0]["text"], source[:source.index("\r")])
+        self.assertEqual(located[1]["start"], source.index("x"))
+
     def test_explicit_reviewed_math_keeps_single_variables(self):
         _, _, fragments, _ = prepare_paper.build_rich_protection(
             "for n", [span("for", semantic_kind="prose"),

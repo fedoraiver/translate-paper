@@ -17,6 +17,7 @@ from typing import Any
 
 import zotero_ingest
 from check_visual_review import check_review_bundle
+from paper_preflight import assert_source_ready
 
 SCHEMA_VERSION = 1
 STAGES = (
@@ -230,12 +231,19 @@ def _manifest_prepared(path: Path, source_sha256: str) -> bool:
     if not manifest_path.is_file():
         return False
     manifest = _read_json(manifest_path)
-    return (
+    reviewed = (
         manifest.get("source_sha256") == source_sha256
         and not bool((manifest.get("boundary") or {}).get("needs_boundary_review"))
         and (manifest.get("source_review") or {}).get("status") == "pass"
         and (manifest.get("visual_inventory") or {}).get("status") == "pass"
     )
+    if not reviewed:
+        return False
+    try:
+        assert_source_ready(manifest_path)
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+    return True
 
 
 def _strict_validation_passes(paths: dict[str, Path]) -> bool:

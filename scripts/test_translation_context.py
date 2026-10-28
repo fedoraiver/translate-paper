@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from translation_context import build_packet, main
+from test_paper_preflight import add_readiness_inputs, write_ready_report
 
 
 class TranslationContextTests(unittest.TestCase):
@@ -20,6 +21,7 @@ class TranslationContextTests(unittest.TestCase):
         self.units = [{
             "id": f"u{i}", "page": 1, "order": i * 2,
             "kind": "body", "translatable": True,
+            "flow_role": "list_item", "list_id": "list1", "list_level": 0, "source_marker": "•",
             "source_text": "Let x be one.",
             "protected_text": "Let [[Fmath]] be [[P0001]].",
             "protected_tokens": {"[[P0001]]": "one"},
@@ -46,6 +48,7 @@ class TranslationContextTests(unittest.TestCase):
                       "translations_template": "template.jsonl",
                       "math_review": "math-review.json"},
         }), encoding="utf-8")
+        add_readiness_inputs(self.manifest)
 
     def write(self, name, records):
         (self.work / name).write_text("".join(
@@ -61,6 +64,8 @@ class TranslationContextTests(unittest.TestCase):
         self.assertEqual(packet["context_only"][0]["id"], "u2")
         self.assertNotIn("runs", packet["units"][0]["inline_fragments"]["[[Fmath]]"])
         self.assertNotIn("span_runs", packet["units"][0])
+        self.assertEqual(packet["units"][0]["source_marker"], "•")
+        self.assertEqual(packet["units"][0]["flow_role"], "list_item")
         self.assertEqual(before, {p: p.read_bytes() for p in self.work.iterdir()})
 
     def test_budget_is_contiguous_and_single_large_unit_is_not_cut(self):
@@ -88,7 +93,7 @@ class TranslationContextTests(unittest.TestCase):
         review = self.work / "math-review.json"
         d = json.loads(review.read_text()); d["source_sha256"] = "stale"
         review.write_text(json.dumps(d), encoding="utf-8")
-        with self.assertRaisesRegex(ValueError, "Math review"):
+        with self.assertRaisesRegex(ValueError, "preflight is stale"):
             build_packet(self.manifest, self.dest)
         (self.work / "source.pdf").write_bytes(b"changed source")
         with self.assertRaisesRegex(ValueError, "hash differs"):
@@ -99,6 +104,21 @@ class TranslationContextTests(unittest.TestCase):
                           {"start_id": "u2", "end_id": "u0"}, {"max_words": 0}):
             with self.subTest(arguments=arguments), self.assertRaises(ValueError):
                 build_packet(self.manifest, self.dest, **arguments)
+
+    def test_assignment_requires_passing_current_preflight(self):
+        report = self.work / "paper-preflight.json"
+        report.unlink()
+        with self.assertRaisesRegex(ValueError, "preflight report is missing"):
+            build_packet(self.manifest, self.dest)
+        write_ready_report(self.manifest)
+        packet = build_packet(self.manifest, self.dest)
+        self.assertIn("assignment_identity", packet)
+        self.assertEqual(len(packet["source_preflight_sha256"]), 64)
+        payload = json.loads(report.read_text(encoding="utf-8"))
+        payload["status"] = "fail"
+        report.write_text(json.dumps(payload), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "did not pass"):
+            build_packet(self.manifest, self.dest)
 
     def test_cli_refuses_to_overwrite_an_existing_assignment(self):
         packet = self.work / "assigned.json"

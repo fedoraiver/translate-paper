@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from native_latex import resolve_display_math, resolve_inline_math
+from display_plan import build_display_plan, select_body_units
 
 PLACEHOLDER_RE = re.compile(r"\[\[P\d{4}\]\]")
 CONTROL_TOKEN_RE = re.compile(
@@ -199,27 +200,26 @@ def export_markdown(
     lines = [f"# {title}", "", "> 中文翻译正文（仅含经复核的可翻译正文范围）", ""]
     footnotes: list[str] = []
     ordered_units = sorted(units, key=lambda item: int(item["order"]))
-    positions = {
-        str(unit["id"]): index for index, unit in enumerate(ordered_units)
-    }
-    boundary = dict(manifest.get("boundary") or {})
-    start = positions.get(str(boundary.get("introduction_id") or ""), 0)
-    stop = positions.get(
-        str(boundary.get("post_body_stop_id") or ""),
-        len(ordered_units),
-    )
+    body_units = select_body_units(ordered_units, manifest)
     listings: dict[str, dict[str, Any]] = {}
     if listing_layout is not None:
         if not manifest.get("source_sha256") or listing_layout.get("source_sha256") != manifest["source_sha256"]:
             raise ValueError("Code listing inventory does not match the source PDF.")
-        body_units = {str(unit["id"]): unit for unit in ordered_units[start:stop]}
+        positions = {str(unit["id"]): index for index, unit in enumerate(ordered_units)}
+        boundary = dict(manifest.get("boundary") or {})
+        start = positions.get(str(boundary.get("introduction_id") or ""), 0)
+        stop = positions.get(str(boundary.get("post_body_stop_id") or ""), len(ordered_units))
+        body_unit_map = {str(unit["id"]): unit for unit in ordered_units[start:stop]}
+        explicit_include_ids = {str(value) for value in boundary.get("include_ids") or []}
+        body_unit_map.update({str(unit["id"]): unit for unit in body_units
+                             if str(unit["id"]) in explicit_include_ids})
         for entry in listing_layout.get("listings") or []:
             unit_id = str(entry.get("id") or "")
             if entry.get("semantic_kind") not in {"code-listing", "code-expression"}:
                 raise ValueError(f"{unit_id}: inventory entry is not a reviewed code listing")
             if unit_id in listings:
                 raise ValueError(f"{unit_id}: duplicate code listing")
-            unit = body_units.get(unit_id)
+            unit = body_unit_map.get(unit_id)
             if unit is None:
                 raise ValueError(f"{unit_id}: code listing is missing from the selected body")
             if (unit.get("translatable") or unit.get("render_suppressed")
@@ -229,23 +229,26 @@ def export_markdown(
                 raise ValueError(f"{unit_id}: code listing must be a nonempty invariant source clip")
             listings[unit_id] = unit
     review_entries = dict((math_review or {}).get("entries") or {})
-    consumed_display_ids: set[str] = set()
-    for unit in ordered_units[start:stop]:
+    display_plan = build_display_plan(body_units, review_entries)
+    display_owners = {group["review_id"]: group for group in display_plan}
+    display_ids = {unit_id for group in display_plan for unit_id in group["source_ids"]}
+    previous_list: tuple[str, int] | None = None
+    for unit in body_units:
         unit_id = str(unit["id"])
-        if unit_id in consumed_display_ids or unit.get("render_suppressed"):
+        if unit_id in display_ids and unit_id not in display_owners:
+            continue
+        if unit.get("render_suppressed"):
             continue
         if unit_id in listings:
             source = str(unit["source_text"])
             fence = "`" * max(3, max((len(run) for run in re.findall(r"`+", source)), default=0) + 1)
             lines.extend((fence, source, fence, ""))
+            previous_list = None
             continue
-        display = dict(review_entries.get(unit_id) or {})
-        if display.get("kind") == "display" or unit.get("kind") == "equation":
+        if unit_id in display_owners:
             tex = resolve_display_math(unit, review_entries)
             lines.extend(("$$", tex, "$$", ""))
-            consumed_display_ids.update(
-                str(value) for value in display.get("source_ids") or [unit_id]
-            )
+            previous_list = None
             continue
         if not unit.get("translatable"):
             continue
@@ -253,16 +256,46 @@ def export_markdown(
         translated = str(record.get("translated_text") or "").strip()
         if not translated:
             raise ValueError(f"{unit['id']}: translated_text is empty")
-        restored = rich_text_to_markdown(
-            unit, restore_tokens(unit, translated), review_entries
-        )
+        restored_text = restore_tokens(unit, translated)
+        role = str(unit.get("flow_role") or "")
+        marker = str(unit.get("source_marker") or "")
+        if role == "list_item" and marker:
+            if restored_text.lstrip().startswith(marker):
+                restored_text = restored_text.lstrip()[len(marker):].lstrip()
+            else:
+                for token, fragment in (unit.get("inline_fragments") or {}).items():
+                    if str(fragment.get("text") or "").strip() == marker.strip() and restored_text.lstrip().startswith(token):
+                        restored_text = restored_text.lstrip()[len(token):].lstrip()
+                        break
+        restored = rich_text_to_markdown(unit, restored_text, review_entries)
         if unit.get("kind") == "footnote":
             footnotes.append(restored)
             continue
         if unit.get("kind") == "heading":
             lines.extend((f"## {restored}", ""))
+            previous_list = None
+        elif role in {"list_item", "list_continuation"}:
+            level = int(unit.get("list_level") or 0)
+            list_key = (str(unit.get("list_id") or ""), level)
+            indent = "    " * level
+            if role == "list_item":
+                if re.fullmatch(r"\d+[.)]", marker):
+                    markdown_marker = marker
+                elif marker in {"•", "·", "▪", "●", "◦", "‣", "⁃", "–", "—", "-", ""}:
+                    markdown_marker = "-"
+                else:
+                    markdown_marker = f"- {marker}"
+                if lines and not lines[-1] and previous_list is not None:
+                    lines.pop()
+                lines.extend((f"{indent}{markdown_marker} {restored}", ""))
+            elif previous_list == list_key and len(lines) >= 2:
+                lines[-2] += " " + restored
+            else:
+                lines.extend((indent + "    " + restored, ""))
+            previous_list = list_key
         else:
             lines.extend((restored, ""))
+            previous_list = None
     if footnotes:
         lines.extend(("---", "", "## 脚注", ""))
         for footnote in footnotes:
@@ -293,6 +326,11 @@ def main() -> int:
         manifest["source_title"] = args.title
     if manifest.get("boundary", {}).get("needs_boundary_review"):
         raise SystemExit("Translation boundary review is incomplete.")
+    from paper_preflight import assert_source_ready
+    try:
+        assert_source_ready(manifest_path)
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
     units_path = manifest_path.parent / manifest["paths"]["translation_units"]
     math_review: dict[str, Any] | None = None
     math_review_name = str(

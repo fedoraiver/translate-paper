@@ -92,6 +92,24 @@ Initialize `translations.jsonl` from the template only if absent. Fill only
 `translated_text` and save after every section. Export `中文翻译正文.md` from the completed JSONL so the
 translation remains auditable independently of PDF layout.
 
+Preserve `flow_role`, `list_id`, `list_level`, and `source_marker` from reviewed
+source. A list item and its continuation are separate source units; do not invent
+Chinese punctuation or extra breaks to compensate for ambiguous structure.
+Resolve that ambiguity in source review before translation.
+
+## Paper glossary
+
+Before the first packet, a translation agent reads the introduction and key
+definitions and proposes a small source-specific term map. The coordinator owns
+`glossary.json`: a flat nonempty English-to-Chinese mapping, or an explicit
+`{"terms": {}, "reviewed": true, "reason": "..."}` when no special terms apply.
+Do not populate it with unrelated universal vocabulary.
+
+Workers return proposed terms separately. Merge accepted terms before dispatching
+dependent text. When an accepted term changes, inspect only units using that
+term and submit deliberate token-preserving revisions. Do not globally replace
+provider verbs merely because a formal noun uses a preferred translation.
+
 Section saves are crash- and compaction-recovery checkpoints, not planned pause
 points. Validate the just-written records and continue with the next untranslated
 unit in the same turn. A partial final response is permitted only under the true
@@ -106,6 +124,9 @@ paper-specific repair script.
 ### Batch checkpoints
 
 Generate a compact assignment rather than dumping the full unit/translation JSONL:
+
+First require a current passing `paper-preflight.json`; packet creation refuses
+missing, failed, or stale readiness. See production.md for the command.
 
 ```powershell
 uv run --script <skill-dir>\scripts\translation_context.py `
@@ -145,7 +166,8 @@ or translation produced by mechanical scripts/services. Save one batch with:
 uv run --script <skill-dir>\scripts\translation_checkpoint.py `
   --manifest <work-dir>\manifest.json `
   --translations <work-dir>\translations.jsonl `
-  --batch <work-dir>\batch-01.jsonl
+  --batch <work-dir>\batch-01.jsonl `
+  --packet <work-dir>\agent-work\translation\batch-01.context.json
 ```
 
 The helper checks source hash, unique IDs, current source metadata, Chinese prose,
@@ -154,6 +176,14 @@ other records, atomically replaces the checkpoint, and reports completed count,
 remaining count, and `next_id`. Replaying identical text is harmless; changing
 completed text requires `--replace-completed` for a deliberate revision. Use one
 writer per checkpoint. Keep revision batches narrowly scoped.
+
+Newly prepared runs require `--packet` for batch writes. Its assignment identity
+binds assigned source/flow/style/protection metadata, associated reviewed math,
+and source-relevant glossary terms. Unrelated batches, manifest annotations and
+unrelated terms do not invalidate it. Changed assigned inputs require a new
+packet and source comparison; never edit the stored identity to pass a stale
+batch. Each batch contains exactly its assigned IDs in order. Legacy checkpoints
+remain readable.
 
 Omit `--batch` for a read-only resume check. Add `--require-complete` before
 export. A partial checkpoint can pass structural checks with `complete: false`;

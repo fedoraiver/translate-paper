@@ -12,6 +12,8 @@ import json
 import re
 from pathlib import Path
 
+from assignment_identity import build_assignment_identity
+from paper_preflight import assert_source_ready
 from translation_checkpoint import load_state, read_records, validate_text
 
 
@@ -34,6 +36,8 @@ def compact_unit(unit: dict, reviews: dict) -> dict:
         "id": unit["id"], "page": unit.get("page"), "kind": unit.get("kind"),
         "order": unit.get("order"),
         "block_style": unit.get("block_style"),
+        "flow_role": unit.get("flow_role"), "list_id": unit.get("list_id"),
+        "list_level": unit.get("list_level"), "source_marker": unit.get("source_marker"),
         "section": unit.get("section", ""),
         "protected_text": unit["protected_text"],
         "protected_tokens": unit.get("protected_tokens", {}),
@@ -49,6 +53,7 @@ def build_packet(manifest_path: Path, translations: Path, start_id: str | None =
         raise ValueError("max_words must be between 1 and 4000")
     manifest_path = manifest_path.resolve()
     units, records = load_state(manifest_path, translations)
+    readiness = assert_source_ready(manifest_path)
     for unit, record in zip(units, records):
         validate_text(unit, record.get("translated_text", ""))
     manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
@@ -66,7 +71,7 @@ def build_packet(manifest_path: Path, translations: Path, start_id: str | None =
         if not isinstance(reviews, dict):
             raise ValueError("Math review entries must be a token-keyed object")
         hashes["math_review"] = sha256(review_path)
-    glossary_path = work / "glossary.json"
+    glossary_path = work / (paths.get("glossary") or "glossary.json")
     if glossary_path.exists():
         hashes["glossary"] = sha256(glossary_path)
 
@@ -123,6 +128,10 @@ def build_packet(manifest_path: Path, translations: Path, start_id: str | None =
         "schema_version": 1, "source_sha256": manifest["source_sha256"],
         "source_pdf": str(source.resolve()), "manifest": str(manifest_path),
         "input_hashes": hashes,
+        "source_preflight_sha256": readiness["source_fingerprint"]["sha256"],
+        "assignment_identity": build_assignment_identity(
+            manifest_path, [u["id"] for u in selected],
+            [u["id"] for u in neighbors] + [u["id"] for u in invariants]),
         "glossary": str(glossary_path.resolve()) if glossary_path.exists() else None,
         "source_preview": str((work / paths["source_preview"]).resolve())
         if paths.get("source_preview") else None,

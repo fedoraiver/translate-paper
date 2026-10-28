@@ -14,13 +14,20 @@ import re
 import tempfile
 from pathlib import Path
 
+from source_structure import FLOW_FIELDS, flow_metadata
+
 
 TOKEN_RE = re.compile(r"\[\[[^\[\]\r\n]+\]\]")
 HAN_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
 SOURCE_FIELDS = (
     "source_text", "protected_text", "protected_tokens", "inline_fragments",
-    "style_tokens",
+    "style_tokens", "flow_role", "list_id", "list_level", "source_marker", "flow_reviewed",
 )
+
+
+def source_value(record: dict, field: str):
+    """Legacy missing flow fields mean the same inferred-paragraph defaults."""
+    return flow_metadata(record)[field] if field in FLOW_FIELDS else record.get(field)
 
 
 def read_records(path: Path) -> list[dict]:
@@ -81,7 +88,7 @@ def load_state(manifest_path: Path, destination: Path) -> tuple[list[dict], list
     for unit in units:
         record = by_id[unit["id"]]
         for field in SOURCE_FIELDS:
-            if record.get(field) != unit.get(field):
+            if source_value(record, field) != source_value(unit, field):
                 raise ValueError(f"{unit['id']}: stale {field}; reconcile source review")
         if not isinstance(record.get("translated_text", ""), str):
             raise ValueError(f"{unit['id']}: translated_text must be a string")
@@ -132,25 +139,49 @@ def atomic_write(path: Path, records: list[dict]) -> None:
 
 
 def checkpoint(manifest: Path, destination: Path, batch_path: Path | None = None,
-               replace_completed: bool = False, require_complete: bool = False) -> dict:
+               replace_completed: bool = False, require_complete: bool = False,
+               packet_path: Path | None = None) -> dict:
     units, records = load_state(manifest, destination)
+    manifest_payload = json.loads(manifest.read_text(encoding="utf-8-sig"))
     if batch_path:
         if batch_path.resolve() == destination.resolve():
             raise ValueError("Batch and canonical checkpoint must be separate files")
-        records = merge_batch(units, records, read_records(batch_path), replace_completed)
+        batch = read_records(batch_path)
+        if packet_path:
+            from assignment_identity import validate_assignment_identity
+            packet = json.loads(packet_path.read_text(encoding="utf-8-sig"))
+            validate_assignment_identity(packet, manifest, [r["id"] for r in batch])
+        elif manifest_payload.get("assignment_protocol_version", 0) >= 1:
+            raise ValueError("Dispatched batch requires --packet for assignment validation")
+        records = merge_batch(units, records, batch, replace_completed)
     for unit, record in zip(units, records):
         validate_text(unit, record.get("translated_text", ""))
     remaining = [r["id"] for r in records if not r.get("translated_text", "").strip()]
     if require_complete and remaining:
         raise ValueError(f"{len(remaining)} untranslated units; next: {remaining[0]}")
     if batch_path:
+        from paper_state import read_state, state_path, update_state
+        track = (manifest_payload.get("assignment_protocol_version", 0) >= 1
+                 or state_path(manifest).exists())
+        if track:
+            read_state(manifest)  # Refuse a mismatched recovery pointer before saving.
         atomic_write(destination, records)
-    return {
+    report = {
         "status": "pass", "complete": not remaining,
         "total": len(records), "completed": len(records) - len(remaining),
         "remaining": len(remaining), "next_id": remaining[0] if remaining else None,
         "translations": str(destination), "saved": batch_path is not None,
     }
+    if batch_path and track:
+        try:
+            update_state(manifest, stage="translated" if not remaining else "translate",
+                         next_action="Render and validate" if not remaining
+                         else f"Translate next batch from {remaining[0]}",
+                         batch_progress={k: report[k] for k in
+                                         ("total", "completed", "remaining", "next_id")})
+        except OSError as error:
+            report["state_warning"] = f"Translation saved; recovery metadata update failed: {error}"
+    return report
 
 
 def main() -> int:
@@ -158,12 +189,14 @@ def main() -> int:
     parser.add_argument("--manifest", required=True, type=Path)
     parser.add_argument("--translations", required=True, type=Path)
     parser.add_argument("--batch", type=Path, help="JSONL with id and translated_text only")
+    parser.add_argument("--packet", type=Path, help="The exact assigned context JSON")
     parser.add_argument("--replace-completed", action="store_true")
     parser.add_argument("--require-complete", action="store_true")
     args = parser.parse_args()
     try:
         report = checkpoint(args.manifest.resolve(), args.translations.resolve(),
-                            args.batch, args.replace_completed, args.require_complete)
+                            args.batch, args.replace_completed, args.require_complete,
+                            args.packet)
     except (ValueError, OSError, KeyError, TypeError) as error:
         print(json.dumps({"status": "fail", "error": str(error)}, ensure_ascii=False))
         return 1

@@ -35,6 +35,26 @@ of rereading the complete accepted source inventory.
 
 ## Gate and lifecycle
 
+Source structure is frozen before translation: `flow_role` is `paragraph`,
+`list_item`, or `list_continuation`; list units carry `list_id`, zero-based
+`list_level` and the original `source_marker` for new items. A paragraph after a
+list has role `paragraph`; a wrapped explanation within an item is a
+`list_continuation` with the same list ID/level. Review ambiguous multi-item PDF
+blocks into separate units instead of asking the Chinese renderer to infer them.
+`replace_unit` and `insert_unit` accept these fields. They are part of the
+completed-translation contract.
+`flow_reviewed: true` marks an explicit reviewed paragraph boundary. Automatically
+annotated ordinary body blocks use false so existing source-only cross-page
+continuation handling remains available; an extraction block is not by itself a
+new paragraph. List roles always follow their source metadata.
+
+Read typed diagnostics in the source report: numbered displays embedded in prose,
+uncovered mathematical spans, orphan scripts, ambiguous source alignment and
+unresolved flow. Compare their source pages and resolve them with replayable
+operations. A small Greek character can be a real variable, script or footnote;
+never suppress it solely by character or font size. Do not promote an entire
+mixed prose/equation block into a display.
+
 `prepare_paper.py` creates this hash-bound skeleton in the work directory:
 
 ```json
@@ -140,6 +160,31 @@ pass an empty caption ID or manufacture a caption. Review chapter-specific
 classification traps in [chapter-workflow.md](chapter-workflow.md).
 
 ## Safety
+
+### Repairs after translation
+
+Preview the complete reviewed proposal against an isolated preparation:
+
+```powershell
+uv run --script <skill-dir>\scripts\paper_repair.py `
+  --manifest <active-work-dir>\manifest.json `
+  --source-review <combined-reviewed-proposal.json> `
+  --report <paper-root>\repair-impact.json
+```
+
+The default only reports impact and destroys the temporary probe. Inspect changed,
+removed, new, and reopened completed IDs. Then run the same arguments with
+`--apply --output-dir <new-revision-dir>` to publish an isolated revision. The
+destination must not exist. The helper backs up the exact checkpoint, reopens
+only changed source contracts, verifies unaffected parsed records, and updates
+the single recovery pointer. Formatting bytes may change; do not label parsed
+field equality as byte identity.
+
+Review changed mathematics, rerun preflight, generate new packets and deliberately
+translate only reopened/new prose. Retain the prior PDF and reports until the
+new candidate passes every downstream gate. A failed preparation never modifies
+the original checkpoint; never manually falsify source metadata or empty the
+whole checkpoint to defeat its guard.
 
 - Unknown IDs, duplicate operations, invalid page geometry, reused visual
   members, and operation conflicts are blocking errors.

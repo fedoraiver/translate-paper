@@ -7,6 +7,21 @@ visuals/front/tail, and the `zh-academic-v1` layout requirements.
 
 ## Export, render, and validate
 
+Before translation dispatch and again after affected source/math/engine changes:
+
+```powershell
+uv run --script <skill-dir>\scripts\paper_preflight.py `
+  --manifest <work-dir>\manifest.json `
+  --report <work-dir>\paper-preflight.json
+```
+
+Inspect its source diagnostic sample for source structures present in this paper.
+The complete mathematical inventory uses the actual production preamble and font
+checks. Both sample and math compile are diagnostics, not Chinese translations
+or visual acceptance. A changed input invalidates readiness; unchanged compile
+inputs may reuse their verified artifacts. Packet creation, batch readiness and
+formal export use the same readiness assertion.
+
 First run `translation_checkpoint.py --manifest <manifest> --translations
 <translations> --require-complete`. This is a text checkpoint gate, not a
 substitute for source, math, or visual review. Use `zh-academic-v1` and native
@@ -39,6 +54,30 @@ PDF** at readable resolution, with source comparisons for complex content.
 Save `visual-review.json` bound to the reviewed PDF hash and containing per-page
 observations. Fix defects, rerender, and repeat review before delivery. Automated
 checks or a contact sheet alone cannot establish visual acceptance.
+
+Before assigning that review, the producer opens the risk pages and each prior
+repair location in the new candidate. Record stable defect IDs, category, source
+units, current output/image locations, regression evidence and actual local
+inspection. For a systemic defect, check all its instances, including list
+continuations and post-list paragraphs. Repeated failure of the same class must
+trigger focused diagnosis of the full source-to-PDF path before another full
+review. Unit tests of the final formatting function alone are insufficient.
+
+The reviewer may report serious findings promptly, but the producer waits for
+the complete consolidated defect list before rerendering. Do not spend a new
+full review on a candidate whose previously reported defect still reproduces.
+
+Use `review_readiness.py --translated <candidate.pdf> --prior-review <prior.json>`
+to list stable defect IDs. The producer authors a JSON inspection record with
+`translated_sha256`, ordered `prior_review_sha256`, current `risk_images`, and
+`repairs`: each has `defect_id`, `status: resolved`, and absolute
+`inspected_images`. Systemic classes also record `scope` and
+`related_occurrence_images`; repeated failures record `regression_evidence` paths.
+Run the same command with `--repairs <producer-inspection.json> --report
+<producer-readiness.json>` before independent review. Repeat `--prior-review` for
+earlier relevant rounds. With no prior defects the risk-page inspection is still
+required. The checker validates identities and recorded coverage, not whether
+the producer actually opened an image. Do not fabricate inspection records.
 
 Use `\qquad(n)`, not `\tag{n}`, for display-equation numbering. Prefer reviewed
 TeX such as `\vec{...}`, `\gg`, `\mathfrak{n}`, and `\leftrightarrow`; resolve
@@ -125,6 +164,12 @@ tests. Run the relevant broader suite once after related edits are settled; do
 not repeatedly rerun an unchanged passing suite. No tests are needed merely to
 restyle instruction prose. Treat nonzero process exit codes as failures; do not
 let a successful later command obscure an earlier failure in a chained shell.
+
+Formula ownership is explicit: the reviewed `source_ids` determine logical
+displays for PDF, Markdown and validation. Suppressed extraction fragments do
+not authorize merging independently reviewed rules. Layout output records every
+consumed review and source ID; missing, duplicate or overlapping ownership blocks
+export even if compilation succeeds.
 
 Before freezing a candidate, inspect the compiler's actionable errors/warnings
 and prioritize known risk pages: first/last body pages, long inline formula lists,

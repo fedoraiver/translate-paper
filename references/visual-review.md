@@ -40,6 +40,19 @@ producer rerenders. This avoids a full review round for each separately discover
 defect. If the candidate is unreadable throughout, report that blocker instead.
 Do not start an idle reviewer in advance merely to wait for production.
 
+Assign a stable defect ID on first observation, together with its category and
+source unit/location; retain that ID across page-number changes. On a repeated
+candidate check both the prior repairs and the rest of the document, collecting
+the complete defect set before handing it back. A producer's local repair check
+is a prerequisite to the next acceptance review, not a replacement for it.
+
+If review is interrupted with the exact same PDF SHA-256 and matching previews,
+resume from persisted unreviewed pages and pending source comparisons. Do not
+reopen successful pages merely because the chat resumed. A changed PDF starts a
+new full-page coverage record; earlier source comparisons may guide it but cannot
+stand in for opening every new output page. Complete source comparisons before
+ending the round, rather than declaring pages without findings accepted early.
+
 Use one concise content-specific observation per passing page and detailed
 evidence for defects; do not repeat a long checklist on every page. Open pages in
 small groups, preserving readable resolution. Ask for high-resolution crops only

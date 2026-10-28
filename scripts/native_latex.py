@@ -14,6 +14,7 @@ import re
 import shutil
 import statistics
 import subprocess
+import unicodedata
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -96,6 +97,17 @@ def _fragment_tex(fragment: dict[str, Any]) -> str:
 
 
 def normalize_native_tex(value: str) -> str:
+    def chancery_variant(match: re.Match[str]) -> str:
+        character = match.group(1)
+        name = unicodedata.name(character, "")
+        base = unicodedata.normalize("NFKC", character)
+        if name.startswith(("MATHEMATICAL SCRIPT CAPITAL ", "SCRIPT CAPITAL ")) and re.fullmatch(r"[A-Z]", base):
+            return rf"\mathcal{{{base}}}"
+        return match.group()
+
+    # FE00 requests the chancery variant of a script capital. Latin Modern
+    # exposes that alphabet through mathcal, not a standalone selector glyph.
+    value = re.sub(r"([^\x00-\x7f])\ufe00", chancery_variant, value)
     # Percentages arrive from the PDF as literal percent signs. In TeX an
     # unescaped percent comments out the closing math delimiter and the rest
     # of the paragraph. Preserve existing escapes (and preceding line breaks).
@@ -162,13 +174,8 @@ def validate_native_tex_compatibility(tex: str, label: str) -> None:
             f"{label}: unsupported native-TeX Unicode remains: "
             + "; ".join(found)
         )
-    mathematical_alphanumerics = sorted(
-        {
-            character
-            for character in tex
-            if 0x1D400 <= ord(character) <= 0x1D7FF
-        }
-    )
+    # unicode-math consumes styled mathematical alphanumerics directly. Keep
+    # their distinct alphabets; actual font coverage is checked at compilation.
     combining_math = sorted(
         {
             character
@@ -176,10 +183,18 @@ def validate_native_tex_compatibility(tex: str, label: str) -> None:
             if 0x20D0 <= ord(character) <= 0x20FF
         }
     )
-    if mathematical_alphanumerics or combining_math:
+    variation_selectors = sorted(
+        {
+            character
+            for character in tex
+            if 0xFE00 <= ord(character) <= 0xFE0F
+            or 0xE0100 <= ord(character) <= 0xE01EF
+        }
+    )
+    if combining_math or variation_selectors:
         details = ", ".join(
             f"U+{ord(character):04X} {character!r}"
-            for character in [*mathematical_alphanumerics, *combining_math]
+            for character in [*combining_math, *variation_selectors]
         )
         raise MathReviewError(
             f"{label}: unsupported mathematical Unicode {details}; "
@@ -275,7 +290,7 @@ def resolve_display_math(
     node: dict[str, Any],
     reviews: dict[str, dict[str, Any]],
 ) -> str:
-    review = reviews.get(str(node["id"]), {})
+    review = reviews.get(str(node.get("math_review_id") or node["id"]), {})
     status = str(review.get("review_status") or "")
     tex = normalize_native_tex(str(review.get("tex") or "").strip())
     if status != "manually_reviewed":
@@ -450,7 +465,7 @@ def latex_escape_text(value: str) -> str:
             output.append(r"\(\vec{" + character + r"}\)")
             index += 2
             continue
-        if "①" <= character <= "⑳" or "\u25a0" <= character <= "\u25ff":
+        if character == "‣" or "①" <= character <= "⑳" or "\u25a0" <= character <= "\u25ff":
             output.append(r"\TPTextSymbol{" + character + "}")
             index += 1
             continue
@@ -555,6 +570,16 @@ def rich_text_to_latex(
         for fragment in fragments.values()
     )
     text = str(node.get("text") or "")
+    if node.get("flow_role") == "list-item" and not node.get("source_flow_role"):
+        def list_boundary(match: re.Match[str]) -> str:
+            marker = match.group(1)
+            fragment = fragments.get(marker, {})
+            label = str(fragment.get("text") or marker)
+            return "[[PAR]]" + marker if re.match(
+                r"^(?:[•●▪◦‣*-]|\d{1,3}[.)、])", label
+            ) else match.group(0)
+        text = re.sub(r"\n\s*(\[\[F[A-Za-z0-9_]+\]\]|[•●▪◦‣*\-]|\d{1,3}[.)、])",
+                      list_boundary, text)
     unmatched_vector = any(
         index == 0 or not re.fullmatch(r"[A-Za-zΑ-ω]", text[index - 1])
         for index, character in enumerate(text)
@@ -632,8 +657,9 @@ def rich_text_to_latex(
                         + "}"
                     )
             elif kind == "code":
-                code = latex_escape_text(str(fragment.get("text") or ""))
-                code = code.replace(",", r",\allowbreak{}").replace(";", r";\allowbreak{}")
+                raw_code = str(fragment.get("text") or "")
+                parts = re.split(r"(?<=[,;.(])|(?<=[a-z])(?=[A-Z])", raw_code)
+                code = r"\allowbreak{}".join(latex_escape_text(part) for part in parts)
                 output.append(
                     r"\texttt{" + code + "}"
                 )
@@ -951,6 +977,7 @@ def _document_preamble(profile: Any) -> str:
 \usepackage{{unicode-math}}
 \usepackage{{amsmath,mathtools}}
 \usepackage{{graphicx,adjustbox}}
+\usepackage{{tikz}}
 \usepackage{{geometry}}
 \usepackage{{needspace}}
 \usepackage{{fancyhdr}}
@@ -1065,10 +1092,30 @@ def _node_to_latex(
     if role == "footnote" or kind == "footnote":
         return rf"\TPFootnote{{{content}}}", "text"
     if role == "list-item":
-        return (
-            rf"\par\noindent\hangindent=23pt\hangafter=1 {content}\par",
-            "text",
-        )
+        if node.get("source_flow_role"):
+            level = int(node.get("list_level") or 0)
+            # All lines stay within the same list text column, including a
+            # wrapped continuation carried from the next source unit.
+            left = profile.list_padding_left * (level + 1)
+            first = profile.list_text_indent
+            return (rf"\par\begingroup\leftskip={left:g}pt\parindent={first:g}pt "
+                    + content + r"\par\endgroup"), "text"
+        items = [part.strip() for part in content.split("\n\n") if part.strip()]
+        rendered_items = []
+        for index, part in enumerate(items):
+            if index and not re.match(r"^(?:[•●▪◦*\-]|\\TPTextSymbol\{‣\}|\\\(\d{1,3}[.)、])", part):
+                rendered_items.append(rf"\par {part}\par")
+                continue
+            nested = part.startswith(r"\TPTextSymbol{‣}")
+            nested_indent = r"\hspace*{23pt}" if nested else ""
+            hang = 46 if nested else 23
+            rendered_items.append(
+                rf"\par\noindent{nested_indent}\hangindent={hang}pt\hangafter=1 {part}\par")
+        return "\n".join(rendered_items), "text"
+    if role == "list-continuation" and node.get("source_flow_role"):
+        left = profile.list_padding_left * (int(node.get("list_level") or 0) + 1)
+        return (rf"\par\begingroup\leftskip={left:g}pt\parindent=0pt "
+                + content + r"\par\endgroup"), "text"
     if kind == "caption":
         return (
             rf"\par\smallskip\begin{{center}}\small\itshape {content}\end{{center}}\smallskip",
@@ -1164,6 +1211,16 @@ def build_body_tex(
                 "anchor_id": node["element"].get("anchor_id"),
                 "visual_id": node["element"].get("visual_id"),
             }
+        if render_mode == "native-math":
+            placement["math_review_id"] = str(node.get("math_review_id") or node["id"])
+        if node.get("source_flow_role"):
+            placement.update({key: node.get(key) for key in
+                              ("source_flow_role", "flow_reviewed", "list_id", "list_level", "source_marker")})
+            if node.get("flow_role") in {"list-item", "list-continuation"}:
+                placement["padding_left"] = profile.list_padding_left * (int(node.get("list_level") or 0) + 1)
+                placement["text_indent"] = profile.list_text_indent if node["flow_role"] == "list-item" else 0
+            else:
+                placement["text_indent"] = profile.body_text_indent
         if node.get("continuation_of"):
             placement.update({
                 "continuation_of": node["continuation_of"],
@@ -1524,6 +1581,7 @@ def render_native_latex(
     profile: Any,
     typography_profile: str,
     columns: int,
+    display_plan: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     review_name = str(
         (manifest.get("paths") or {}).get("math_review")
@@ -1552,6 +1610,9 @@ def render_native_latex(
     tex, placement_stubs, math_statuses = build_body_tex(
         nodes, reviews, profile, source, build_dir
     )
+    if display_plan is not None:
+        from display_plan import validate_display_consumption
+        validate_display_consumption(display_plan, placement_stubs)
     tex_path = build_dir / "translated-body.tex"
     tex_path.write_text(tex, encoding="utf-8", newline="\n")
     body_pdf, compile_metrics = compile_body_tex(build_dir, tex_path)
@@ -1656,6 +1717,11 @@ def render_native_latex(
                 "inline_statuses": dict(math_statuses),
                 "unresolved": 0,
                 "image_fallbacks": 0,
+                "display_review_ids": [str(item["math_review_id"]) for item in placement_stubs
+                                       if item.get("render_mode") == "native-math"],
+                "display_source_ids": [str(unit_id) for item in placement_stubs
+                                       if item.get("render_mode") == "native-math"
+                                       for unit_id in item["ids"]],
             },
             "styles": dict(style_counts),
             "footnote_placements": footnote_placements,

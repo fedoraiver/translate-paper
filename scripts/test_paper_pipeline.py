@@ -1471,6 +1471,16 @@ class PaperPipelineTests(unittest.TestCase):
         prepare_paper.promote_display_math_fragments(elements, 10.0)
         self.assertTrue(all(item["kind"] == "equation" for item in elements))
         review = prepare_paper.build_math_review(elements, "hash")
+        self.assertEqual(list(review["entries"]), ["eq", "symbol", "operator"])
+        self.assertEqual([entry["source_ids"] for entry in review["entries"].values()],
+                         [["eq"], ["symbol"], ["operator"]])
+        review = prepare_paper.build_math_review(elements, "hash", {
+            "source_sha256": "hash", "entries": {"eq": {
+                "kind": "display", "display": True,
+                "source_ids": ["eq", "symbol", "operator"],
+                "review_status": "unresolved",
+            }},
+        })
         self.assertEqual(list(review["entries"]), ["eq"])
         self.assertEqual(
             review["entries"]["eq"]["source_ids"],

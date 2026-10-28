@@ -8,12 +8,16 @@ corrections against freshly extracted paper elements.
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import re
+import statistics
 from collections.abc import Callable
 from itertools import pairwise
 from pathlib import Path
 from typing import Any
+
+import source_structure
 
 SCHEMA_VERSION = 1
 SUPPORTED_OPERATIONS = {
@@ -162,6 +166,9 @@ def _refresh_translation_fields(
     element: dict[str, Any],
     protect_element: Callable[[dict[str, Any]], None],
 ) -> None:
+    flow_error = source_structure.validate_flow(element)
+    if flow_error:
+        raise SourceReviewError(f"{element['id']}: {flow_error}")
     if element.get("translatable"):
         if element.get("render_mode") != "text":
             raise SourceReviewError(
@@ -228,6 +235,9 @@ def apply_source_review(
                     "after replay against the persisted reviewed source."
                 )
     elements[:] = working
+    report["source_review_sha256"] = hashlib.sha256(
+        json.dumps(review, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
     return report
 
 
@@ -286,6 +296,7 @@ def _completed_unit_contract(element: dict[str, Any]) -> dict[str, Any]:
         "section",
     )
     result = {field: element.get(field) for field in fields}
+    result.update(source_structure.flow_metadata(element))
     result["translatable"] = bool(element.get("translatable"))
     result["render_suppressed"] = bool(element.get("render_suppressed"))
     result["block_style"] = element.get("block_style") or "normal"
@@ -347,6 +358,8 @@ def _apply_source_review_operations(
         op = str(operation.get("op") or "")
         if op not in SUPPORTED_OPERATIONS:
             raise SourceReviewError(f"Operation {index} has unsupported op={op!r}.")
+        if "flow_reviewed" in operation and not isinstance(operation["flow_reviewed"], bool):
+            raise SourceReviewError(f"Operation {index}: flow_reviewed must be a boolean.")
         reason = _validate_reason(operation, index)
         by_id = index_elements()
 
@@ -406,6 +419,7 @@ def _apply_source_review_operations(
                 "bbox",
                 "span_runs",
                 "section",
+                *source_structure.FLOW_FIELDS,
             }
             changed = False
             for field in allowed:
@@ -429,6 +443,10 @@ def _apply_source_review_operations(
             )
             if "source_text" in operation and "span_runs" not in operation:
                 updated["span_runs"] = []
+            if any(field in operation for field in source_structure.FLOW_FIELDS):
+                updated.pop("flow_review_required", None)
+                updated["flow_reviewed"] = True
+                changed = changed or element.get("flow_reviewed", False) is not True
             if changed and element_id in translated_ids:
                 raise SourceReviewError(
                     f"Refusing to replace completed translation unit {element_id}."
@@ -494,6 +512,11 @@ def _apply_source_review_operations(
                 "translatable": bool(operation.get("translatable", kind == "body")),
                 "source_review_reason": reason,
                 "source_ref": f"source-review:{element_id}",
+                "flow_role": operation.get("flow_role", "paragraph"),
+                "list_id": operation.get("list_id"),
+                "list_level": operation.get("list_level", 0),
+                "source_marker": operation.get("source_marker", ""),
+                "flow_reviewed": any(field in operation for field in source_structure.FLOW_FIELDS),
             }
             _refresh_translation_fields(inserted, protect_element)
             anchor_index = elements.index(anchor)
@@ -669,6 +692,117 @@ def _formula_only_body(element: dict[str, Any]) -> bool:
     )
 
 
+def _significant_math_run(run: dict[str, Any]) -> bool:
+    value = str(run.get("text") or "").strip()
+    if not value or run.get("semantic_kind") == "prose":
+        return False
+    if run.get("semantic_kind") == "math":
+        return True
+    math_font = run.get("style") == "math" or bool(re.search(
+        r"CMMI|CMSY|CMEX|MSAM|MSBM|MATH|SYMBOL", str(run.get("font") or ""), re.I))
+    return bool((math_font and re.search(r"[\wΑ-ω\U0001d400-\U0001d7ff]", value))
+                or re.search(r"[=<>≤≥≈≠∑∏∫√∞±×÷∂∇∈∉→←↔⊥∗◦]", value)
+                or re.search(r"[\U0001d400-\U0001d7ff]", value))
+
+
+def _fragment_intervals(element: dict[str, Any]) -> list[tuple[int, int, dict[str, Any]]]:
+    text = str(element.get("source_text") or "")
+    intervals: list[tuple[int, int, dict[str, Any]]] = []
+    for fragment in (element.get("inline_fragments") or {}).values():
+        if isinstance(fragment.get("source_start"), int) and isinstance(fragment.get("source_end"), int):
+            intervals.append((fragment["source_start"], fragment["source_end"], fragment))
+            continue
+        runs = [run for run in fragment.get("runs") or []
+                if isinstance(run.get("start"), int) and isinstance(run.get("end"), int)]
+        if runs:
+            intervals.append((min(run["start"] for run in runs),
+                              max(run["end"] for run in runs), fragment))
+            continue
+        literal = str(fragment.get("text") or "")
+        start = text.find(literal) if literal else -1
+        if start >= 0 and text.find(literal, start + 1) < 0:
+            intervals.append((start, start + len(literal), fragment))
+    return intervals
+
+
+def structured_source_issues(
+    elements: list[dict[str, Any]], visual_layout: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Return source-bound risks for review gates and diagnostic sampling."""
+    issues: list[dict[str, Any]] = []
+    body_sizes = [float(item.get("font_size") or 0) for item in elements
+                  if item.get("kind") == "body" and float(item.get("font_size") or 0) > 0]
+    body_font_size = statistics.median(body_sizes) if body_sizes else None
+    for element in elements:
+        if (element.get("render_suppressed") or element.get("kind") not in {"body", "heading"}
+                or element.get("translatable") is not True):
+            continue
+        base = {"unit_id": str(element["id"]), "page": int(element.get("page") or 0)}
+
+        def add(code: str, message: str, **details: Any) -> None:
+            issues.append({**base, "code": code, "message": message, **details})
+
+        flow_error = source_structure.validate_flow(element)
+        markers = source_structure.source_markers(element)
+        mixed = len(markers) > 1 or (markers and markers[0]["line"] > 0)
+        if element.get("kind") == "heading":
+            heading_emphasis = any(run.get("style") == "bold" or int(run.get("flags") or 0) & 16
+                                   for run in element.get("span_runs") or [])
+            heading_size = (body_font_size is not None
+                            and float(element.get("font_size") or 0) >= body_font_size * 1.12)
+            if markers and not element.get("source_review_reason") and (mixed or not (heading_emphasis or heading_size)):
+                add("heading_list_ambiguous", "Numbered/bulleted source text has no clear heading typography; review whether it is a list item.")
+            continue
+        if flow_error or mixed or element.get("flow_review_required") or (markers and element.get("flow_role") != "list_item"):
+            add("flow_ambiguous", flow_error or element.get("flow_review_required") or (
+                "Source paragraph/list boundaries require splitting or explicit reviewed flow metadata."
+            ))
+        text = str(element.get("source_text") or "")
+        runs = list(element.get("span_runs") or [])
+        located, locator_issues = source_structure.locate_source_spans(text, runs)
+        for issue in locator_issues:
+            add(issue["code"], issue["message"], **{key: value for key, value in issue.items()
+                                                  if key not in {"code", "message"}})
+        intervals = _fragment_intervals(element)
+        sizes = [float(run.get("size") or 0) for run in runs if float(run.get("size") or 0) > 0]
+        body_size = max(sizes, default=0)
+        for run in located:
+            start, end = int(run["start"]), int(run["end"])
+            coverage = [fragment for left, right, fragment in intervals
+                        if left <= start and end <= right]
+            significant = _significant_math_run(run)
+            details = {"span_index": run["_source_run_index"],
+                       "source_start": start, "source_end": end}
+            if significant and not coverage:
+                add("uncovered_math_span", "Significant source mathematics is outside protected fragments.", **details)
+            compact = str(run.get("text") or "").strip()
+            script = (run.get("semantic_kind") != "prose"
+                      and bool(re.fullmatch(r"[\wΑ-ω\U0001d400-\U0001d7ff]+", compact))
+                      and (int(run.get("flags") or 0) & 1
+                           or (body_size > 0 and 0 < float(run.get("size") or 0) <= body_size * 0.82)))
+            if script and not any(fragment.get("kind") in {"citation", "code", "footnote-marker", "list-marker"}
+                                  for fragment in coverage):
+                has_base = any(fragment.get("kind") == "math"
+                               and any(float(part.get("size") or 0) > float(run.get("size") or 0) * 1.12
+                                       for part in fragment.get("runs") or [])
+                               for fragment in coverage)
+                if not has_base:
+                    add("orphan_script", "Source superscript/subscript has no protected mathematical base.", **details)
+        lines = source_structure.source_lines(element)
+        for index, line in enumerate(lines):
+            candidate = str(line["text"]).strip()
+            if not re.search(r"\(\d+(?:\.\d+)*[a-z]?\)\s*$", candidate, re.I):
+                continue
+            if re.fullmatch(r"\(\d+(?:\.\d+)*[a-z]?\)", candidate, re.I) and index:
+                candidate = str(lines[index - 1]["text"]) + " " + candidate
+            expression = re.sub(r"\(\d+(?:\.\d+)*[a-z]?\)\s*$", "", candidate).strip()
+            words = PROSE_WORD_RE.findall(expression)
+            if len(words) <= 2 and MATH_SIGNAL_RE.search(expression):
+                add("numbered_display_in_body", "A numbered mathematical display remains classified as body text.",
+                    source_line=index)
+    return issues
+
+
 def detect_source_issues(
     elements: list[dict[str, Any]],
     visual_layout: dict[str, Any],
@@ -684,6 +818,8 @@ def detect_source_issues(
         for element in elements
         if _formula_only_body(element)
     ]
+    errors.extend(f"{issue['unit_id']}: {issue['message']} [{issue['code']}]"
+                  for issue in structured_source_issues(elements, visual_layout))
     warnings: list[str] = []
     by_page: dict[int, list[dict[str, Any]]] = {}
     for element in elements:
@@ -782,6 +918,7 @@ def reconcile_translations(
                 "protected_tokens",
                 "inline_fragments",
                 "style_tokens",
+                *source_structure.FLOW_FIELDS,
             ):
                 if field in old and old[field] != element.get(field):
                     raise SourceReviewError(
@@ -797,6 +934,8 @@ def reconcile_translations(
                 "protected_tokens": element.get("protected_tokens", {}),
                 "inline_fragments": element.get("inline_fragments", {}),
                 "style_tokens": element.get("style_tokens", {}),
+                **{field: element[field] for field in source_structure.FLOW_FIELDS
+                   if field in element},
                 "translated_text": str(old.get("translated_text") or ""),
             }
         )

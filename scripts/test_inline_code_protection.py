@@ -16,6 +16,16 @@ def span(text, font="Consolas", style="text", **kwargs):
 
 
 class InlineCodeTests(unittest.TestCase):
+    def test_long_code_breaks_at_punctuation_and_camel_case_without_text_loss(self):
+        value = "ctx.intercept(key, extensionDependencies)"
+        element = self.element("Use " + value + ".", [span(value)])
+        latex = native_latex.rich_text_to_latex(
+            {"id": "body", "text": element["protected_text"], "element": element},
+            {}, Counter())
+        self.assertIn(r"ctx.\allowbreak{}intercept(\allowbreak{}key,\allowbreak{}", latex)
+        self.assertIn(r"extension\allowbreak{}Dependencies", latex)
+        self.assertIn(value, latex.replace(r"\allowbreak{}", ""))
+
     def test_inline_record_fields_can_wrap_without_changing_code(self):
         value = "{cost:Float,partno:Nat}"
         element = self.element("Use " + value + ".", [span(value)])
