@@ -29,7 +29,7 @@ Create `batch-run.json` beside the project artifacts:
     "sha256": "<optional until first refresh>",
     "section": "零知识证明协议的经典论文"
   },
-  "zotero_target": {"id": "C123", "name": "未读论文"},
+  "zotero_target": {"id": "user:0/collections/ABCD1234", "name": "未读论文"},
   "output_root": "output/pdf",
   "papers": [
     {
@@ -58,9 +58,9 @@ terminal local stage be `packaged`.
 
 Each paper must have a stable order, slug, title, source PDF, work directory,
 and DOI, arXiv ID, or title plus year. Use an `artifacts` object to override
-staging paths for `translated_pdf`, `translated_markdown`, `summary`, `latex_source_archive`,
+staging paths for `translated_pdf`, `latex_source_archive`,
 `metadata`, `layout_report`, `strict_validation`, `quick_validation`,
-`summary_validation`, `visual_review`, or `source_review_report`.
+`visual_review`, or `source_review_report`.
 
 ## Commands
 
@@ -68,18 +68,28 @@ Before translating, audit the exact local Zotero parents. Skip this command for
 local-only batches:
 
 ```powershell
-python <skill-dir>\scripts\batch_workflow.py audit-zotero `
+uv run --script <skill-dir>\scripts\batch_workflow.py audit-zotero `
   --ledger <project>\batch-run.json
 ```
 
-Items with exactly one complete parent and five required children become
+The audit resolves the stable target, reads its actual library through Pyzotero,
+and checks the parent's real collection membership. Legacy C/L IDs are accepted
+only after a unique full-hierarchy conversion; prefer stable IDs in new ledgers.
+
+Papers with exactly one complete parent and the three required children (original
+paper PDF, Chinese translation PDF and LaTeX source ZIP) become
 `skipped_existing`. Missing items remain queued. Multiple exact parents or an
 incomplete matched parent are blocking results.
+Extra local original PDF copies, translation Markdown and summaries are not
+generated or packaged. The paper's immutable source input is also required in
+Zotero and must match the ZIP's source identity. Books keep their full PDF and
+do not need chapter-original attachments. An explicitly requested cleanup uses
+the separate guarded flow and preserves paper originals.
 
 Resume from the first non-terminal paper:
 
 ```powershell
-python <skill-dir>\scripts\batch_workflow.py next `
+uv run --script <skill-dir>\scripts\batch_workflow.py next `
   --ledger <project>\batch-run.json
 ```
 
@@ -90,7 +100,7 @@ The script derives stages from source hashes and artifacts:
 A changed source hash resets only that paper. The terminal states are
 `zotero_verified` and `skipped_existing`, or `packaged` for local-only batches.
 
-After strict, quick, summary, and independent visual review pass, package one
+After strict, quick, and independent visual review pass, package one
 paper. The default visual report is `<work-dir>/visual-review.json`; packaging
 and final-bundle audit require complete page coverage and matching source/output
 PDF hashes. A missing or stale visual report is not a reason to retranslate a
@@ -98,13 +108,13 @@ completed paper: review the existing valid PDF and resume packaging. Do not
 fabricate a report for an older bundle that lacks review evidence.
 
 ```powershell
-python <skill-dir>\scripts\batch_workflow.py package `
+uv run --script <skill-dir>\scripts\batch_workflow.py package `
   --ledger <project>\batch-run.json `
   --slug <paper-slug>
 ```
 
-Packaging writes only the standard artifact names. It refuses to replace a
-different source PDF and verifies the copied bundle.
+Packaging writes only the standard artifact names and verifies the copied bundle
+against the original source input without making a source PDF copy.
 The required `latex_source_archive` defaults to `<work-dir>/LaTeX源码包.zip`;
 override it when using a staging directory. Generate the rebuildable source ZIP
 using [production.md](production.md#rebuildable-latex-source). Package and final
@@ -113,20 +123,22 @@ audit validate every ZIP member hash and match its source/accepted-PDF identity.
 After `zotero_ingest.py verify` succeeds, record the exact parent:
 
 ```powershell
-python <skill-dir>\scripts\batch_workflow.py record-zotero `
+uv run --script <skill-dir>\scripts\batch_workflow.py record-zotero `
   --ledger <project>\batch-run.json `
   --slug <paper-slug> `
   --parent-key <PARENT_KEY>
 ```
 
 This command repeats live local verification and records the key only when the
-parent has exactly the five required children, including the stored source ZIP
-whose manifest matches the stored source and accepted translation PDFs.
+paper parent has the three required delivery children, including the stored source ZIP
+whose manifest matches the accepted translation PDF. The complete local bundle
+also validates the ZIP against the original source PDF. Pass that original input
+to paper ingestion with `--source-pdf`; no extra local source copy is needed.
 
 Finish with a full audit:
 
 ```powershell
-python <skill-dir>\scripts\batch_workflow.py audit `
+uv run --script <skill-dir>\scripts\batch_workflow.py audit `
   --ledger <project>\batch-run.json `
   --zotero
 ```

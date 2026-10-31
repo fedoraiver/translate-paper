@@ -20,8 +20,8 @@ cropped, distorted, or split visual is a blocking error.
 Standalone source code and pseudocode use `kind: "code"`, `source_clip`, and
 `translatable: false`, preserving exact source text and reviewed bounds. Keep
 them as independent vector clips without captions; do not classify their
-operators or variables as native mathematics. Markdown retains the source as
-a fenced code block, including its line breaks and indentation.
+operators or variables as native mathematics. Retain exact line breaks and
+indentation in the canonical source and editable LaTeX project.
 
 Calibrate visual size from the type inside the object:
 

@@ -28,11 +28,6 @@ substitute for source, math, or visual review. Use `zh-academic-v1` and native
 LuaLaTeX mathematics:
 
 ```powershell
-uv run --script <skill-dir>\scripts\export_translation_markdown.py `
-  --manifest <work-dir>\manifest.json `
-  --translations <work-dir>\translations.jsonl `
-  --output <staging-dir>\中文翻译正文.md
-
 uv run --script <skill-dir>\scripts\render_translation.py `
   --manifest <work-dir>\manifest.json `
   --translations <work-dir>\translations.jsonl `
@@ -93,28 +88,16 @@ uv run --script <skill-dir>\scripts\quick_validate.py `
   --report <work-dir>\quick-validation.json
 ```
 
-## Summarize and package
+## Package
 
 Packaging requires a passing final visual review and `check_visual_review.py`
-check in addition to the strict, quick, and summary checks. Summary drafting
-from the reviewed source may run in parallel with translation or rendering.
-
-Write UTF-8 Markdown `中文论文总结.md` from the requested source only, using these nine headings:
-文献信息、一句话结论、研究问题、方法与数据、核心贡献、主要结果、局限、复现材料、关键词。
-Target 1,200–1,400 counted characters within the accepted 800–1,500 range.
-`check_summary.py` counts non-whitespace text including Latin terms, numbers,
-and headings, not just Chinese characters. For theoretical or textbook material,
-describe definitions, proof methods, and examples; state when experiments or
-reproduction materials are not provided rather than inventing them.
-Deliver this same file as the Zotero stored attachment titled `中文论文总结`,
-with a `.md` filename and `text/markdown` content type. Do not convert it into
-an HTML note or place Markdown source inside a Zotero note.
-
-```powershell
-uv run --script <skill-dir>\scripts\check_summary.py `
-  --summary <staging-dir>\中文论文总结.md `
-  --report <work-dir>\summary-validation.json
-```
+check in addition to the strict and quick checks. Do not export translation
+Markdown, draft a Chinese summary, run summary validation, or copy the original
+PDF into the final bundle. The immutable source remains an input for identity
+and visual checks; a necessary chapter excerpt is a working input, not a deliverable.
+For Zotero paper delivery, use this original input as `--source-pdf` and retain it
+as the paper's original attachment. For a book with its full PDF already attached,
+deliver only each chapter's translation PDF and source ZIP.
 
 Write original-language `zotero-item.json` with item type, title, creators,
 date, publication fields, DOI/arXiv/URL, and language. Require DOI, arXiv ID, or
@@ -126,15 +109,14 @@ separate final PDFs from supporting artifacts; do not create a second bundle in
 the default directory. Chapter source provenance is defined in
 [chapter-workflow.md](chapter-workflow.md). The standard bundle includes:
 
-- byte-identical `原文 PDF.pdf`;
-- `中文翻译.pdf`, `中文翻译正文.md`, `中文论文总结.md`, `zotero-item.json`;
+- `中文翻译.pdf` and `zotero-item.json`;
 - `LaTeX源码包.zip`, the editable source of the exact accepted PDF;
 - `中文翻译.layout.json`, `translation-validation.json`;
-- `quick-validation.json` and `summary-validation.json`;
+- `quick-validation.json`;
 - `visual-review.json` with final PDF hash and complete page coverage;
 - `source-review-report.json` when review operations were applied.
 
-Verify the source copy's SHA-256 and the delivered PDF's exact match to the visual
+Verify the source input's SHA-256 and the delivered PDF's exact match to the visual
 report. If a final bundle already exists, identify its owned files from its
 checkpoint or manifest before replacement; do not recursively delete a guessed
 directory. Keep unrelated files. A fresh translation uses separate staging until
@@ -188,10 +170,9 @@ as acceptance.
 | Change | Required rerun |
 | --- | --- |
 | Source PDF, boundary, extraction classification or protected tokens | Replay preparation; reconcile existing translations; revise only affected prose; run all downstream gates. |
-| Chinese prose or reviewed native TeX | Checkpoint; export Markdown; render; strict and quick checks; full independent visual review. No new OCR/extraction when source metadata is unchanged. |
-| Visual size/spacing or paragraph-flow renderer | Render; strict and quick checks; full visual review. Re-export Markdown only if semantic text/grouping used by that exporter changes. |
+| Chinese prose or reviewed native TeX | Checkpoint; render; strict and quick checks; full independent visual review. No new OCR/extraction when source metadata is unchanged. |
+| Visual size/spacing or paragraph-flow renderer | Render; strict and quick checks; full visual review. |
 | Validator-only correction with byte-identical PDF | Regression-test the correction; rerun affected checks. Do not recompile or restart a completed visual review solely for that change. |
-| Summary only | Summary check and any dependent Markdown delivery copy/attachment; no paper render or PDF review. |
 | Byte-identical packaging or Zotero upload | Verify hashes/identity and destination; retain the accepted PDF review. |
 
 For code corrections, reproduce the general failure and run focused regression
@@ -201,7 +182,7 @@ restyle instruction prose. Treat nonzero process exit codes as failures; do not
 let a successful later command obscure an earlier failure in a chained shell.
 
 Formula ownership is explicit: the reviewed `source_ids` determine logical
-displays for PDF, Markdown and validation. Suppressed extraction fragments do
+displays for PDF and validation. Suppressed extraction fragments do
 not authorize merging independently reviewed rules. Layout output records every
 consumed review and source ID; missing, duplicate or overlapping ownership blocks
 export even if compilation succeeds.

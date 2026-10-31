@@ -2,7 +2,7 @@
 
 `translate-paper` 是一个 Codex skill，用于将单篇或一组学术论文 PDF
 翻译为中文，同时保留图表、公式、引文、附录和参考文献，并生成经过验证
-的中文 PDF、Markdown 与论文总结。默认工作流还支持审计 Zotero 中缺少
+的中文 PDF 与可重建的 LaTeX 源码 ZIP。默认工作流还支持审计 Zotero 中缺少
 翻译的论文、断点续跑和安全导入最终产物。
 
 仅在用户明确要求使用此技能时调用。教材章节采用专门的边界审阅流程；
@@ -22,7 +22,9 @@
 - 翻译前检查源文段落、列表和公式归属，编译数学清单与高风险样张；任务包拒绝缺失或失效的检查结果。
 - 使用统一检查点工具校验并原子合并译文批次，报告下一未译单元，避免覆盖已有译文。
 - 以 `run-state.json` 定位当前修订；局部源文修复先报告影响，再创建保留原检查点的隔离副本。
-- 输出原始 PDF、中文翻译 PDF、中文正文 Markdown、中文总结和 Zotero 元数据。
+- 本地生成中文翻译 PDF 与 LaTeX 源码包，并保留必要元数据、验证报告和恢复检查点。
+- Zotero 中论文保留原文 PDF、中文翻译 PDF 与 LaTeX 源码包三项；书籍已有全本 PDF 时，章节只添加译文 PDF 与源码 ZIP，不添加章节原文 PDF。
+- 不生成中文正文 Markdown、中文总结或归档原文副本；原始输入不改动，章节节选仅作为处理输入。
 - 验证翻译完整性、版面结构、字体、公式、图表和 Zotero 附件结构。
 
 完整行为与安全约束见 [`SKILL.md`](SKILL.md)。
@@ -40,7 +42,7 @@ New-Item -ItemType Junction `
   -Target "C:\path\to\translate-paper"
 ```
 
-创建 Junction 前，`$HOME\.codex\skills\translate-paper` 必须不存在。Zotero 导入依赖 Zotero Desktop、对应的 Codex Zotero 插件，以及 Windows Credential Manager 中配置的 Zotero Web API 凭据。
+创建 Junction 前，`$HOME\.codex\skills\translate-paper` 必须不存在。Zotero 交付使用固定版本的 `pyzotero==1.16.0`，需要 Zotero Desktop 10+ 并启用本地 API。独立 Codex Zotero 插件仅用于启用/重启等桌面辅助；正常交付不需要 Web API 密钥或云端同步。
 
 ## 使用
 
@@ -51,7 +53,7 @@ New-Item -ItemType Junction `
 使用 $translate-paper 翻译这个列表中 Zotero 里还没有中文附件的论文，并支持继续未完成批次。
 ```
 
-skill 会按照 `SKILL.md` 中定义的准备、翻译、导出、验证、总结和 Zotero
+skill 会按照 `SKILL.md` 中定义的准备、翻译、导出、验证和 Zotero
 导入流程执行。默认最终文件保存在：
 
 ```text
@@ -73,10 +75,20 @@ python scripts/paper_state.py --help
 python scripts/review_readiness.py --help
 uv run --script scripts/render_translation.py --help
 uv run --script scripts/check_translation.py --help
-python scripts/batch_workflow.py --help
+uv run --script scripts/batch_workflow.py --help
 python scripts/translation_checkpoint.py --help
 python scripts/check_visual_review.py --help
 ```
+
+首次交付前检查状态和目标，再通过 Zotero 原生弹窗授予本地写入权限：
+
+```powershell
+uv run --script scripts/zotero_ingest.py status
+uv run --script scripts/zotero_ingest.py targets
+uv run --script scripts/zotero_ingest.py authorize
+```
+
+选择“始终允许”后，密钥会按 Zotero 服务器标识保存在 Windows 凭据管理器，后续复用。只读命令不弹出授权窗口。集合使用 `user:0/collections/<key>` 或群组稳定标识；旧 `C123`、`L1` 仅在能唯一核对时兼容。`ingest` 创建新条目，`attach` 向指定父条目交付，`resume --receipt <回执> --yes-resume` 从已记录的 key 补传；具体参数见 [交付说明](references/zotero-ingestion.md)。SDK 串行上传文件，但会整文件读入内存。
 
 这些脚本不会自行做出翻译决策。
 准备和审查通过后运行 `paper_preflight.py --manifest <manifest> --report

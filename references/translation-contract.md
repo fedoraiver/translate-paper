@@ -89,8 +89,8 @@ deterministically.
 - source previews and layout-aware extracted text.
 
 Initialize `translations.jsonl` from the template only if absent. Fill only
-`translated_text` and save after every section. Export `中文翻译正文.md` from the completed JSONL so the
-translation remains auditable independently of PDF layout.
+`translated_text` and save after every section. The completed JSONL is the
+auditable translation authority; do not export a translation Markdown deliverable.
 
 Preserve `flow_role`, `list_id`, `list_level`, and `source_marker` from reviewed
 source. A list item and its continuation are separate source units; do not invent
@@ -188,7 +188,7 @@ remain readable.
 Omit `--batch` for a read-only resume check. Add `--require-complete` before
 export. A partial checkpoint can pass structural checks with `complete: false`;
 continue from `next_id`. This helper does not certify translation quality or
-replace source, math, PDF, or summary validation. A stale source record must go
+replace source, math, or PDF validation. A stale source record must go
 through source-review reconciliation, not have its metadata silently overwritten.
 
 ## Layout-specific rules

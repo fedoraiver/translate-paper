@@ -1,245 +1,266 @@
-# Zotero ingestion
+# Zotero ingestion through Pyzotero
 
-## Contents
+## Responsibilities and readiness
 
-- Responsibilities, metadata, and readiness
-- Select the upload route
-- Search and guarded replacement
-- Connector ingestion
-- Verification and recovery
+All project API operations use the pinned `pyzotero==1.16.0` Python SDK through
+`zotero_client.py`. Reads, parent creation, attachment metadata and file uploads,
+updates, guarded deletion, and verification use Zotero Desktop 10+ on the local
+API. No cloud sync or Web API credential is required for normal delivery.
+The independent Zotero plugin is unchanged and is used only to enable/probe or
+restart Desktop when needed. Older plugin statements that the Local API is
+read-only do not describe Zotero 10.
 
-Use `$zotero:Zotero` plus the skill-local adapter. Do not use computer-use,
-edit `zotero.sqlite`, or manipulate Zotero storage.
-
-## Responsibilities
-
-- Zotero plugin: enable/probe local API, search, inspect children and target.
-- Local API: read and verify immediate Desktop state.
-- Web API: search synced state and delete one guarded parent plus children.
-- Connector: create the parent, upload stored PDFs, Markdown files and source ZIP, and place the
-  session in the selected collection.
-- `zotero_credentials.py`: read the Web API key from Windows Credential Manager.
-- `zotero_ingest.py`: enforce identity, sync, sequencing, and verification.
-
-For this adapter's new-parent flow, PDF, Markdown and LaTeX ZIP bytes go to the
-local Connector. Bibliographic identity and deletion requests go to the Web API.
-
-## Select the upload route
-
-Inspect the requested parent scope and existing delivery receipt before writing.
-Reuse the skill's existing client and configured credentials where they fit;
-do not replace a working Connector import with a newly written Local API client
-merely to upload files.
-
-| Requested operation | Route |
-| --- | --- |
-| New paper, or an explicitly in-scope guarded replacement | Existing `zotero_ingest.py ingest` Connector flow. Read [Connector protocol](zotero-connector.md) for session, file-type or retry issues. |
-| Continue adding files to a parent in its still-valid original Connector session | Reuse that session and its client alias after checking live children. A saved session ID alone does not restore a lost session. |
-| Append chapters/files to an arbitrary existing parent | Preserve its exact key and use an authorized existing-parent API adapter. Read [existing-parent delivery](zotero-existing-parent.md). The `ingest` command does not implement this mode. |
-| Continue a completed delivery | Read back titles, parent keys and bytes; report complete if all intended files match. Do not upload duplicates. |
-
-Connector sessions, zotero.org Web API credentials, and Desktop Local API keys
-are different mechanisms. Connector file uploads do not call
-`/api/local/authorize` or carry the Web API key. The current adapter still needs
-its configured Web credentials for remote identity checks and guarded deletion.
-Local API writes in Zotero 10 require a separate user-operated grant. Explain a
-change of route when it introduces a new grant; loss of an in-memory key explains
-repeat prompts, not why a different historical route had no prompt. Consult
-actual prior commands/logs before attributing differences to an application update.
-
-## Metadata
-
-```json
-{
-  "itemType": "journalArticle",
-  "title": "The Knowledge Complexity of Interactive Proof Systems",
-  "creators": [
-    {
-      "creatorType": "author",
-      "firstName": "Shafi",
-      "lastName": "Goldwasser"
-    }
-  ],
-  "publicationTitle": "SIAM Journal on Computing",
-  "date": "1989",
-  "volume": "18",
-  "issue": "1",
-  "pages": "186-208",
-  "DOI": "10.1137/0218012",
-  "url": "https://doi.org/10.1137/0218012",
-  "language": "en",
-  "_sourceParentKey": "6ACE9QQE"
-}
-```
-
-Retain the original metadata. Require item type, title, at least one creator,
-and DOI, arXiv ID, or title plus year.
-
-Set `_sourceParentKey` only when the source PDF or metadata was obtained from
-that known Zotero parent. The adapter accepts the key only when the candidate
-has the exact normalized title, is a bibliographic parent, and has no DOI,
-arXiv, or year conflict. It does not permit arbitrary-key deletion. Workflow
-fields are stripped before Connector creation.
-
-## Readiness
-
-Use `python` on this Windows installation:
+Do not use computer-use, edit `zotero.sqlite`, or write to Zotero storage. Only
+`/connector/getSelectedCollection` remains as a small read-only bridge for the
+selected Desktop destination and edit permissions, which the SDK does not expose.
+No Connector save session is created by new deliveries.
+The SDK client mounts a small read-only file-transport extension for local
+attachment redirects: httpx2 can inherit 127.0.0.1 when resolving file:/// URLs,
+which Pyzotero's stock transport rejects. It reuses Pyzotero's file reader,
+normalizes loopback hosts, and keeps non-local paths rejected. No upstream
+package is patched.
 
 ```powershell
-python <zotero-plugin-root>\skills\zotero\scripts\zotero.py status --json
-python <skill-dir>\scripts\zotero_credentials.py verify
-python <skill-dir>\scripts\zotero_ingest.py status
-python <skill-dir>\scripts\zotero_ingest.py targets
+uv run --script <skill-dir>\scripts\zotero_ingest.py status
+uv run --script <skill-dir>\scripts\zotero_ingest.py targets
 ```
 
-If needed:
+If Desktop is unavailable or its local API is disabled, use the independent
+Zotero skill's `status --json` / `enable --restart` helper. Do not enable it by
+editing the database. Read-only status reports whether a credential is stored;
+it does not claim that a stored key was validated by a write.
+
+## Local authorization
 
 ```powershell
-python <zotero-plugin-root>\skills\zotero\scripts\zotero.py enable --restart
+uv run --script <skill-dir>\scripts\zotero_ingest.py authorize --timeout-seconds 3600
 ```
 
-Resolve targets on every run. Honor an explicit user-supplied library or
-collection; otherwise use the writable currently selected target. If none is
-selected, use the only writable target when exactly one exists. Ask only when
-no writable target exists or multiple plausible targets remain. Resolve one
-exact Connector target ID with `filesEditable: true`. Stop on duplicate names
-or an ID/name mismatch.
+The SDK requests permission with application name `translate-paper`. The user
+operates Zotero's native dialog. Keep one request active and let it receive the
+response; the process and HTTP request must remain alive. Denial, expiration,
+invalid keys, and rate limits are actionable failures, not a reason to loop.
 
-The new credential target is `Codex/translate-paper/ZoteroAPI`. The helper
-automatically reads the legacy
-`Codex/translate-paper-to-zotero/ZoteroAPI` target when the new target is
-absent, so the existing configured key remains usable. Never print the key.
+Only an actual `remember: true` response is stored, under
+`Codex/translate-paper/ZoteroLocalAPI/<server-id>` in Windows Credential Manager.
+A one-time grant is not saved and cannot support a later multi-write command;
+choose Always Allow for durable batch delivery. Reads never authorize. Missing
+or expired grants leave the delivery receipt intact for a later `resume`.
+Never print keys, put them in command arguments/workspace receipts, or recover
+keys from Zotero profile preferences. Web keys and local keys are separate.
 
-## Search and guarded replacement
+## Destination and identity
 
-Resolve identity and preserve the original PDF and metadata before translation.
-For replacement, normally defer the guarded deletion below until the new local
-bundle has passed all acceptance gates and is ready for ingestion. Revalidate the
-exact match and record its current children then; this avoids leaving the library
-without a usable item during a long translation or repair. An explicit request
-to delete first overrides this ordering. Never re-delete an already removed item
-when resuming; inspect the saved result and current local/Web state.
+`targets` returns canonical IDs: `user:0`, `user:0/collections/<key>`,
+`group:<id>`, and `group:<id>/collections/<key>`. Honor the user's explicit
+library/collection; otherwise use the currently selected writable destination,
+or the only writable destination when there is exactly one. Ask only if the
+intended destination cannot be resolved. Pass its exact ID/name to delivery.
+
+Legacy `C123` / `L1` are Desktop internal IDs, not API keys. The bridge's complete
+library/collection hierarchy is matched against SDK data. A legacy mapping must
+be unique; same-name paths, ID/name mismatches and unprovable file permissions
+block writing. Canonical collection keys disambiguate collections with identical
+names when library permissions can be established. Re-resolve the target at
+actual execution, not from a pre-translation UI snapshot. Completion checks the
+parent's actual library and collection keys, never just the selected UI target.
+
+Keep original-language bibliographic metadata in `zotero-item.json`: `itemType`,
+`title`, `creators`, and DOI, arXiv ID or title plus year. Keep venue, date, pages,
+URL and other original fields. `_sourceParentKey` may be set only when the source
+was obtained from that exact parent; it requires the exact normalized title and
+no DOI/arXiv/year conflict. Workflow fields are stripped before SDK creation;
+`arXivID` is preserved as an arXiv line in Extra.
 
 ```powershell
-python <skill-dir>\scripts\zotero_ingest.py search `
-  --metadata <output-dir>\zotero-item.json
+uv run --script <skill-dir>\scripts\zotero_ingest.py search --metadata <metadata.json>
+# Explicit comparison of synced personal-library state, only if needed:
+uv run --script <skill-dir>\scripts\zotero_ingest.py search --metadata <metadata.json> --include-web
 ```
 
-Matching is strict:
+Search and children are fully paginated, with duplicate/repeated-page checks.
+Matching uses exact normalized DOI, exact normalized arXiv, title plus year, or
+the guarded recorded source key. Conflicting identifiers never fall back to
+similar titles; multiple exact parents block replacement.
 
-1. exact normalized DOI;
-2. exact normalized arXiv ID;
-3. exact title plus year;
-4. a recorded `_sourceParentKey` with exact title and no identity conflict.
+Web comparison and `zotero_credentials.py verify` also use the SDK. The Web
+credential namespace remains `Codex/translate-paper/ZoteroAPI`, with legacy
+`Codex/translate-paper-to-zotero/ZoteroAPI` fallback. `ZOTERO_USER_ID` and
+`ZOTERO_API_KEY` must be supplied together if used for explicit Web comparison.
+The global `--credential-target` option changes only this Web namespace.
 
-Never fall back from a conflicting DOI or arXiv ID to title similarity. Stop
-when multiple parents match.
+## New-parent delivery and guarded replacement
 
-Preview and record the parent and all children:
+For papers, `ingest` creates one parent and three stored `imported_file`
+attachments: `原文 PDF`, `中文翻译 PDF`, and `LaTeX 源码包`. For chapters under
+a book that already has its full PDF, preserve that original full-book attachment
+and deliver only the chapter translation PDF and source ZIP. Do not upload a
+redundant chapter-original excerpt, translation Markdown or summary, or create notes.
+Existing exact parents are refused; use `attach` for preserving an existing one.
 
 ```powershell
-python <skill-dir>\scripts\zotero_ingest.py delete `
+uv run --script <skill-dir>\scripts\zotero_ingest.py ingest `
   --metadata <output-dir>\zotero-item.json `
-  --item-key <PARENT_KEY>
-```
-
-Invoking `$translate-paper` is standing authorization to replace one unique
-guarded match. Do not pause for another confirmation:
-
-```powershell
-python <skill-dir>\scripts\zotero_ingest.py delete `
-  --metadata <output-dir>\zotero-item.json `
-  --item-key <PARENT_KEY> `
-  --yes-delete
-```
-
-The adapter revalidates identity, fetches children, deletes at most 50 keys
-with an unmodified-library-version guard, and waits for Desktop sync. If the
-Web delete succeeds but local removal does not, stop and ask the user to sync.
-
-## Connector ingestion
-
-This adapter creates a new parent (or replaces a uniquely guarded parent).
-When the user explicitly requests attaching chapters to an existing book parent,
-honor that exact parent through an authorized API path; do not delete/recreate it
-or insist on exactly five total children for the whole book. Require each chapter's
-five uniquely titled stored attachments and verify its source ZIP against that
-chapter's source/accepted translation. Add only missing owned files after inspecting
-partial results; preserve other chapters and the full-book source attachment.
-Do not remove `ingest`'s matched-parent guard to simulate append support; use the
-separate existing-parent procedure instead.
-
-```powershell
-python <skill-dir>\scripts\zotero_ingest.py ingest `
-  --metadata <output-dir>\zotero-item.json `
-  --source-pdf <source.pdf> `
+  --source-pdf <original-paper.pdf> `
   --translated-pdf <translated.pdf> `
-  --translated-markdown <translated.md> `
-  --summary <summary.md> `
   --latex-source-archive <output-dir>\LaTeX源码包.zip `
-  --receipt <work-dir>\zotero-upload.json `
-  --target-id <TARGET_ID> `
-  --target-name "<COLLECTION_NAME>"
+  --target-id user:0/collections/ABCD1234 --target-name "未读论文" `
+  --receipt <work-dir>\zotero-upload.json
 ```
 
-After the preview succeeds, rerun `targets` immediately before the actual
-ingestion. Confirm that the exact target ID/name pair is still present and
-`filesEditable: true`, then rerun ingestion with the same pair and
-`--yes-ingest`. Do not reuse a target result captured before translation or a
-long batch pause. The adapter must refuse while a matched parent remains,
-create one session and parent, place it in the selected target, upload stored
-`原文 PDF`, `中文翻译 PDF`, `中文翻译 Markdown`, `中文论文总结`, and `LaTeX 源码包`, then verify
-the local result. The summary must be the actual UTF-8 `中文论文总结.md` file,
-uploaded with `text/markdown`; never create an HTML note or a note containing
-Markdown source.
-The Connector upload identifier must have a URL path ending in `.md` (the
-adapter builds this without fetching that URL). A fragment alone is insufficient:
-Zotero derives the stored extension from the path when its MIME service does not
-recognize Markdown. Zotero may rename the basename, but the `.md` suffix must survive.
-For resumable work, retain the `--receipt` path: its session ID, client alias,
-expected hashes and per-file state are saved before writes. Inspect an existing
-receipt and live files instead of rerunning `ingest` over partial results.
+This previews only. Add `--yes-ingest` to execute an authorized delivery. A
+receipt is always written before creation: absent `--receipt`, its default is
+`zotero-upload.json` beside the metadata. An existing receipt is refused; use
+`resume`. SDK creation uses preallocated legal keys and version zero; confirmed
+keys survive missing responses and process interruptions. SDK attachment upload
+uses explicit dictionaries rather than the attachment-template convenience
+methods unavailable locally. Files are uploaded serially; Pyzotero 1.16.0 reads
+each whole file into memory. No custom streaming protocol or silent alternative
+write route is retained.
 
-## Verification and recovery
+`--translated-pdf` and `--latex-source-archive` are required. Papers also require
+`--source-pdf`: it checks archive source identity and uploads the original paper.
+For book metadata, `--source-pdf` is an optional local
+identity check only; it never uploads the excerpt. Legacy `--translated-markdown` and `--summary`
+arguments are accepted but neither read nor uploaded. Local packaging requires
+the PDF, source ZIP and supporting metadata/reports in [production.md](production.md).
+
+For an explicitly authorized replacement, preserve original source and metadata,
+prepare and accept the new bundle first, then revalidate and preview deletion:
 
 ```powershell
-python <skill-dir>\scripts\zotero_ingest.py verify `
-  --metadata <output-dir>\zotero-item.json `
-  --expected-dir <output-dir>
+uv run --script <skill-dir>\scripts\zotero_ingest.py delete `
+  --metadata <metadata.json> --item-key <PARENT_KEY>
 ```
 
-Require exactly one parent, one stored attachment with each required title
-(`原文 PDF`, `中文翻译 PDF`, `中文翻译 Markdown`, `中文论文总结`, and `LaTeX 源码包`). The summary
-must have a `.md` filename and `text/markdown` content type (`text/plain` is
-accepted only when Zotero normalizes the MIME type). A legacy summary note does
-not satisfy this check. After
-a partial Connector failure, search and inspect children before retrying.
-Never blindly rerun ingestion, overwrite generated children, or perform SQL
-cleanup.
+Invoking `$translate-paper` remains standing authorization to replace one unique
+guarded match; do not ask again for that operation. Add `--yes-delete` only for
+that authorized deletion. It permanently deletes the one parent and its recorded
+children through the SDK, with a local library-version precondition and a limit
+of 50 objects. No chunking or cloud-sync wait is introduced. `--wait-local-seconds`
+is accepted for CLI compatibility but no longer controls a sync wait. For group
+search/delete/verification use `--library-type group --library-id <group-id>`.
+An explicit existing-parent chapter request never authorizes its replacement.
 
-The LaTeX source must be the actual `LaTeX源码包.zip` stored file with
-`application/zip` MIME and a `.zip` filename. Export and rebuild it using
-[production.md](production.md#rebuildable-latex-source). Ingestion validates all
-members and source/output hashes before upload; live verification reads the stored
-ZIP and stored chapter PDFs through the local API and checks their identities.
-Two PDFs and two Markdown files without this fifth attachment are incomplete;
-adding a ZIP to an already accepted bundle does not invalidate its PDF review.
+## Existing parents and recovery
 
-For a requested format-only migration of legacy summary notes, preserve the
-parent and all other children. Back up the original note, convert its complete
-content to UTF-8 Markdown, and verify the replacement attachment's bytes and
-parent before moving only the old note to trash through an authorized API.
-Keep a key/path/hash record for recovery; do not rerun translation or replace
-the whole paper merely to change its summary format.
+Use implemented `attach` for existing parents and chapters; see
+[existing-parent delivery](zotero-existing-parent.md). It shares the two delivery file
+flags with `ingest`, requires `--parent-key` plus that parent's metadata and exact
+destination, and uses `--title-prefix` to separate chapter attachment titles.
 
-For a paper-list request, run the read-only audit in
-[batch-workflow.md](batch-workflow.md) before translating. Treat an item as
-already translated only when this exact five-attachment verification passes; a
-parent with partial or differently titled children is not complete.
+```powershell
+uv run --script <skill-dir>\scripts\zotero_ingest.py resume `
+  --receipt <work-dir>\zotero-upload.json
+# Execute after reviewing the saved/live state:
+uv run --script <skill-dir>\scripts\zotero_ingest.py resume `
+  --receipt <work-dir>\zotero-upload.json --yes-resume
+```
 
-The `verify` command covers parent identity and stored file contents; it does
-not itself prove collection membership. Confirm the parent's actual library and
-collection keys against the requested destination separately. Connector's
-selected-target state alone is insufficient proof of placement.
-The configured reading path is Google Chrome,
-so do not launch or validate Zotero's built-in PDF reader during ingestion.
+Version 2 receipts bind server ID, library/collection, parent and child keys,
+local input paths/hashes, owned titles, original unrelated children and confirmed
+stages. Resume validates the accepted files and live parent before any writes.
+Matching stored bytes are adopted/skipped; confirmed metadata without a file is
+uploaded to the same key. A duplicate title, wrong parent/key, changed input,
+conflicting stored bytes, disappeared confirmed item, or changed server blocks
+writing and preserves evidence. A timeout never proves a POST failed. A completed
+delivery is reverified and reported complete without requiring write credentials.
+
+When resuming an old five-file paper receipt, keep the original PDF, Chinese PDF
+and source ZIP eligible for upload. Move only Markdown and summary records/hashes
+into `local_only_files` / `local_only_hashes`. For a chapter, exclude the original
+excerpt as well. Excluded paths need not exist. Preview leaves the receipt
+unchanged; an executed resume saves this narrowed scope and retained evidence.
+These are historical receipt fields, not instructions to save or regenerate
+document copies.
+Already stored local-only attachments are left in place and are not required by
+verification. This policy change does not authorize deleting existing attachments.
+
+Legacy version 1 Connector receipts are recovered into a separate
+`<receipt-stem>.pyzotero.json`; the original remains unchanged. A saved parent key,
+or an explicitly supplied `resume --parent-key`, must match the original identity
+and destination. Missing/unprovable parent ownership blocks conversion, rather
+than creating another parent. See [historical Connector recovery](zotero-connector.md).
+
+## Verification and batch completion
+
+```powershell
+uv run --script <skill-dir>\scripts\zotero_ingest.py verify `
+  --metadata <metadata.json> --expected-dir <output-dir> `
+  --target-id user:0/collections/ABCD1234
+```
+
+Verify exact titles/types, stored modes, actual destination, and file bytes read
+through the SDK into temporary verification copies. The Chinese PDF uses
+`application/pdf`; the source uses `.zip` and `application/zip`. Validate the
+stored ZIP against the stored Chinese PDF and compare SHA-256/MD5/size identities
+to accepted inputs. For papers, require the stored original PDF and validate it
+against the ZIP's source identity too. `--source-pdf` can verify the original's
+accepted bytes without making an extra copy in the output directory.
+A missing source ZIP is incomplete; adding it does not invalidate a prior
+accepted PDF review. `--expected-dir` uses the standard packaged filenames.
+
+Use `verify --parent-key <key> --title-prefix "第 1 章"` for a chapter's owned
+two-file subset; unrelated children are preserved. Batch audits resolve the
+actual target library and require actual collection membership before recording
+`skipped_existing` or `zotero_verified`. Keep local acceptance and Zotero delivery
+stages separate. See [batch workflow](batch-workflow.md).
+
+Do not generate a summary or translation Markdown, or archive a standalone
+original PDF copy. Existing Zotero summaries, original PDFs and translation
+Markdown are preserved unless the user separately requests a specific cleanup.
+
+## Explicit historical attachment cleanup
+
+Use this flow only when the user requests removal of earlier skill-generated
+attachments. It is separate from normal delivery and never replaces a parent.
+Resolve the exact parents from the library and recorded deliveries, then call
+`prepare_cleanup_manifest(client, parent_keys)` and save its result with
+`_write_upload_receipt`. The manifest records metadata and byte identities, not
+document backups. Save document copies only if the user asks for them.
+
+```powershell
+uv run --script <skill-dir>\scripts\zotero_ingest.py cleanup --manifest <cleanup.json>
+uv run --script <skill-dir>\scripts\zotero_ingest.py cleanup --manifest <cleanup.json> --yes-cleanup
+```
+
+The preview validates the entire manifest without authorizing or deleting.
+`--yes-cleanup` permanently deletes only recorded translation Markdown, summaries,
+and redundant chapter-original excerpts under books with full PDFs. Paper
+originals are never cleanup candidates. Preserve paper originals, full-book originals,
+translation PDFs, source ZIPs, parent metadata, collections, unrelated notes and
+annotations. A candidate with child notes/annotations or changed bytes blocks
+cleanup. Deletion uses the pinned SDK, library-version preconditions and batches
+of at most 50 attachments. Confirm absence after every batch and checkpoint
+before and after writes. Reconcile an uncertain response against live keys before
+retrying; an already completed manifest verifies preservation without new writes.
+
+Search for missing existing source ZIPs only in the user-specified directories.
+Verify ZIP membership hashes and its accepted-PDF identity before any upload.
+When the user requests existing ZIPs only, report missing sources without
+repackaging or retranslating. Cleanup completion and delivery completeness
+are separate outcomes; a missing ZIP does not prevent separately authorized
+attachment cleanup.
+
+### Restore a missing paper original
+
+Use `attach-source` to repair an existing paper without requiring or regenerating
+a missing ZIP. It cannot target books. Resolve the original from known paths or
+the publisher/author; prefer byte-identical recovery using the recorded SHA-256.
+It preserves the exact parent and all other children, checkpoints a reserved key,
+and verifies stored bytes. Repeat the same command/receipt after interruption.
+
+```powershell
+uv run --script <skill-dir>\scripts\zotero_ingest.py attach-source `
+  --metadata <paper-metadata.json> --parent-key <PAPER_KEY> `
+  --source-pdf <original-paper.pdf> --expected-sha256 <recorded-source-hash> `
+  --target-id user:0 --receipt <source-upload.json>
+```
+
+Add `--yes-attach-source` for the authorized write. If an older two-file paper
+delivery receipt needs its original added, use `resume --source-pdf <original>`;
+the archive source identity is checked before it becomes upload-eligible.
+
+The configured PDF reader is Google Chrome. Do not launch or diagnose Zotero's
+built-in reader during ingestion; follow `zotero-reader.md` only on an explicit
+reader diagnosis request.

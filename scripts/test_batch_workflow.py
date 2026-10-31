@@ -86,8 +86,6 @@ class BatchWorkflowTests(unittest.TestCase):
         )
         (work / "中文翻译.pdf").write_bytes(b"%PDF translated")
         make_archive(work / "LaTeX源码包.zip", source, work / "中文翻译.pdf")
-        (work / "中文翻译正文.md").write_text("# 译文\n", encoding="utf-8")
-        (work / "中文论文总结.md").write_text("# 总结\n", encoding="utf-8")
         write_json(
             work / "zotero-item.json",
             {"title": "A Paper", "date": "2020", "DOI": "10.1000/example"},
@@ -108,10 +106,6 @@ class BatchWorkflowTests(unittest.TestCase):
             work / "quick-validation.json",
             {"status": "pass", "metrics": {"source_sha256": source_hash,
              "pdf_sha256": sha256(work / "中文翻译.pdf"), "pages": 1}},
-        )
-        write_json(
-            work / "summary-validation.json",
-            {"status": "pass", "metrics": {"characters": 1250}},
         )
         write_json(
             work / "source-review-report.json",
@@ -208,6 +202,24 @@ class BatchWorkflowTests(unittest.TestCase):
             ),
         )
 
+    def test_package_never_creates_original_markdown_or_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            ledger_path = self.make_batch(root)
+            self.make_validated_artifacts(root)
+            work = root / "work"
+            (work / "中文翻译正文.md").write_text("old translation", encoding="utf-8")
+            (work / "中文论文总结.md").write_text("old summary", encoding="utf-8")
+            write_json(work / "summary-validation.json", {"status": "fail"})
+            with mock.patch("builtins.print"):
+                batch_workflow.cmd_package(argparse.Namespace(ledger=ledger_path, slug="01-paper"))
+            ledger, path = batch_workflow.load_ledger(ledger_path)
+            paths = batch_workflow._paper_paths(ledger, path, ledger["papers"][0])
+            self.assertTrue(batch_workflow._final_bundle_complete(paths))
+            for filename in ("原文 PDF.pdf", "中文翻译正文.md", "中文论文总结.md", "summary-validation.json"):
+                self.assertFalse((paths["final_dir"] / filename).exists())
+            self.assertEqual((root / "source.pdf").read_bytes(), b"%PDF source")
+
     def test_strict_validation_flag_is_required(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -268,10 +280,8 @@ class BatchWorkflowTests(unittest.TestCase):
                 "verification": {
                     "ok": True,
                     "children": [
-                        {"title": "原文 PDF"},
                         {"title": "中文翻译 PDF"},
-                        {"title": "中文翻译 Markdown"},
-                        {"title": "中文论文总结"},
+                        {"title": "LaTeX 源码包"},
                     ],
                 },
             }
@@ -291,7 +301,7 @@ class BatchWorkflowTests(unittest.TestCase):
         self.assertEqual(ledger["papers"][0]["stage"], "skipped_existing")
         self.assertEqual(ledger["papers"][0]["zotero_parent_key"], "PARENT1")
 
-    def test_record_zotero_requires_live_five_child_verification(self) -> None:
+    def test_record_zotero_requires_live_pdf_and_latex_verification(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             ledger_path = self.make_batch(root)
@@ -304,7 +314,7 @@ class BatchWorkflowTests(unittest.TestCase):
                 "ok": True,
                 "translated": True,
                 "parent_key": "PARENT1",
-                "verification": {"ok": True, "children": [{}, {}, {}, {}, {}]},
+                "verification": {"ok": True, "children": [{}, {}]},
             }
             with (
                 mock.patch.object(

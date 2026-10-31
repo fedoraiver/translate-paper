@@ -1,14 +1,19 @@
 ---
 name: translate-paper
-description: Translate academic-paper PDFs or requested textbook chapters into Chinese, preserving original visuals and native mathematics and delivering validated PDF, Markdown, summary, and editable LaTeX source artifacts. Supports resumable batches and in-scope Zotero delivery. Use when explicitly requested.
+description: Translate academic-paper PDFs or requested textbook chapters into Chinese, preserving original visuals and native mathematics and delivering a validated Chinese PDF and editable LaTeX source ZIP. Supports resumable batches and in-scope Zotero delivery. Use when explicitly requested.
 ---
 
 # Translate paper
 
-Deliver faithful Chinese body translation as PDF and Markdown, plus UTF-8
-`中文论文总结.md`, plus a rebuildable `LaTeX源码包.zip`. Zotero requires five
-stored attachments: two PDFs, two Markdown files, and the LaTeX source ZIP; the
-summary title is `中文论文总结` and MIME type `text/markdown`, never an HTML note.
+Deliver faithful Chinese body translation as `中文翻译.pdf` plus a rebuildable
+`LaTeX源码包.zip`. For a paper, Zotero must also retain the original paper PDF:
+upload `原文 PDF`, `中文翻译 PDF`, and `LaTeX 源码包`. For chapters under a book
+that already has its full PDF, preserve that full-book attachment and add only
+the chapter translation PDF and source ZIP; never upload redundant chapter excerpts.
+Do not generate translation Markdown, a Chinese summary, or an extra local original
+PDF copy. Read the original as an immutable input; chapter excerpts are working
+inputs only. Retain required metadata, validation reports and recovery inputs;
+`translations.jsonl` remains the translation authority. Do not create Zotero notes.
 Use Codex translators, a separate PDF producer and independent visual reviewer,
 with role settings from [reasoning-policy.md](references/reasoning-policy.md).
 Keep the coordinator's current model/effort. Translation services and local
@@ -34,7 +39,7 @@ translation models are forbidden; scripts do deterministic processing only.
 | --- | --- |
 | Requested chapter or excerpt | [chapter-workflow.md](references/chapter-workflow.md) |
 | Paper list, library audit, or resumed batch | [batch-workflow.md](references/batch-workflow.md) |
-| Zotero explicitly or contextually in scope | [zotero-ingestion.md](references/zotero-ingestion.md), plus the available Zotero skill |
+| Zotero explicitly or contextually in scope | [zotero-ingestion.md](references/zotero-ingestion.md); Zotero plugin only for Desktop setup |
 | Extraction or source classification needs correction | [source-review.md](references/source-review.md) |
 | Source/math reconstruction or PDF typography | [rendering-contract.md](references/rendering-contract.md) |
 
@@ -76,7 +81,7 @@ glossary terms before dependent assignments. Preserve source anomalies faithfull
 
 **Produce.** After the complete translation checkpoint passes, follow
 [production.md](references/production.md) for export, rendering, strict/quick
-validation, summary, and packaging. Freeze inputs while production runs. Resolve
+validation and packaging. Freeze inputs while production runs. Resolve
 structural failures and complete the producer's repair-locus checks before
 handing a stable PDF to visual review.
 
@@ -88,15 +93,21 @@ review; byte-identical copies do not. Automated success never substitutes for
 image inspection. Require the hash-bound visual report and checker to pass.
 
 **Deliver.** Package only the exact accepted PDF and passing reports. Complete any
-requested project links, then in-scope Zotero delivery and five-attachment
+requested project links, then in-scope Zotero delivery and three-file paper or two-file chapter
 byte verification. Select the route in [zotero-ingestion.md](references/zotero-ingestion.md):
-retain Connector for new-parent imports; use an authorized existing-parent route
-for chapter attachments. On a request to continue uploading, inspect live files
+use the pinned Pyzotero local API for both new-parent imports and existing-parent
+chapter attachments; keep the independent Zotero plugin only for Desktop setup. On a request to continue uploading, inspect live files
 and the delivery ledger first; report completion when nothing is missing.
 Batch mode continues until its ledger audit is complete. Do not
 commit, publish, or modify unrelated resources merely because translation ran.
 Honor an explicitly requested existing parent; preserve it and its other children.
 The adapter's new-parent/replacement flow does not authorize replacing that parent.
+For an explicitly requested historical attachment cleanup, use the separate
+guarded `cleanup` flow in the ingestion reference. Preserve paper originals and
+full-book PDFs; only redundant chapter excerpts and unwanted Markdown/summaries
+are eligible. It never replaces parents or requires Markdown/summary generation.
+Search only the specified directories for
+missing existing source ZIPs; do not regenerate them when the user requests search only.
 
 ## Keep work bounded and recoverable
 

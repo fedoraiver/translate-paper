@@ -13,7 +13,6 @@ do not change global Codex settings or claim to change the running coordinator.
 | PDF production | `gpt-6.1-terra` / `low` | Use Terra / `medium` for new layouts or local typesetting adjustments. Assign complex generator changes or cross-file diagnosis to Sol / `high`. |
 | Independent visual review | `gpt-6.1-terra` / `medium` | Use Terra / `high` for dense formulas, multiple columns, complex tables, or small superscripts and subscripts. Refer questions about formula meaning or translation correctness to source and math review, supplying the source location and specific concern. |
 | Source and math review, if delegated | `gpt-6.1-sol` / `high` | Use Sol / `xhigh` for localized unresolved questions about quantifiers, conditions, symbol dependencies, or proof continuity after obtaining readable source evidence. Provide the source location and specific concern. Extraction/OCR alone is production work. |
-| Summary, if delegated | `gpt-6.1-terra` / `medium` | Use Sol / `high` when judging contribution boundaries, comparing technical assumptions, or explaining subtle limitations. |
 | Metadata inspection, if delegated | `gpt-6.1-terra` / `low` | Use Terra / `medium` for conflicts in authors, years, versions, DOI, or venue; check original sources and report identity as unresolved when evidence is insufficient. Zotero writes remain coordinator-only. |
 
 Do not create extra agents merely to populate this table. A higher setting never

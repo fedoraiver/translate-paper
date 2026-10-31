@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Store Zotero Web API credentials in Windows Credential Manager.
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["pyzotero==1.16.0"]
+# ///
+"""Store separate Zotero Web and local API credentials in Windows Credential Manager.
 
 The secret is accepted only on stdin and is never printed. Other skill scripts
 can import ``read_credential`` to obtain it inside the current process.
@@ -13,11 +17,11 @@ from ctypes import wintypes
 import json
 import os
 import sys
-import urllib.request
 
 
 DEFAULT_TARGET = "Codex/translate-paper/ZoteroAPI"
 LEGACY_TARGET = "Codex/translate-paper-to-zotero/ZoteroAPI"
+LOCAL_TARGET = "Codex/translate-paper/ZoteroLocalAPI"
 _CRED_TYPE_GENERIC = 1
 _CRED_PERSIST_LOCAL_MACHINE = 2
 _ERROR_NOT_FOUND = 1168
@@ -72,7 +76,7 @@ def write_credential(target: str, username: str, secret: str) -> None:
     credential = _CREDENTIALW()
     credential.Type = _CRED_TYPE_GENERIC
     credential.TargetName = target
-    credential.Comment = "Zotero Web API key for Translate paper"
+    credential.Comment = "Zotero API key for translate-paper"
     credential.CredentialBlobSize = len(secret_bytes)
     credential.CredentialBlob = ctypes.cast(
         secret_buffer, ctypes.POINTER(ctypes.c_ubyte)
@@ -122,17 +126,11 @@ def credential_exists(target: str = DEFAULT_TARGET) -> tuple[bool, str | None]:
 
 
 def verify_credential(target: str = DEFAULT_TARGET) -> dict[str, object]:
+    from zotero_client import Client
+
     user_id, api_key = read_credential(target)
-    request = urllib.request.Request(
-        "https://api.zotero.org/keys/current",
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Zotero-API-Version": "3",
-            "User-Agent": "translate-paper/2.0",
-        },
-    )
-    with urllib.request.urlopen(request, timeout=20) as response:
-        payload = json.load(response)
+    with Client(library_id=user_id, local=False, api_key=api_key) as client:
+        payload = client.call("key_info")
 
     returned_user_id = str(payload.get("userID", ""))
     if returned_user_id != user_id:
@@ -142,6 +140,28 @@ def verify_credential(target: str = DEFAULT_TARGET) -> dict[str, object]:
         "user_id": returned_user_id,
         "access": payload.get("access", {}),
     }
+
+
+def local_target(server_id: str) -> str:
+    if not server_id or any(c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_" for c in server_id):
+        raise ValueError("Invalid Zotero server ID")
+    return f"{LOCAL_TARGET}/{server_id}"
+
+
+def read_local_credential(server_id: str) -> str | None:
+    try:
+        username, key = _read_exact_credential(local_target(server_id))
+    except FileNotFoundError:
+        return None
+    if username != "translate-paper":
+        raise RuntimeError("Unexpected local credential owner")
+    return key
+
+
+def save_local_credential(server_id: str, key: str, *, remember: bool) -> bool:
+    if remember is True:
+        write_credential(local_target(server_id), "translate-paper", key)
+    return remember is True
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -186,4 +206,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except (OSError, RuntimeError, ValueError) as error:
+        print(json.dumps({"ok": False, "error": str(error)}), file=sys.stderr)
+        raise SystemExit(2)

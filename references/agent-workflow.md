@@ -41,14 +41,13 @@ rules in [reasoning-policy.md](reasoning-policy.md#dispatch-and-escalation).
 Keep the visual reviewer distinct from the agents that translated and produced
 the PDF. Within that same paper/chapter, reuse the translation agent for successive
 batches and the reviewer for successive rounds when the user's freshness policy
-allows it. A source-review or summary assignment may use an
+allows it. A source-review assignment may use an
 additional agent when it has useful independent work and a free slot; do not
 create idle agents merely to fill a role.
 
 A source-only reviewer may later serve as the independent final visual reviewer
-if it did not translate or produce the PDF and its configured model and effort fit. The
-translation agent may draft the summary after its batch work, or the coordinator
-may do so; a dedicated summary agent is optional. Delegate only when useful
+if it did not translate or produce the PDF and its configured model and effort fit.
+Delegate only when useful
 parallel work outweighs the extra source/context loading. Do not have two agents
 independently repeat the same successful source review without a concrete issue.
 
@@ -74,15 +73,14 @@ agents running. Do not start production or visual review before its gates pass.
    corrections still merge through the coordinator.
 2. Assign one translation agent by default. For a large document, independent
    sections may use separate agents only with disjoint unit IDs, separate batch
-   files, and the same accepted glossary. Merge in document order. Summary
-   drafting from the reviewed source may run alongside translation.
+   files, and the same accepted glossary. Merge in document order.
 3. Start the final export only after the canonical checkpoint passes
    `--require-complete` and source/math gates pass. The coordinator must not edit
    its inputs while PDF production is running. Different papers may run in
    parallel only in disjoint work and staging directories; preserve ledger
    ordering and let the coordinator alone update shared batch state.
 4. Hand the completed, stable PDF and its SHA-256 to the visual reviewer after
-   strict and quick checks pass. While review runs, independent summary validation or
+   strict and quick checks pass. While review runs, independent
    metadata work may continue. No renderer may overwrite the PDF or its page
    previews during review.
 5. Package, update downstream links, and ingest only after both structural and

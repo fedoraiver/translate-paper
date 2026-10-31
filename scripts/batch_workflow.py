@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["pyzotero==1.16.0"]
+# ///
 """Track, package, resume, and audit translate-paper batches.
 
 The script performs deterministic state and artifact operations only. It never
@@ -33,16 +37,12 @@ TERMINAL_STAGES = {"zotero_verified", "skipped_existing"}
 ALL_STAGES = {*STAGES, "skipped_existing"}
 STAGE_INDEX = {stage: index for index, stage in enumerate(STAGES)}
 FINAL_NAMES = {
-    "source_pdf": "原文 PDF.pdf",
     "translated_pdf": "中文翻译.pdf",
-    "translated_markdown": "中文翻译正文.md",
-    "summary": "中文论文总结.md",
     "latex_source_archive": "LaTeX源码包.zip",
     "metadata": "zotero-item.json",
     "layout_report": "中文翻译.layout.json",
     "strict_validation": "translation-validation.json",
     "quick_validation": "quick-validation.json",
-    "summary_validation": "summary-validation.json",
     "visual_review": "visual-review.json",
     "source_review_report": "source-review-report.json",
 }
@@ -168,14 +168,11 @@ def _paper_paths(
     defaults = {
         "source_pdf": source,
         "translated_pdf": work_dir / "中文翻译.pdf",
-        "translated_markdown": work_dir / "中文翻译正文.md",
-        "summary": work_dir / "中文论文总结.md",
         "latex_source_archive": work_dir / "LaTeX源码包.zip",
         "metadata": work_dir / "zotero-item.json",
         "layout_report": work_dir / "中文翻译.layout.json",
         "strict_validation": work_dir / "translated-preview" / "validation-report.json",
         "quick_validation": work_dir / "quick-validation.json",
-        "summary_validation": work_dir / "summary-validation.json",
         "visual_review": work_dir / "visual-review.json",
         "source_review_report": work_dir / "source-review-report.json",
     }
@@ -252,8 +249,7 @@ def _manifest_prepared(path: Path, source_sha256: str) -> bool:
 def _strict_validation_passes(paths: dict[str, Path]) -> bool:
     strict_ok, strict = _json_pass(paths["strict_validation"])
     quick_ok, quick = _json_pass(paths["quick_validation"])
-    summary_ok, _ = _json_pass(paths["summary_validation"])
-    if not (strict_ok and quick_ok and summary_ok):
+    if not (strict_ok and quick_ok):
         return False
     strict_metrics = dict((strict or {}).get("metrics") or {})
     quick_metrics = dict((quick or {}).get("metrics") or {})
@@ -296,17 +292,15 @@ def _final_bundle_complete(paths: dict[str, Path]) -> bool:
         required.append(final_dir / FINAL_NAMES["source_review_report"])
     if not all(path.is_file() for path in required):
         return False
-    if not _latex_archive_matches({key: final_dir / FINAL_NAMES[key]
-                                  for key in ("latex_source_archive", "source_pdf", "translated_pdf")}):
-        return False
-    if sha256_file(final_dir / FINAL_NAMES["source_pdf"]) != sha256_file(
-        paths["source_pdf"]
-    ):
+    if not _latex_archive_matches({
+        "source_pdf": paths["source_pdf"],
+        "latex_source_archive": final_dir / FINAL_NAMES["latex_source_archive"],
+        "translated_pdf": final_dir / FINAL_NAMES["translated_pdf"],
+    }):
         return False
     for name in (
         "translation-validation.json",
         "quick-validation.json",
-        "summary-validation.json",
     ):
         ok, _ = _json_pass(final_dir / name)
         if not ok:
@@ -316,7 +310,7 @@ def _final_bundle_complete(paths: dict[str, Path]) -> bool:
         (strict.get("metrics") or {}).get("strict_invariants") is True
         and not check_review_bundle(
             _read_json(final_dir / FINAL_NAMES["visual_review"]),
-            final_dir / FINAL_NAMES["source_pdf"],
+            paths["source_pdf"],
             final_dir / FINAL_NAMES["translated_pdf"],
             strict, _read_json(final_dir / "quick-validation.json"),
         )
@@ -421,19 +415,28 @@ def audit_paper_zotero(
 ) -> dict[str, Any]:
     paths = _paper_paths(ledger, ledger_path, paper)
     metadata = _identity_metadata(paper, paths)
-    matches = zotero_ingest.local_matches(metadata)
-    if len(matches) > 1:
-        return {
-            "ok": False,
-            "error": f"expected at most one exact parent, found {len(matches)}",
-            "matches": zotero_ingest.public_matches(matches),
-        }
-    if not matches:
-        return {"ok": True, "translated": False, "matches": []}
-    parent_key = str(matches[0]["key"])
-    verification = zotero_ingest.verify_generated_children(
-        zotero_ingest.fetch_local_children(parent_key), verify_archive_identity=True
-    )
+    requested = ledger["zotero_target"]
+    target = zotero_ingest.resolve_target(requested["id"], requested["name"])
+    with zotero_ingest.Client(target["library_type"], target["library_id"]) as client:
+        matches = zotero_ingest.local_matches(metadata, client=client)
+        if len(matches) > 1:
+            return {
+                "ok": False,
+                "error": f"expected at most one exact parent, found {len(matches)}",
+                "matches": zotero_ingest.public_matches(matches),
+            }
+        if not matches:
+            return {"ok": True, "translated": False, "matches": []}
+        parent_key = str(matches[0]["key"])
+        verification = zotero_ingest.verify_generated_children(
+            zotero_ingest.fetch_local_children(parent_key, client=client), verify_archive_identity=True,
+            expected_parent_key=parent_key, client=client,
+            include_source=zotero_ingest.needs_paper_source(metadata),
+        )
+        verification.update(server_id=client.server_id, target=target)
+        if not zotero_ingest.target_matches(matches[0]["_raw"], target):
+            verification["ok"] = False
+            verification["errors"].append("Parent is not in the requested library/collection.")
     return {
         "ok": verification["ok"],
         "translated": verification["ok"],
@@ -525,14 +528,6 @@ def cmd_package(args: argparse.Namespace) -> int:
         raise BatchWorkflowError(
             f"{paper['slug']}: current staging artifacts require passing structural "
             "and visual reviews before copying."
-        )
-    source_destination = final_dir / FINAL_NAMES["source_pdf"]
-    if (
-        source_destination.exists()
-        and sha256_file(source_destination) != sha256_file(paths["source_pdf"])
-    ):
-        raise BatchWorkflowError(
-            f"Refusing to replace a different source PDF in {final_dir}."
         )
     final_dir.mkdir(parents=True, exist_ok=True)
     keys = list(REQUIRED_ARTIFACTS)
@@ -672,7 +667,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     record = commands.add_parser(
         "record-zotero",
-        help="Record a parent key only after live five-attachment verification.",
+        help="Record a parent key only after live PDF/source-ZIP verification.",
     )
     record.add_argument("--ledger", required=True, type=Path)
     record.add_argument("--slug", required=True)

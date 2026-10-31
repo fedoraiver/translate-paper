@@ -13,7 +13,7 @@ does not reinstate skipped chapters. Once the user requests the whole remaining
 book, advance through its included chapters without asking the range again.
 
 Start new agents for each new chapter in every role: translation, source/math
-review, code or pseudocode repair, production, visual review, and any summary or
+review, code or pseudocode repair, production, visual review, and any
 metadata work. Do not reassign a previous chapter's idle agent to the next one.
 Within a chapter, batches and repair rounds may keep their owner when its role,
 independence and configured model/effort still fit, unless the user asks for a
@@ -28,11 +28,16 @@ not mutable chapter state. Refill from runtime completion events. When only
 serial coordination or delivery remains, finish it without creating idle agents.
 
 Track each chapter's active manifest/revision, excerpt/source hash, accepted PDF
-and source-ZIP hashes, page count, stage, and five attachment titles/keys. Keep
+and source-ZIP hashes, page count, stage, and two attachment titles/keys. Keep
 local acceptance separate from byte-verified Zotero delivery. Aggregate progress
 from those records, preserve explicit skips, and update final indexes and next
 actions to complete when the included chapters are delivered. These are recovery
 metadata, not a second translation ledger.
+
+For Zotero, upload only each chapter's Chinese translation PDF and LaTeX source
+ZIP under the book parent. Do not generate Chinese translation Markdown, a
+chapter summary or an archived original excerpt. A necessary chapter excerpt
+is a working input only.
 
 ## Establish the source once
 
@@ -111,7 +116,7 @@ literal, variables retain subscripts/primes, and program keywords remain code.
 
 Use the project's final PDF and intermediate-artifact directories from the
 start. Retain the provenance and replayable review files with the work state.
-Create a chapter summary from the requested chapter only. Check the final PDF's
+Check the final PDF's
 opening and closing pages, exercise/proof paragraph breaks, diagram captions,
 footnote anchors, and long expressions even after strict validation passes.
 
