@@ -1,12 +1,13 @@
 ---
 name: translate-paper
-description: Translate academic-paper PDFs or requested textbook chapters into Chinese, preserving original visuals and native mathematics and delivering validated PDF, Markdown, and summary artifacts. Supports resumable batches and in-scope Zotero replacement. Use when explicitly requested.
+description: Translate academic-paper PDFs or requested textbook chapters into Chinese, preserving original visuals and native mathematics and delivering validated PDF, Markdown, summary, and editable LaTeX source artifacts. Supports resumable batches and in-scope Zotero delivery. Use when explicitly requested.
 ---
 
 # Translate paper
 
 Deliver faithful Chinese body translation as PDF and Markdown, plus UTF-8
-`中文论文总结.md`. Zotero requires two PDFs and two Markdown attachments; the
+`中文论文总结.md`, plus a rebuildable `LaTeX源码包.zip`. Zotero requires five
+stored attachments: two PDFs, two Markdown files, and the LaTeX source ZIP; the
 summary title is `中文论文总结` and MIME type `text/markdown`, never an HTML note.
 Use Codex translators, a separate PDF producer and independent visual reviewer,
 with role settings from [reasoning-policy.md](references/reasoning-policy.md).
@@ -37,7 +38,8 @@ translation models are forbidden; scripts do deterministic processing only.
 | Extraction or source classification needs correction | [source-review.md](references/source-review.md) |
 | Source/math reconstruction or PDF typography | [rendering-contract.md](references/rendering-contract.md) |
 
-Never modify the source PDF, Zotero database, or Zotero storage. Do not use
+Never modify the source PDF or directly edit Zotero's database or storage. Use
+supported APIs for library changes. Do not use
 computer-use as a fallback. For an explicitly fresh retranslation, copy the
 original source and metadata to a fresh work directory; do not reuse old Chinese
 prose. Identify prior artifacts from the item and known output paths, not a broad
@@ -47,7 +49,10 @@ passes acceptance; honor an explicit request to delete first.
 ## Execution gates
 
 **Prepare and review.** Run `prepare_paper.py --input <source.pdf> --work-dir
-<work-dir> --ocr auto`. Review boundaries, source structure, mathematics, visuals,
+<work-dir> --ocr off`. Extract native text first. For image-only pages or regions,
+use the model's own image reading and save replayable source corrections; do not
+OCR readable native text or enable a traditional OCR engine unless requested.
+Review boundaries, source structure, mathematics, visuals,
 and source diagnostics. Lists, continuation paragraphs, and display ownership
 must be established before freezing units. Resolve suspicious extraction through
 the hash-bound review files; formula-only body units require reclassification.
@@ -83,9 +88,15 @@ review; byte-identical copies do not. Automated success never substitutes for
 image inspection. Require the hash-bound visual report and checker to pass.
 
 **Deliver.** Package only the exact accepted PDF and passing reports. Complete any
-requested project links, then in-scope Zotero replacement and four-child
-verification. Batch mode continues until its ledger audit is complete. Do not
+requested project links, then in-scope Zotero delivery and five-attachment
+byte verification. Select the route in [zotero-ingestion.md](references/zotero-ingestion.md):
+retain Connector for new-parent imports; use an authorized existing-parent route
+for chapter attachments. On a request to continue uploading, inspect live files
+and the delivery ledger first; report completion when nothing is missing.
+Batch mode continues until its ledger audit is complete. Do not
 commit, publish, or modify unrelated resources merely because translation ran.
+Honor an explicitly requested existing parent; preserve it and its other children.
+The adapter's new-parent/replacement flow does not authorize replacing that parent.
 
 ## Keep work bounded and recoverable
 
@@ -97,8 +108,11 @@ commit, publish, or modify unrelated resources merely because translation ran.
   checkpoint to bypass completed-unit guards.
 - Read selected JSON fields/IDs; keep detailed logs on disk. Return counts,
   paths, hashes and actionable failures, never invented token/cost measurements.
-- Reuse agents whose role, independence, configured model, and effort still fit. Start
-  dependent roles only when their inputs are ready. Use bounded waits and concise
+- Start fresh agents for each new chapter across all roles, including source/math
+  review and repairs; follow [chapter-workflow.md](references/chapter-workflow.md#multi-chapter-runs).
+  Within one paper/chapter, reuse only when role, independence, model and effort fit.
+  Honor the user's concurrency limit and fill available slots with ready work.
+  Start dependent roles only when their inputs are ready. Use bounded waits and concise
   progress updates; do not repeatedly poll unchanged logs or ask agents to restate
   a completed handoff.
 - Update the recovery pointer at accepted batches and stage transitions. Reuse

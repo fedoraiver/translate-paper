@@ -48,8 +48,9 @@ to change models takes precedence; check compatibility and representative qualit
   before assigning a replacement with the new configuration and explicit handoff.
   Keep visual review independent; transfer findings and coverage without
   concurrent writes. Use a supported runtime update if another environment
-  exposes one. Return to defaults for subsequent routine assignments and reuse
-  agents only when role, independence, model, and effort still fit.
+  exposes one. Return to defaults for subsequent routine assignments. Reuse only
+  within the same paper/chapter when role, independence, model, effort, and the user's
+  freshness policy fit; a new chapter gets new agents for every delegated role.
 
 ## Evidence and limits
 

@@ -5,6 +5,35 @@ The translation engine, fidelity, native mathematics, and validation gates stay
 the same as for a paper. Project paths and local-only rules take precedence over
 the default packaging and Zotero workflow.
 
+## Multi-chapter runs
+
+Record the agreed chapter range, skipped chapters, agent limit and freshness
+policy in the existing book/batch recovery record. A later request to continue
+does not reinstate skipped chapters. Once the user requests the whole remaining
+book, advance through its included chapters without asking the range again.
+
+Start new agents for each new chapter in every role: translation, source/math
+review, code or pseudocode repair, production, visual review, and any summary or
+metadata work. Do not reassign a previous chapter's idle agent to the next one.
+Within a chapter, batches and repair rounds may keep their owner when its role,
+independence and configured model/effort still fit, unless the user asks for a
+fresh owner for that round too.
+
+Use at most three concurrent agents by default for multi-chapter runs, bounded
+by runtime capacity; honor an explicit different user limit. With a three-agent pipeline,
+keep up to three independent, ready assignments running across chapters; start
+the next included chapter's preparation/translation while another chapter is
+in production or review. Share only accepted terminology and book metadata,
+not mutable chapter state. Refill from runtime completion events. When only
+serial coordination or delivery remains, finish it without creating idle agents.
+
+Track each chapter's active manifest/revision, excerpt/source hash, accepted PDF
+and source-ZIP hashes, page count, stage, and five attachment titles/keys. Keep
+local acceptance separate from byte-verified Zotero delivery. Aggregate progress
+from those records, preserve explicit skips, and update final indexes and next
+actions to complete when the included chapters are delivered. These are recovery
+metadata, not a second translation ledger.
+
 ## Establish the source once
 
 Locate the complete source and inspect its table of contents, PDF page labels,

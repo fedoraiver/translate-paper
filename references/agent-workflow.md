@@ -22,7 +22,9 @@ references: translators need the translation contract and compact packet;
 production needs production instructions and frozen paths; visual review needs
 the visual-review reference, frozen identity, and preview paths. Workers do not
 need Zotero credentials/procedures, other batches, or prior tool transcripts.
-If a resumed worker already has the unchanged reference, send only the delta.
+If a worker continuing the same paper/chapter already has the unchanged
+reference, send only the delta. Freshness requirements apply to every delegated
+role, not just translators; see [chapter-workflow.md](chapter-workflow.md#multi-chapter-runs).
 
 Pass the selected model and effort in the actual spawn/configuration fields, not just in
 the task prose. Record requested and confirmed model and effort (or `unverified`
@@ -37,8 +39,9 @@ rules in [reasoning-policy.md](reasoning-policy.md#dispatch-and-escalation).
 | Visual review agent | Independently inspect the completed Chinese PDF's actual rendered page images. Own the visual review report and any review-only crops in its assigned directory; do not modify the PDF, translations, or shared review files. |
 
 Keep the visual reviewer distinct from the agents that translated and produced
-the PDF. Reuse the translation agent for successive batches and the reviewer
-for successive review rounds. A source-review or summary assignment may use an
+the PDF. Within that same paper/chapter, reuse the translation agent for successive
+batches and the reviewer for successive rounds when the user's freshness policy
+allows it. A source-review or summary assignment may use an
 additional agent when it has useful independent work and a free slot; do not
 create idle agents merely to fill a role.
 
@@ -56,6 +59,14 @@ from [translation-contract.md](translation-contract.md). Agent availability does
 not permit concurrent writes to a canonical checkpoint or shared review file.
 
 ## Dependencies and safe parallel work
+
+Record the job's concurrency limit and agent-freshness policy before dispatch.
+Count actually running agents using the collaboration runtime, not stale ledger
+assignments. When the user requests a full pipeline of three agents, refill a
+free slot with the next independent, ready chapter/role without waiting for a
+manual reminder. Never exceed the limit or manufacture work to fill slots;
+serial checkpoint merges, final uploads, and dependency waits can leave fewer
+agents running. Do not start production or visual review before its gates pass.
 
 1. Resolve the source boundary, source flow, display ownership and glossary;
    pass `paper_preflight.py`, then freeze units and tokens. Source-review
@@ -85,7 +96,8 @@ Follow [visual-review.md](visual-review.md) for the visual review procedure and
 report schema, consolidated repair rounds, and mandatory all-page inspection.
 The coordinator verifies coverage and the current hash with
 `check_visual_review.py`, integrates the complete repair set, then returns the
-new frozen PDF to the same reviewer. No concurrent PDF/preview writes during
+new frozen PDF to the same chapter's reviewer when the freshness policy permits.
+No concurrent PDF/preview writes during
 review, no producer self-approval, and no carried-over pass for changed PDF bytes.
 
 ## Compact handoff and checkpoint
