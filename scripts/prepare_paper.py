@@ -1058,6 +1058,7 @@ def expand_math_fragment_bounds(
     source_text: str, start: int, end: int
 ) -> tuple[int, int]:
     """Keep function-style delimiters such as ``O(√p)`` in one fragment."""
+    original_start, original_end = start, end
     prefix = source_text[:start]
     function_open = re.search(r"[A-Za-z][A-Za-z0-9]*\(\s*$", prefix)
     if function_open:
@@ -1078,6 +1079,8 @@ def expand_math_fragment_bounds(
             open_parentheses -= 1
             continue
         break
+    if open_parentheses > 0:
+        return original_start, original_end
     return start, end
 
 
@@ -1089,15 +1092,9 @@ def build_rich_protection(
 ) -> tuple[str, dict[str, str], dict[str, dict[str, Any]], dict[str, str]]:
     """Protect exact values plus source typography using controlled tokens."""
     located = locate_span_runs(source_text, span_runs or [])
-    body_size = (
-        statistics.median(
-            float(run.get("size") or 0.0)
-            for run in located
-            if float(run.get("size") or 0.0) > 0
-        )
-        if located
-        else 0.0
-    )
+    positive_sizes = [float(run.get("size") or 0.0) for run in located
+                      if float(run.get("size") or 0.0) > 0]
+    body_size = statistics.median(positive_sizes) if positive_sizes else 0.0
 
     atomic: list[dict[str, Any]] = []
     if source_marker:
@@ -1130,6 +1127,11 @@ def build_rich_protection(
     for match in CITATION_RE.finditer(source_text):
         if any(match.start() < item["end"] and match.end() > item["start"]
                for item in atomic):
+            continue
+        if any(run.get("semantic_kind") == "math"
+               and match.start() < int(run["end"])
+               and match.end() > int(run["start"])
+               for run in located):
             continue
         # A numeric range after a membership/map symbol is an interval,
         # even when its brackets and endpoints use an upright text font.
@@ -2290,12 +2292,14 @@ def apply_reviewed_boundary(
         text = normalized_heading(str(element.get("source_text") or ""))
         if (
             start_order <= int(element["order"]) < stop_order
+            and not element.get("render_suppressed")
             and (element.get("kind") == "heading" or element_id == start_id)
             and text
         ):
             current_section = text
         if (
             start_order <= int(element["order"]) < stop_order
+            and not element.get("render_suppressed")
             and CONCLUSION_RE.match(text)
             and conclusion_id is None
         ):
@@ -2310,7 +2314,7 @@ def apply_reviewed_boundary(
         )
         if element_id in include_ids:
             translatable = True
-        if element_id in exclude_ids:
+        if element_id in exclude_ids or element.get("render_suppressed"):
             translatable = False
         element["translatable"] = translatable
         element["section"] = current_section

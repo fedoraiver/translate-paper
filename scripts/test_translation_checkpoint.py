@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from translation_checkpoint import atomic_write, checkpoint
+from translation_checkpoint import atomic_write, checkpoint, validate_text
 
 
 class CheckpointTests(unittest.TestCase):
@@ -136,6 +136,70 @@ class CheckpointTests(unittest.TestCase):
                 atomic_write(self.dest, [])
         self.assertEqual(self.dest.read_bytes(), before)
         self.assertEqual(set(self.work.iterdir()), files)
+
+    def test_exact_formal_heading_can_be_checkpointed_without_added_prose(self):
+        heading = {
+            "id": "u0", "kind": "heading", "translatable": True,
+            "source_text": "18.2.4 CIE 1976 L*a*b*",
+            "protected_text": "[[Fsection]] CIE [[P0001]] [[Flab]]",
+            "protected_tokens": {"[[P0001]]": "1976"},
+            "inline_fragments": {
+                "[[Fsection]]": {"kind": "math", "tex": "18.2.4"},
+                "[[Flab]]": {"kind": "math", "tex": r"L^{*}a^{*}b^{*}"},
+            },
+            "style_tokens": {},
+        }
+        self.units[0] = heading
+        self.write_records("units.jsonl", self.units)
+        self.write_records("template.jsonl", [
+            {**unit, "translated_text": ""} for unit in self.units
+        ])
+        report = self.save([self.entry(text=heading["protected_text"])])
+        self.assertEqual(report["completed"], 1)
+        self.assertEqual(checkpoint(self.manifest, self.dest)["completed"], 1)
+
+    def test_exact_formal_heading_preserves_style_tokens(self):
+        text = "[[B0001_OPEN]]CIE[[B0001_CLOSE]] [[P0001]] [[Flab]]"
+        unit = {
+            "id": "heading", "kind": "heading", "protected_text": text,
+            "protected_tokens": {"[[P0001]]": "1976"},
+            "inline_fragments": {"[[Flab]]": {"kind": "math", "tex": "L^{*}"}},
+            "style_tokens": {"B0001": "bold"},
+        }
+        validate_text(unit, text)
+
+    def test_untranslated_prose_heading_still_requires_chinese(self):
+        for text in ("Introduction", "CIE color spaces [[Flab]]"):
+            with self.subTest(text=text), self.assertRaisesRegex(ValueError, "no Chinese prose"):
+                validate_text({"id": "heading", "kind": "heading",
+                               "protected_text": text}, text)
+
+    def test_capitalized_prose_is_not_mistaken_for_an_acronym_heading(self):
+        text = "[[Fsection]] INTRODUCTION"
+        unit = {"id": "heading", "kind": "heading", "protected_text": text,
+                "inline_fragments": {"[[Fsection]]": {"kind": "math", "tex": "18.2.4"}}}
+        with self.assertRaisesRegex(ValueError, "no Chinese prose"):
+            validate_text(unit, text)
+
+    def test_formal_heading_exception_cannot_change_a_literal_label(self):
+        unit = {"id": "heading", "kind": "heading",
+                "protected_text": "CIE [[P0001]]",
+                "protected_tokens": {"[[P0001]]": "1976"}}
+        with self.assertRaisesRegex(ValueError, "no Chinese prose"):
+            validate_text(unit, "RGB [[P0001]]")
+
+    def test_formal_heading_exception_does_not_accept_hidden_prose_or_body_math(self):
+        text = "[[P0001]] [[Flab]]"
+        heading = {
+            "id": "heading", "kind": "heading", "protected_text": text,
+            "protected_tokens": {"[[P0001]]": "Introduction"},
+            "inline_fragments": {"[[Flab]]": {"kind": "math", "tex": "x^{2}"}},
+        }
+        with self.assertRaisesRegex(ValueError, "no Chinese prose"):
+            validate_text(heading, text)
+        with self.assertRaisesRegex(ValueError, "formula-only source units"):
+            validate_text({**heading, "kind": "body",
+                           "protected_tokens": {"[[P0001]]": "1976"}}, text)
 
 
 if __name__ == "__main__":

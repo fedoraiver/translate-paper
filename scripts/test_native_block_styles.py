@@ -15,6 +15,54 @@ from typography import ZH_ACADEMIC_V1
 
 
 class NativeBlockStyleTests(unittest.TestCase):
+    def test_reviewed_math_does_not_reinterpret_neighboring_source_prose(self):
+        element = self.element("prose-math", 1, "A source paragraph.")
+        element["inline_fragments"] = {"[[Fvalue]]": {
+            "token": "[[Fvalue]]", "kind": "math", "tex": "x_i",
+            "review_status": "manually_reviewed"}}
+        text = "a scientific 3D source is all Lambert’s, it’s [[Fvalue]]."
+        node = {"id": element["id"], "element": element, "text": text}
+        rendered = native_latex.rich_text_to_latex(node, {}, Counter())
+        self.assertEqual(rendered,
+                         r'a scientific 3D source is all Lambert\ltjalchar"2019\relax{}s, '
+                         r'it\ltjalchar"2019\relax{}s '
+                         + r"\(x_i\).")
+
+    def test_protected_heading_number_keeps_source_heading_level(self):
+        element = self.element("heading", 1, "5.1.1 Point source illumination")
+        element["kind"] = "heading"
+        element["inline_fragments"] = {"[[Fnumber]]": {
+            "token": "[[Fnumber]]", "kind": "math", "tex": "5.1.1",
+            "review_status": "auto_validated"}}
+        node = {"id": "heading", "element": element,
+                "flow_role": "heading",
+                "text": "[[Fnumber]] Point source illumination"}
+        rendered, mode = native_latex._node_to_latex(
+            node, {}, Counter(), None, Path("."), ZH_ACADEMIC_V1, {})
+        self.assertEqual(mode, "text")
+        self.assertTrue(rendered.startswith(r"\TPHeadingLower{"), rendered)
+
+    @unittest.skipUnless(shutil.which("lualatex"), "LuaLaTeX is unavailable")
+    def test_pdf_word_internal_apostrophe_keeps_latin_font(self):
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            path = work / "apostrophes.tex"
+            path.write_text(native_latex._document_preamble(ZH_ACADEMIC_V1)
+                            + native_latex.prose_to_latex("it’s ")
+                            + r"{\itshape "
+                            + native_latex.prose_to_latex("Lambert’s")
+                            + "} 中文‘引文’。\\end{document}", encoding="utf-8")
+            pdf, metrics = native_latex.compile_body_tex(work, path)
+            self.assertEqual(metrics["missing_glyphs"], 0)
+            with pymupdf.open(pdf) as document:
+                apostrophes = [span for page in document
+                               for block in page.get_text("dict")["blocks"]
+                               for line in block.get("lines", []) for span in line["spans"]
+                               if "’" in span["text"]]
+                latin = [s for s in apostrophes if "lmroman" in s["font"].lower()]
+                self.assertEqual(len(latin), 2, apostrophes)
+                self.assertTrue(any("simsun" in s["font"].lower() for s in apostrophes))
+
     def element(self, unit_id, order, source, style="normal", page=1):
         return {"id": unit_id, "order": order, "page": page,
                 "bbox": [50, 50, 450, 100], "kind": "body",

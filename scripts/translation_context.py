@@ -38,6 +38,7 @@ def compact_unit(unit: dict, reviews: dict) -> dict:
         "block_style": unit.get("block_style"),
         "flow_role": unit.get("flow_role"), "list_id": unit.get("list_id"),
         "list_level": unit.get("list_level"), "source_marker": unit.get("source_marker"),
+        "flow_reviewed": unit.get("flow_reviewed", False), "continuation_of": unit.get("continuation_of"),
         "section": unit.get("section", ""),
         "protected_text": unit["protected_text"],
         "protected_tokens": unit.get("protected_tokens", {}),

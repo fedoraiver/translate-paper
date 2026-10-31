@@ -34,6 +34,27 @@ class InvariantValidationTests(unittest.TestCase):
         active = self.unit("active", [10, 30, 20, 40])
         self.assertEqual(checker.missing_invariant_ids([suppressed, active], "", {}), ["active"])
 
+    def test_code_invariant_uses_native_clip_order_and_keeps_symbols(self) -> None:
+        code = self.unit(
+            "code", [10, 10, 200, 80], kind="code", render_mode="source_clip",
+            source_text="a = f(x)\nif (a > 0) then\n    do something",
+        )
+        layout = {"placements": [{
+            "id": "code", "kind": "code", "render_mode": "source_clip",
+            "output_page": 1, "bbox": [10, 10, 200, 100],
+        }]}
+        for comparison, expected in ((">", []), ("<", ["code"])):
+            with pymupdf.open() as document:
+                page = document.new_page(width=400, height=200)
+                page.insert_text((20, 35), "a = f(x)", fontsize=9)
+                page.insert_text((20, 75), f"if (a {comparison} 0) then", fontsize=9)
+                page.insert_text((30, 55), "do something", fontsize=9)
+                sorted_text = checker.normalize_text(page.get_text("text", sort=True))
+                self.assertEqual(checker.missing_invariant_ids([code], sorted_text, layout), ["code"])
+                native = checker.original_code_output_text(document, layout)
+                self.assertEqual(checker.missing_invariant_ids(
+                    [code], checker.normalize_text(sorted_text + native), layout), expected)
+
     def test_original_columns_are_checked_without_interleaving(self) -> None:
         left_lines = [
             "Acknowledgments begin.",

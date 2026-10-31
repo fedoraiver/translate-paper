@@ -1,0 +1,12 @@
+{
+  "listings": [
+    {
+      "text": "a = f(x)\nif (a > 0) then\n    do something",
+      "bbox": [72, 120, 290, 180]
+    },
+    {
+      "text": "if x = 126 and y = 247 then\n    print \u201cblarg!\u201d",
+      "bbox": [72, 220, 330, 265]
+    }
+  ]
+}

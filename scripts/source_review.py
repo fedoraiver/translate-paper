@@ -35,7 +35,7 @@ TEXT_KINDS = {
     "heading",
     "keywords",
 }
-CLIP_KINDS = {"equation", "figure", "figure-text", "margin-note", "table"}
+CLIP_KINDS = {"code", "equation", "figure", "figure-text", "margin-note", "table"}
 MATH_SIGNAL_RE = re.compile(r"[=<>≤≥≈≠∑∏∫√∞±×÷∂∇∈∉→←↔⊥∗◦^_{}\\]")
 PROSE_WORD_RE = re.compile(r"\b[A-Za-z]{3,}\b")
 
@@ -166,6 +166,14 @@ def _refresh_translation_fields(
     element: dict[str, Any],
     protect_element: Callable[[dict[str, Any]], None],
 ) -> None:
+    if element.get("kind") == "code" and (
+        element.get("render_mode") != "source_clip"
+        or element.get("translatable")
+        or not str(element.get("source_text") or "").strip()
+    ):
+        raise SourceReviewError(
+            f"{element['id']}: code must be a nonempty invariant source clip."
+        )
     flow_error = source_structure.validate_flow(element)
     if flow_error:
         raise SourceReviewError(f"{element['id']}: {flow_error}")
@@ -517,6 +525,7 @@ def _apply_source_review_operations(
                 "list_level": operation.get("list_level", 0),
                 "source_marker": operation.get("source_marker", ""),
                 "flow_reviewed": any(field in operation for field in source_structure.FLOW_FIELDS),
+                "continuation_of": operation.get("continuation_of"),
             }
             _refresh_translation_fields(inserted, protect_element)
             anchor_index = elements.index(anchor)
@@ -648,6 +657,10 @@ def _apply_source_review_operations(
         affected.add(caption_id)
 
     _renumber(elements)
+    try:
+        source_structure.explicit_continuations(elements)
+    except ValueError as error:
+        raise SourceReviewError(str(error)) from error
     return {
         "schema_version": SCHEMA_VERSION,
         "source_sha256": source_sha256,
@@ -730,6 +743,13 @@ def structured_source_issues(
 ) -> list[dict[str, Any]]:
     """Return source-bound risks for review gates and diagnostic sampling."""
     issues: list[dict[str, Any]] = []
+    try:
+        source_structure.explicit_continuations(elements)
+    except ValueError as error:
+        unit_id = str(error).partition(":")[0]
+        source = next((item for item in elements if str(item["id"]) == unit_id), {})
+        issues.append({"unit_id": unit_id, "page": int(source.get("page") or 0),
+                       "code": "flow_ambiguous", "message": str(error)})
     body_sizes = [float(item.get("font_size") or 0) for item in elements
                   if item.get("kind") == "body" and float(item.get("font_size") or 0) > 0]
     body_font_size = statistics.median(body_sizes) if body_sizes else None
@@ -920,7 +940,10 @@ def reconcile_translations(
                 "style_tokens",
                 *source_structure.FLOW_FIELDS,
             ):
-                if field in old and old[field] != element.get(field):
+                is_flow = field in source_structure.FLOW_FIELDS
+                before = source_structure.flow_metadata(old)[field] if is_flow else old.get(field)
+                after = source_structure.flow_metadata(element)[field] if is_flow else element.get(field)
+                if (is_flow or field in old) and before != after:
                     raise SourceReviewError(
                         f"Refusing to change {field} for completed translation "
                         f"unit {element_id} during reconciliation."

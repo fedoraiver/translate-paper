@@ -17,6 +17,12 @@ adjacent formula. Every numbered source figure/table must have one unique
 inventory entry and exactly one rendered placement. A missing, duplicate,
 cropped, distorted, or split visual is a blocking error.
 
+Standalone source code and pseudocode use `kind: "code"`, `source_clip`, and
+`translatable: false`, preserving exact source text and reviewed bounds. Keep
+them as independent vector clips without captions; do not classify their
+operators or variables as native mathematics. Markdown retains the source as
+a fenced code block, including its line breaks and indentation.
+
 Calibrate visual size from the type inside the object:
 
 `target internal font = source internal font / source body font × 11.5pt`.
@@ -102,6 +108,9 @@ Use the general `zh-academic-v1` profile for translated PDFs:
 - ideographic spacing after section numbers;
 - hanging indentation for lists;
 - no new paragraph or repeated indent for a source-page continuation.
+- no repeated indent for an explicitly reviewed `paragraph` with
+  `continuation_of`, including across independent display groups; the anchor is
+  the nearest preceding prose, and each display retains its reviewed ownership.
 - no new paragraph for a same-page extraction split when the preceding block
   ends mid-sentence; preserve an explicit line break before a new bold
   definition label and represent that label as a semantic paragraph start with
@@ -123,6 +132,9 @@ one page. Use a width-constrained TeX box for long equations so mathematical
 glyphs remain embedded text.
 
 Treat extraction blocks as layout units, not automatically as paragraphs.
+Explicit reviewed continuation links take precedence over punctuation-based
+extraction-split handling. Reject links crossing sections or unrelated content;
+only native displays and explicitly linked same-paragraph footnotes may intervene.
 Merge only consecutive translated body units in the same section when the
 previous source page ends mid-sentence and no heading, list, figure, table, or
 other source clip intervenes. Record merged IDs and typography metadata in the

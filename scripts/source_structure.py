@@ -6,7 +6,7 @@ import re
 from collections import OrderedDict
 from typing import Any
 
-FLOW_FIELDS = ("flow_role", "list_id", "list_level", "source_marker", "flow_reviewed")
+FLOW_FIELDS = ("flow_role", "list_id", "list_level", "source_marker", "flow_reviewed", "continuation_of")
 FLOW_ROLES = {"paragraph", "list_item", "list_continuation"}
 MARKER_RE = re.compile(
     r"^\s*(?P<marker>[•·▪●◦‣⁃–—\-]|\d+[.)]|\([0-9A-Za-z]+\)|[A-Za-z][.)])"
@@ -20,7 +20,8 @@ def locate_source_spans(
     """Align ordered source runs and expose lossy or nonunique alignments.
 
     Earliest and latest monotone alignments agree when the source evidence
-    locates a run unambiguously. Whitespace normalization retains exact offsets.
+    locates a run unambiguously. Normalize whitespace and optional source-line
+    dehyphenation while retaining exact offsets into the extracted text.
     """
     parts = list(re.finditer(r"\s+|\S", source_text))
     searchable = "".join(" " if p.group().isspace() else p.group() for p in parts)
@@ -28,11 +29,23 @@ def locate_source_spans(
     issues: list[dict[str, Any]] = []
     cursor = 0
     for index, run in enumerate(span_runs):
-        needle = re.sub(r"\s+", " ", str(run.get("text") or "")).strip()
-        if not needle:
+        raw = str(run.get("text") or "")
+        needles = {re.sub(r"\s+", " ", raw).strip()}
+        joined = re.sub(r"(?<=[A-Za-z])-\s*\n\s*(?=[a-z])", "", raw)
+        following = next((item for item in span_runs[index + 1:]
+                          if str(item.get("text") or "").strip()), None)
+        if (following is not None and run.get("line") is not None
+                and int(following.get("line", run["line"])) > int(run["line"])
+                and re.search(r"[A-Za-z]-\s*$", joined)
+                and re.match(r"\s*[a-z]", str(following["text"]))):
+            joined = re.sub(r"-\s*$", "", joined)
+        needles.add(re.sub(r"\s+", " ", joined).strip())
+        needles.discard("")
+        if not needles:
             continue
-        start = searchable.find(needle, cursor)
-        if start < 0:
+        matches = [(searchable.find(needle, cursor), needle) for needle in needles]
+        matches = [match for match in matches if match[0] >= 0]
+        if not matches:
             issues.append(
                 {
                     "code": "unmatched_source_span",
@@ -41,6 +54,7 @@ def locate_source_spans(
                 }
             )
             continue
+        start, needle = min(matches, key=lambda match: (match[0], -len(match[1])))
         end = start + len(needle)
         item = dict(run)
         item.update(
@@ -50,14 +64,14 @@ def locate_source_spans(
                 "text": source_text[parts[start].start() : parts[end - 1].end()],
                 "_source_run_index": index,
                 "_normalized_start": start,
-                "_needle": needle,
+                "_needles": needles,
             }
         )
         located.append(item)
         cursor = end
     cursor = len(searchable)
     for run in reversed(located):
-        latest = searchable.rfind(run["_needle"], 0, cursor)
+        latest = max(searchable.rfind(needle, 0, cursor) for needle in run["_needles"])
         if latest != run["_normalized_start"]:
             issues.append(
                 {
@@ -71,7 +85,7 @@ def locate_source_spans(
         if latest >= 0:
             cursor = latest
     for run in located:
-        del run["_needle"], run["_normalized_start"]
+        del run["_needles"], run["_normalized_start"]
     return located, sorted(issues, key=lambda issue: issue["span_index"])
 
 
@@ -111,10 +125,24 @@ def source_lines(element: dict[str, Any]) -> list[dict[str, Any]]:
     return result
 
 
+def _inside_delimiters(prefix: str) -> bool:
+    stack: list[str] = []
+    closing = {")": "(", "]": "["}
+    for character in prefix:
+        if character in "([":
+            stack.append(character)
+        elif stack and closing.get(character) == stack[-1]:
+            stack.pop()
+    return bool(stack)
+
+
 def source_markers(element: dict[str, Any]) -> list[dict[str, Any]]:
     lines = source_lines(element)
     markers: list[dict[str, Any]] = []
+    prefix = ""
     for index, line in enumerate(lines):
+        preceding_lines = prefix
+        prefix += line["text"] + "\n"
         match = MARKER_RE.match(line["text"])
         if not match:
             continue
@@ -144,18 +172,22 @@ def source_markers(element: dict[str, Any]) -> list[dict[str, Any]]:
                 content_x = float(line["bbox"][0]) + (
                     len(match["marker"]) * 0.5 + 0.3
                 ) * float(first.get("size") or 10)
-        markers.append(
-            {
-                "marker": match["marker"],
-                "line": index,
-                "marker_x": float(line["bbox"][0]) if line["bbox"] else None,
-                "content_x": content_x,
-            }
-        )
+        if not _inside_delimiters(preceding_lines + line["text"][:match.start("marker")]):
+            markers.append(
+                {
+                    "marker": match["marker"],
+                    "line": index,
+                    "marker_x": float(line["bbox"][0]) if line["bbox"] else None,
+                    "content_x": content_x,
+                }
+            )
         for embedded in re.finditer(
             r"\s(?P<marker>[•▪●◦‣⁃]|\d+[.)])\s+(?=[A-Za-z\u3400-\u9fff])",
             match["content"],
         ):
+            candidate_start = match.start("content") + embedded.start("marker")
+            if _inside_delimiters(preceding_lines + line["text"][:candidate_start]):
+                continue
             markers.append(
                 {
                     "marker": embedded["marker"],
@@ -271,6 +303,13 @@ def validate_flow(element: dict[str, Any]) -> str | None:
     role = element.get("flow_role", "paragraph")
     if role not in FLOW_ROLES:
         return f"Unsupported flow_role {role!r}."
+    continuation = element.get("continuation_of")
+    if continuation is not None:
+        if not isinstance(continuation, str) or not continuation.strip():
+            return "continuation_of must be a nonempty source prose ID or null."
+        if (role != "paragraph" or element.get("kind") != "body"
+                or element.get("translatable") is not True or not element.get("flow_reviewed")):
+            return "continuation_of requires a reviewed translatable body paragraph."
     level = element.get("list_level", 0)
     if isinstance(level, bool) or not isinstance(level, int) or level < 0:
         return "list_level must be a nonnegative integer."
@@ -301,4 +340,55 @@ def flow_metadata(element: dict[str, Any]) -> dict[str, Any]:
         "list_level": element.get("list_level", 0),
         "source_marker": element.get("source_marker", ""),
         "flow_reviewed": element.get("flow_reviewed", False),
+        "continuation_of": element.get("continuation_of"),
     }
+
+
+def explicit_continuations(elements: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Resolve reviewed prose links without inferring boundaries from wording.
+
+    The anchor is the immediately preceding prose unit. Only native displays
+    and footnotes anchored within that same reviewed paragraph may intervene.
+    Display source IDs remain independent ownership, never merged into prose.
+    """
+    ordered = sorted(elements, key=lambda item: int(item["order"]))
+    by_id = {str(item["id"]): item for item in ordered}
+    links: dict[str, dict[str, Any]] = {}
+    for index, element in enumerate(ordered):
+        if element.get("render_suppressed") or element.get("continuation_of") is None:
+            continue
+        unit_id = str(element["id"])
+        error = validate_flow(element)
+        if error:
+            raise ValueError(f"{unit_id}: {error}")
+        anchor_id = element["continuation_of"]
+        anchor = by_id.get(anchor_id)
+        if (anchor is None or anchor.get("render_suppressed")
+                or int(anchor["order"]) >= int(element["order"])
+                or anchor.get("kind") != "body" or anchor.get("translatable") is not True
+                or anchor.get("flow_role", "paragraph") != "paragraph"):
+            raise ValueError(f"{unit_id}: continuation_of must identify preceding active paragraph prose: {anchor_id!r}.")
+        if str(anchor.get("section") or "") != str(element.get("section") or ""):
+            raise ValueError(f"{unit_id}: continuation_of crosses a source section.")
+        paragraph_ids = {anchor_id}
+        ancestor = anchor
+        while str(ancestor["id"]) in links:
+            ancestor = by_id[ancestor["continuation_of"]]
+            paragraph_ids.add(str(ancestor["id"]))
+        display_ids: list[str] = []
+        for previous in reversed(ordered[:index]):
+            previous_id = str(previous["id"])
+            if previous.get("render_suppressed") or previous.get("kind") in {"header", "footer"}:
+                continue
+            if previous_id == anchor_id:
+                break
+            if previous.get("kind") == "equation" and previous.get("translatable") is not True:
+                display_ids.insert(0, previous_id)
+                continue
+            if previous.get("kind") == "footnote" and previous.get("anchor_id") in paragraph_ids:
+                continue
+            raise ValueError(f"{unit_id}: continuation_of crosses unrelated source unit {previous_id}.")
+        links[unit_id] = {"continuation_of": anchor_id,
+                          "continuation_paragraph_id": links.get(anchor_id, {}).get("continuation_paragraph_id", anchor_id),
+                          "continuation_across_display_ids": display_ids}
+    return links

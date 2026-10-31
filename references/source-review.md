@@ -2,6 +2,7 @@
 
 ## Contents
 
+- Native text and image-only regions
 - Gate and lifecycle
 - Supported operations
 - Safety and translation reconciliation
@@ -33,6 +34,25 @@ reconstruction being diagnosed. Do not print the entire manifest or all hundreds
 of math records. After replay, inspect the report delta and changed units instead
 of rereading the complete accepted source inventory.
 
+## Native text and image-only regions
+
+Prepare with `--ocr off` by default and inspect native extraction diagnostics.
+Use extracted PDF text for readable text layers; do not send the whole document
+through visual OCR merely because a few pages are images. For hybrid PDFs,
+render only the image-only or corrupt regions needed to recover missing text,
+then use the model's own image-reading ability to transcribe the source language,
+symbols and code faithfully. A traditional OCR engine or external OCR service
+requires an explicit user request; image reading must not silently enable one.
+
+Bind the transcription to the immutable source hash, page and region. Apply it
+with supported `source-review.json` operations, including reviewed reading order,
+and retain the inspected page/crop location. Rebuild extraction with the same
+OCR policy, then review affected units/math before freezing packets. Do not put
+Chinese translations into source corrections, guess unreadable symbols, or
+replace correct native text with model guesses. Figures preserved as source
+clips still need full bounds: include legends, labels and frame edges without
+neighboring prose, and verify them in the final page images.
+
 ## Gate and lifecycle
 
 Source structure is frozen before translation: `flow_role` is `paragraph`,
@@ -43,10 +63,31 @@ list has role `paragraph`; a wrapped explanation within an item is a
 blocks into separate units instead of asking the Chinese renderer to infer them.
 `replace_unit` and `insert_unit` accept these fields. They are part of the
 completed-translation contract.
-`flow_reviewed: true` marks an explicit reviewed paragraph boundary. Automatically
+`flow_reviewed: true` marks an explicit reviewed paragraph-flow decision. Without
+`continuation_of`, it declares a new paragraph boundary. Automatically
 annotated ordinary body blocks use false so existing source-only cross-page
 continuation handling remains available; an extraction block is not by itself a
 new paragraph. List roles always follow their source metadata.
+
+For an explicitly reviewed continuation, keep `flow_role: "paragraph"` and set
+`continuation_of: "<nearest preceding prose unit ID>"` on `replace_unit` or
+`insert_unit`. This automatically sets `flow_reviewed: true`. The anchor may
+itself be a continuation, forming a strictly backward chain; it must belong to
+the same source section. Adjacent prose and cross-page continuation are allowed,
+including when the preceding sentence ends with punctuation. Only independent
+native displays and footnotes explicitly anchored within that same paragraph may
+intervene. A heading, list, figure/caption, sidebar, or other unrelated prose
+blocks the link. Place floating figures with captions and sidebars after their
+complete logical paragraph rather than threading them through its displays.
+An absent/null `continuation_of` on a reviewed paragraph means a new paragraph.
+Never infer a post-display continuation from capitalization or punctuation.
+The layout records `continuation_of`, the final `continuation_paragraph_id`, and
+the ordered active equation source IDs in `continuation_across_display_ids`;
+display ownership stays in its own reviewed math groups. PDF, Markdown and
+strict validation consume this same source relationship.
+With no intervening display, adjacent continuation text joins the anchor's
+paragraph without a new line or paragraph gap; the placement's
+`reviewed_continuations` map records each joined source relationship.
 
 Read typed diagnostics in the source report: numbered displays embedded in prose,
 uncovered mathematical spans, orphan scripts, ambiguous source alignment and
@@ -108,6 +149,15 @@ Reclassify or restore one existing unit:
 `replace_unit` may also set `page`, `bbox`, `span_runs`, and `section`. When
 changing `source_text`, include reviewed `span_runs` if rich inline mathematics
 must be retained.
+
+Preserve a standalone code or pseudocode block with `kind: "code"`,
+`render_mode: "source_clip"`, and `translatable: false`. Keep its exact source
+text, line breaks and indentation in `source_text`, and review the complete
+source `bbox`. Suppress duplicated extraction fragments separately. Code is a
+captionless invariant object, not a figure or equation; it bypasses prose/math
+reconstruction, stays a vector source clip in PDF, and exports as a fenced
+Markdown block without a separate listing inventory. Both `replace_unit` and
+`insert_unit` accept this representation.
 
 Correct all affected source and protection metadata before translating those
 units. If a later visual review reveals a defect in a completed unit, preserve

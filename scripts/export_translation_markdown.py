@@ -19,6 +19,7 @@ from typing import Any
 
 from native_latex import resolve_display_math, resolve_inline_math
 from display_plan import build_display_plan, select_body_units
+from source_structure import explicit_continuations
 
 PLACEHOLDER_RE = re.compile(r"\[\[P\d{4}\]\]")
 CONTROL_TOKEN_RE = re.compile(
@@ -201,7 +202,15 @@ def export_markdown(
     footnotes: list[str] = []
     ordered_units = sorted(units, key=lambda item: int(item["order"]))
     body_units = select_body_units(ordered_units, manifest)
+    continuations = explicit_continuations(body_units)
     listings: dict[str, dict[str, Any]] = {}
+    for unit in body_units:
+        if unit.get("kind") != "code" or unit.get("render_suppressed"):
+            continue
+        if (unit.get("translatable") or unit.get("render_mode") != "source_clip"
+                or not str(unit.get("source_text") or "").strip()):
+            raise ValueError(f"{unit['id']}: code must be a nonempty invariant source clip")
+        listings[str(unit["id"])] = unit
     if listing_layout is not None:
         if not manifest.get("source_sha256") or listing_layout.get("source_sha256") != manifest["source_sha256"]:
             raise ValueError("Code listing inventory does not match the source PDF.")
@@ -213,12 +222,14 @@ def export_markdown(
         explicit_include_ids = {str(value) for value in boundary.get("include_ids") or []}
         body_unit_map.update({str(unit["id"]): unit for unit in body_units
                              if str(unit["id"]) in explicit_include_ids})
+        explicit_ids: set[str] = set()
         for entry in listing_layout.get("listings") or []:
             unit_id = str(entry.get("id") or "")
             if entry.get("semantic_kind") not in {"code-listing", "code-expression"}:
                 raise ValueError(f"{unit_id}: inventory entry is not a reviewed code listing")
-            if unit_id in listings:
+            if unit_id in explicit_ids:
                 raise ValueError(f"{unit_id}: duplicate code listing")
+            explicit_ids.add(unit_id)
             unit = body_unit_map.get(unit_id)
             if unit is None:
                 raise ValueError(f"{unit_id}: code listing is missing from the selected body")
@@ -247,6 +258,10 @@ def export_markdown(
             continue
         if unit_id in display_owners:
             tex = resolve_display_math(unit, review_entries)
+            # Reviewed prose/display/prose belongs to one Markdown paragraph.
+            # Keep each display's own $$ pair while removing paragraph breaks.
+            if any(unit_id in link["continuation_across_display_ids"] for link in continuations.values()) and lines and not lines[-1]:
+                lines.pop()
             lines.extend(("$$", tex, "$$", ""))
             previous_list = None
             continue
@@ -294,6 +309,8 @@ def export_markdown(
                 lines.extend((indent + "    " + restored, ""))
             previous_list = list_key
         else:
+            if unit_id in continuations and lines and not lines[-1]:
+                lines.pop()
             lines.extend((restored, ""))
             previous_list = None
     if footnotes:

@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any
 
 import pymupdf
+from source_structure import explicit_continuations
 from typography import SUPPORTED_PROFILES, ZH_ACADEMIC_V1, TypographyProfile
 
 
@@ -835,6 +836,7 @@ def build_flow_nodes(
     display_plan: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     nodes: list[dict[str, Any]] = []
+    continuations = explicit_continuations(elements)
     flow_section: str | None = None
     display_owners = {group["review_id"]: group for group in display_plan or []}
     display_members = {unit_id for group in display_plan or [] for unit_id in group["source_ids"]}
@@ -897,9 +899,9 @@ def build_flow_nodes(
                     )
                 )
                 and (
-                    # Equations are grouped only by explicit reviewed ownership.
-                    element.get("kind") != "equation"
-                    and not any(part.get("kind") == "equation" for part in nodes[-1].get("elements", []))
+                    # Equations and standalone code retain their reviewed bounds.
+                    element.get("kind") not in {"code", "equation"}
+                    and not any(part.get("kind") in {"code", "equation"} for part in nodes[-1].get("elements", []))
                 )
             ):
                 previous = nodes[-1]
@@ -951,6 +953,17 @@ def build_flow_nodes(
             and previous_body.get("list_id") == element.get("list_id")
             and previous_body.get("list_level") == element.get("list_level")
         )
+        explicit = continuations.get(unit_id)
+        if (explicit and not explicit["continuation_across_display_ids"] and previous_body
+                and previous_body.get("render_mode") == "text"
+                and previous_body.get("flow_role") in {"paragraph-start", "paragraph-continuation"}
+                and explicit["continuation_of"] == str(previous_body["elements"][-1]["id"])):
+            append_text_continuation(previous_body, text, element)
+            previous_body["ids"].append(unit_id)
+            previous_body["elements"].append(element)
+            previous_body["joined_continuations"] = len(previous_body["ids"]) - 1
+            previous_body.setdefault("reviewed_continuations", {})[unit_id] = dict(explicit)
+            continue
         if previous_body and (list_continuation or is_logical_continuation(previous_body, element, role)):
             previous = previous_body
             append_text_continuation(previous, text, element)
@@ -979,6 +992,8 @@ def build_flow_nodes(
                     "source_marker": element.get("source_marker", "")}
                    if structured else {}),
                 **continuation_after_visuals(nodes, element, role),
+                **({"flow_role": "paragraph-continuation", **continuations[unit_id]}
+                   if unit_id in continuations else {}),
             }
         )
     return nodes

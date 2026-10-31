@@ -22,6 +22,29 @@ def span(text: str, style: str = "text", font: str = "Times-Roman", **kw):
 
 
 class MathProseBoundariesTests(unittest.TestCase):
+    def test_reviewed_math_span_without_font_metrics(self):
+        _, _, fragments, _ = prepare_paper.build_rich_protection(
+            "x", [{"text": "x", "style": "math", "semantic_kind": "math", "line": 0}],
+        )
+        self.assertIn(("x", "math"), {
+            (item["text"], item["kind"]) for item in fragments.values()
+        })
+
+    def test_reviewed_interval_takes_precedence_over_numeric_citation(self):
+        text = "Use [0, 1], then see [2, 3]."
+        runs = [
+            span("Use "),
+            span("[0, 1]", semantic_kind="math"),
+            span(", then see "),
+            span("[2, 3]"),
+            span("."),
+        ]
+        _, _, fragments, _ = prepare_paper.build_rich_protection(text, runs)
+        kinds = {(item["text"], item["kind"]) for item in fragments.values()}
+        self.assertIn(("[0, 1]", "math"), kinds)
+        self.assertIn(("[2, 3]", "citation"), kinds)
+        self.assertNotIn(("[0, 1]", "citation"), kinds)
+
     def test_literal_set_braces_survive_raw_math_span_decoding(self):
         for font in ("NewCMMath-Book", "CMR10", "CMMI10", "UnknownMath-Regular"):
             with self.subTest(font=font):
@@ -103,6 +126,33 @@ class MathProseBoundariesTests(unittest.TestCase):
         self.assertEqual(located[0]["end"], source.index("\r"))
         self.assertEqual(located[0]["text"], source[:source.index("\r")])
         self.assertEqual(located[1]["start"], source.index("x"))
+
+    def test_prose_parenthesis_around_several_variable_mentions_is_not_math(self):
+        text = "image (x goes to red, y goes to green, z goes to blue)"
+        for variable in "xyz":
+            with self.subTest(variable=variable):
+                start = text.index(variable, text.index("("))
+                self.assertEqual(prepare_paper.expand_math_fragment_bounds(text, start, start + 1),
+                                 (start, start + 1))
+        _, _, fragments, _ = prepare_paper.build_rich_protection(text, [
+            span("image (", semantic_kind="prose"),
+            span("x", "math", "CMMI10", semantic_kind="math"),
+            span("goes to red,", semantic_kind="prose"),
+            span("y", "math", "CMMI10", semantic_kind="math"),
+            span("goes to green,", semantic_kind="prose"),
+            span("z", "math", "CMMI10", semantic_kind="math"),
+            span("goes to blue)", semantic_kind="prose"),
+        ])
+        self.assertEqual([fragment["text"] for fragment in fragments.values()], list("xyz"))
+
+    def test_balanced_math_parentheses_still_expand(self):
+        for text, atom, expected in (("Use O(√p) here.", "√p", "O(√p)"),
+                                     ("Use (x+y) here.", "x+y", "(x+y)"),
+                                     ("Use f(x goes to red) here.", "x", "x")):
+            with self.subTest(text=text):
+                start = text.index(atom)
+                left, right = prepare_paper.expand_math_fragment_bounds(text, start, start + len(atom))
+                self.assertEqual(text[left:right], expected)
 
     def test_explicit_reviewed_math_keeps_single_variables(self):
         _, _, fragments, _ = prepare_paper.build_rich_protection(

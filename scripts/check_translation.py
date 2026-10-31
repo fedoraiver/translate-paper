@@ -27,8 +27,10 @@ from pathlib import Path
 from typing import Any
 
 import pymupdf
-from PIL import Image, ImageDraw, ImageOps
+from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageOps
+from display_plan import select_body_units
 from typography import ZH_ACADEMIC_V1
+from translation_checkpoint import is_preserved_formal_heading
 from quick_validate import (
     reviewed_proof_square_count, source_contains_glyph, suspicious_glyphs,
 )
@@ -137,6 +139,56 @@ def validate_display_ownership(
     return []
 
 
+def validate_reviewed_flow(
+    manifest: dict[str, Any], units: list[dict[str, Any]], layout: dict[str, Any],
+) -> list[str]:
+    """Require explicit source continuations and rendered paragraph starts to agree."""
+    from source_structure import explicit_continuations
+
+    try:
+        body = select_body_units(units, manifest)
+        links = explicit_continuations(body)
+    except (ValueError, TypeError, KeyError) as error:
+        return [str(error)]
+    placements = list(layout.get("placements") or [])
+    errors: list[str] = []
+    for unit in body:
+        if (unit.get("render_suppressed") or not unit.get("translatable")
+                or unit.get("kind") != "body" or unit.get("flow_role") != "paragraph"
+                or not unit.get("flow_reviewed")):
+            continue
+        unit_id = str(unit["id"])
+        found = [item for item in placements if unit_id in (item.get("ids") or [item.get("id")])]
+        if len(found) != 1:
+            errors.append(f"{unit_id}: reviewed paragraph requires exactly one flow placement.")
+            continue
+        placement = found[0]
+        expected = links.get(unit_id)
+        if expected and placement.get("id") != unit_id:
+            actual = (placement.get("reviewed_continuations") or {}).get(unit_id)
+            source_ids = list(placement.get("ids") or [])
+            if (expected["continuation_across_display_ids"] or actual != expected
+                    or expected["continuation_of"] not in source_ids
+                    or source_ids.index(expected["continuation_of"]) >= source_ids.index(unit_id)
+                    or placement.get("flow_role") not in {"paragraph-start", "paragraph-continuation"}
+                    or placement.get("source_flow_role") != "paragraph"):
+                errors.append(f"{unit_id}: merged explicit continuation differs from reviewed source flow.")
+        elif expected:
+            if placement.get("source_flow_role") != "paragraph" or placement.get("flow_reviewed") is not True:
+                errors.append(f"{unit_id}: rendered source flow metadata differs from reviewed paragraph.")
+            if (placement.get("id") != unit_id or placement.get("flow_role") != "paragraph-continuation"
+                    or placement.get("text_indent") != 0):
+                errors.append(f"{unit_id}: reviewed continuation is not a separate flush paragraph continuation.")
+            for key, value in expected.items():
+                if placement.get(key) != value:
+                    errors.append(f"{unit_id}: rendered {key} differs from reviewed source flow.")
+        elif (placement.get("id") != unit_id or placement.get("flow_role") != "paragraph-start"
+              or placement.get("source_flow_role") != "paragraph" or placement.get("flow_reviewed") is not True
+              or placement.get("continuation_of") or placement.get("text_indent") != ZH_ACADEMIC_V1.body_text_indent):
+            errors.append(f"{unit_id}: reviewed paragraph start was merged or lost its source indent.")
+    return errors
+
+
 def is_expected_latin_font(value: str) -> bool:
     normalized = normalize_font_name(value)
     return (
@@ -239,10 +291,29 @@ def original_boundary_output_text(
     return "\n".join(texts)
 
 
+def original_code_output_text(
+    document: pymupdf.Document, layout: dict[str, Any] | None,
+) -> str:
+    texts: list[str] = []
+    for placement in (layout or {}).get("placements") or []:
+        if (placement.get("render_mode") != "source_clip"
+                or (placement.get("kind") != "code" and not placement.get("caption_id"))):
+            continue
+        page_index = int(placement.get("output_page") or 0) - 1
+        rectangle = pymupdf.Rect(placement.get("bbox") or [])
+        if 0 <= page_index < len(document) and not rectangle.is_empty:
+            texts.append(document[page_index].get_text("text", clip=rectangle, sort=False))
+    return "\n".join(texts)
+
+
 def missing_invariant_ids(
     units: list[dict[str, Any]],
     normalized_output: str,
     layout: dict[str, Any] | None,
+    *,
+    validated_image_code_ids: set[str] | None = None,
+    validated_image_caption_ids: set[str] | None = None,
+    validated_native_display_ids: set[str] | None = None,
 ) -> list[str]:
     exact_original_pages = full_original_source_pages(layout)
     missing: list[str] = []
@@ -252,28 +323,72 @@ def missing_invariant_ids(
             unit.get("translatable")
             or unit.get("render_suppressed")
             or int(unit.get("page") or 0) in exact_original_pages
-            or unit.get("render_mode") != "text"
+            or (unit.get("render_mode") != "text" and unit.get("kind") != "code")
             or unit.get("kind") in {"header", "footer"}
-            or len(normalize_text(text)) < 60
+            or str(unit["id"]) in (validated_native_display_ids or set())
+            or (unit.get("kind") == "caption"
+                and str(unit["id"]) in (validated_image_caption_ids or set()))
+            or (unit.get("kind") == "code"
+                and str(unit["id"]) in (validated_image_code_ids or set()))
+            or (len(normalize_text(text)) < 60 and unit.get("kind") != "code")
         ):
             continue
-        if not invariant_present(text, normalized_output):
+        present = (normalize_text(text) in normalized_output if unit.get("kind") == "code"
+                   else invariant_present(text, normalized_output))
+        if not present:
             missing.append(str(unit["id"]))
     return missing
+
+
+def _source_prose_span_boxes(
+    unit: dict[str, Any], blocks: list[dict[str, Any]],
+) -> list[pymupdf.Rect] | None:
+    """Use precise spans only for a complete, geometrically identified paragraph."""
+    if unit.get("kind") not in {"body", "heading", "footnote"}:
+        return None
+    text = normalize_text(str(unit.get("source_text") or ""))
+    if not text:
+        return None
+    bounds = pymupdf.Rect(unit.get("bbox") or [])
+    matches = []
+    for block in blocks:
+        if block.get("type") != 0:
+            continue
+        block_box = pymupdf.Rect(block["bbox"])
+        if max(abs(a - b) for a, b in zip(bounds, block_box)) > 0.002:
+            continue
+        block_text = "\n".join(
+            "".join(str(span.get("text") or "") for span in line.get("spans", []))
+            for line in block.get("lines", [])
+        )
+        if normalize_text(block_text) == text:
+            matches.append(block)
+    if len(matches) != 1:
+        return None
+    boxes = [pymupdf.Rect(span["bbox"])
+             for line in matches[0].get("lines", [])
+             for span in line.get("spans", [])
+             if str(span.get("text") or "").strip()]
+    return boxes or None
 
 
 def validate_source_clip_envelopes(
     layout: dict[str, Any] | None,
     units: list[dict[str, Any]],
+    source_document: pymupdf.Document | None = None,
 ) -> tuple[list[str], dict[str, Any]]:
     """Reject clips that include separately rendered prose or other objects.
 
     Suppressed fragments belong to their reviewed replacement and must not be
     counted as independently rendered objects. A union of two source clips,
     however, must not swallow active units between them or in another column.
+    A wrapped paragraph's rectangle also contains empty space next to its text.
+    When its complete source block is identified by text and geometry, check
+    the actual spans; otherwise retain the conservative rectangle check.
     """
     errors: list[str] = []
     checked = 0
+    page_blocks: dict[int, list[dict[str, Any]]] = {}
     for placement in list((layout or {}).get("placements") or []):
         if placement.get("render_mode") != "source_clip":
             continue
@@ -295,6 +410,15 @@ def validate_source_clip_envelopes(
                 continue
             intersection = rectangle & pymupdf.Rect(unit.get("bbox") or [])
             if intersection.get_area() > 0.5:
+                if source_document is not None and 0 < source_page <= len(source_document):
+                    if source_page not in page_blocks:
+                        page_blocks[source_page] = source_document[source_page - 1].get_text(
+                            "dict", sort=True)["blocks"]
+                    spans = _source_prose_span_boxes(unit, page_blocks[source_page])
+                    if spans is not None and not any(
+                        (rectangle & span).get_area() > 0.5 for span in spans
+                    ):
+                        continue
                 unexpected.append(str(unit["id"]))
         if unexpected:
             errors.append(
@@ -303,6 +427,476 @@ def validate_source_clip_envelopes(
             )
         checked += 1
     return errors, {"checked": checked, "contaminated_clips": len(errors)}
+
+
+def _normalized_code_pixels(
+    document: pymupdf.Document,
+    page_index: int,
+    rectangle: pymupdf.Rect,
+    source_size: tuple[float, float],
+) -> pymupdf.Pixmap:
+    """Render the actual clipped PDF contents at a shared origin and source scale."""
+    with pymupdf.open() as normalized:
+        page = normalized.new_page(width=source_size[0], height=source_size[1])
+        page.show_pdf_page(page.rect, document, page_index, clip=rectangle,
+                           keep_proportion=False)
+        return page.get_pixmap(matrix=pymupdf.Matrix(4, 4), alpha=False)
+
+
+def _code_bitmap_transform(
+    image: dict[str, Any], source_box: pymupdf.Rect, target_box: pymupdf.Rect,
+) -> tuple[float, ...]:
+    sx, sy = target_box.width / source_box.width, target_box.height / source_box.height
+    mapping = pymupdf.Matrix(sx, 0, 0, sy, target_box.x0 - sx * source_box.x0,
+                             target_box.y0 - sy * source_box.y0)
+    return tuple(pymupdf.Matrix(image["transform"]) * mapping)
+
+
+def _source_clip_bitmap_noise_evidence(
+    source: pymupdf.Document, output: pymupdf.Document,
+    source_page_index: int, output_page_index: int,
+    source_box: pymupdf.Rect, target_box: pymupdf.Rect,
+    unit_id: str, layout: dict[str, Any] | None,
+    *, combined_caption: bool = False,
+) -> dict[str, Any]:
+    """Allow interpolation noise only for unchanged bitmaps at their exact source transform."""
+    source_page, output_page = source[source_page_index], output[output_page_index]
+    source_images = [image for image in source_page.get_image_info(hashes=True)
+                     if pymupdf.Rect(image["bbox"]).intersects(source_box)]
+    actual = [image for image in output_page.get_image_info(hashes=True)
+              if pymupdf.Rect(image["bbox"]).intersects(target_box)]
+    key = lambda image: (image["digest"].hex(), image["width"], image["height"])
+    expected = [(key(image), _code_bitmap_transform(image, source_box, target_box), target_box)
+                for image in source_images]
+
+    def transform_delta(image, signature):
+        mapping = ~pymupdf.Matrix(signature[1]) * pymupdf.Matrix(image["transform"])
+        box = signature[2]
+        return max(max(abs(q.x - p.x), abs(q.y - p.y))
+                   for p in (box.tl, box.tr, box.bl, box.br)
+                   for q in [p * mapping])
+
+    def transform_tolerance(box):
+        # Production includegraphics rounds scaling coefficients. Bound that
+        # measured error at this crop, not at the far-away full-page image edge.
+        if combined_caption:
+            # Caption envelopes pass through two PDF Forms; includegraphics
+            # rounds their crop dimensions as well as its scale coefficient.
+            return min(0.04, 0.002 + max(box.width, box.height) * 0.00015)
+        return 0.002 + max(box.width, box.height) * 0.0001
+
+    def matches(image, signature):
+        return (key(image) == signature[0]
+                and transform_delta(image, signature) <= transform_tolerance(signature[2]))
+
+    # Image bboxes can extend far outside their Form clip. Exclude only instances
+    # proven to belong to another disjoint, reviewed source-clip placement.
+    other_signatures = []
+    for placement in (layout or {}).get("placements") or []:
+        if (placement.get("render_mode") != "source_clip"
+                or int(placement.get("output_page") or 0) != output_page_index + 1
+                or unit_id in (placement.get("ids") or [placement.get("id")])):
+            continue
+        other_target = pymupdf.Rect(placement.get("bbox") or [])
+        other_source = pymupdf.Rect(placement.get("source_bbox") or [])
+        page_index = int(placement.get("source_page") or 0) - 1
+        if (other_target.is_empty or other_source.is_empty or other_target.intersects(target_box)
+                or not 0 <= page_index < len(source)):
+            continue
+        for image in source[page_index].get_image_info(hashes=True):
+            if pymupdf.Rect(image["bbox"]).intersects(other_source):
+                other_signatures.append((key(image), _code_bitmap_transform(
+                    image, other_source, other_target), other_target))
+    actual = [image for image in actual
+              if any(matches(image, signature) for signature in expected)
+              or not any(matches(image, signature) for signature in other_signatures)]
+    unmatched = list(actual)
+    deltas = []
+    measured_boxes = []
+    output_to_source_transforms = []
+    for signature, source_image in zip(expected, source_images):
+        match = next((image for image in unmatched if matches(image, signature)), None)
+        if match is None:
+            break
+        deltas.append(transform_delta(match, signature))
+        mapping = ~pymupdf.Matrix(signature[1]) * pymupdf.Matrix(match["transform"])
+        measured_boxes.append(pymupdf.Rect(target_box.tl * mapping, target_box.br * mapping))
+        output_to_source_transforms.append(
+            ~pymupdf.Matrix(match["transform"]) * pymupdf.Matrix(source_image["transform"]))
+        unmatched.remove(match)
+    transforms_match = bool(expected) and len(deltas) == len(expected) and not unmatched
+
+    def drawings_in_clip(page, box):
+        for drawing in page.get_drawings():
+            pad = max(float(drawing.get("width") or 0) / 2, 0.001)
+            if (pymupdf.Rect(drawing["rect"]) + (-pad, -pad, pad, pad)).intersects(box):
+                return True
+        return False
+
+    marker = "TPVIS" + re.sub(r"[^A-Za-z0-9_.-]+", "-", unit_id)
+    markers = []
+    extra_text = False
+    for span in output_page.get_texttrace():
+        box = pymupdf.Rect(span["bbox"])
+        if not box.intersects(target_box):
+            continue
+        text = "".join(chr(character[0]) for character in span["chars"])
+        if (text == marker and float(span.get("size") or 0) <= 0.11
+                and box.y0 >= target_box.y1 - 0.2 and box.y1 <= target_box.y1 + 0.2
+                and box.x0 >= target_box.x0 - 0.002 and box.x1 <= target_box.x1 + 0.002):
+            markers.append({"text": text, "size_pt": span["size"], "bbox": list(box)})
+        else:
+            extra_text = True
+    no_vector_overlays = (not drawings_in_clip(source_page, source_box)
+                          and not drawings_in_clip(output_page, target_box))
+    source_digests = sorted(key(image) for image in source_images)
+    output_digests = sorted(key(image) for image in actual)
+    return {
+        "source_bitmap_digests": source_digests, "output_bitmap_digests": output_digests,
+        "expected_bitmap_transforms": [list(signature[1]) for signature in expected],
+        "output_bitmap_transforms": [list(image["transform"]) for image in actual],
+        "bitmap_multisets_identical": bool(source_digests) and source_digests == output_digests,
+        "bitmap_transforms_match": transforms_match,
+        "maximum_transform_delta_pt": max(deltas) if deltas else None,
+        "transform_tolerance_pt": transform_tolerance(target_box),
+        "transform_relative_tolerance": 0.00015 if combined_caption else 0.0001,
+        "no_vector_overlays": no_vector_overlays,
+        "measured_output_bbox": list(measured_boxes[0]) if transforms_match else None,
+        "output_to_source_transform": (list(output_to_source_transforms[0])
+                                       if transforms_match else None),
+        "no_extra_text": not extra_text, "layout_markers": markers,
+        "noise_eligible": (transforms_match and source_digests == output_digests
+                           and no_vector_overlays and not extra_text),
+    }
+
+
+def validate_code_preservation(
+    document: pymupdf.Document,
+    units: list[dict[str, Any]],
+    layout: dict[str, Any] | None,
+    *,
+    source_document: pymupdf.Document | None = None,
+    evidence: list[dict[str, Any]] | None = None,
+) -> list[str]:
+    """Check native code text or image-only code pixels against actual source clips."""
+    errors: list[str] = []
+    for unit in units:
+        if unit.get("kind") != "code" or unit.get("render_suppressed"):
+            continue
+        unit_id = str(unit["id"])
+        unit_errors: list[str] = []
+        record: dict[str, Any] = {"id": unit_id, "status": "fail",
+                                  "source_modality": "unverified"}
+        placements = [item for item in (layout or {}).get("placements") or []
+                      if unit_id == str(item.get("id") or "")
+                      or unit_id in item.get("ids", [])]
+        if len(placements) != 1:
+            errors.append(f"{unit_id}: code requires exactly one source clip placement.")
+            if evidence is not None:
+                evidence.append(record)
+            continue
+        placement = placements[0]
+        represented = set(placement.get("ids") or [placement.get("id")])
+        source_box = pymupdf.Rect(placement.get("source_bbox") or [])
+        expected_box = pymupdf.Rect(unit.get("bbox") or [])
+        if (placement.get("render_mode") != "source_clip"
+                or represented != {unit_id}
+                or int(placement.get("source_page") or 0) != int(unit["page"])
+                or source_box.is_empty
+                or max(abs(a - b) for a, b in zip(source_box, expected_box)) > 0.002):
+            unit_errors.append(f"{unit_id}: code source clip differs from its reviewed bounds/ownership.")
+        page_index = int(placement.get("output_page") or 0) - 1
+        target_box = pymupdf.Rect(placement.get("bbox") or [])
+        record.update(source_page=int(unit["page"]), source_bbox=list(source_box),
+                      output_page=page_index + 1, output_bbox=list(target_box))
+        if (not 0 <= page_index < len(document) or target_box.is_empty
+                or not document[page_index].rect.contains(target_box)):
+            unit_errors.append(f"{unit_id}: code output clip is empty or outside its actual page.")
+        source_page_index = int(unit["page"]) - 1
+        source_clip_text = None
+        if source_document is not None:
+            if (not 0 <= source_page_index < len(source_document) or source_box.is_empty
+                    or not source_document[source_page_index].rect.contains(source_box)):
+                unit_errors.append(f"{unit_id}: code source clip is outside its actual source page.")
+            else:
+                source_page = source_document[source_page_index]
+                source_clip_text = source_page.get_text("text", clip=source_box)
+                has_bitmap = any(pymupdf.Rect(image["bbox"]).intersects(source_box)
+                                 for image in source_page.get_image_info())
+                record["source_modality"] = ("text" if source_clip_text.strip() else
+                                             "image" if has_bitmap else "nontext-vector")
+                if source_box.get_area() >= source_page.rect.get_area() * 0.9:
+                    unit_errors.append(f"{unit_id}: code source clip covers an entire source page.")
+                envelope_errors, _ = validate_source_clip_envelopes(
+                    {"placements": [placement]}, units, source_document=source_document)
+                unit_errors.extend(envelope_errors)
+        if (not source_box.is_empty and not target_box.is_empty
+                and abs((target_box.width / target_box.height)
+                        / (source_box.width / source_box.height) - 1) > 0.002):
+            unit_errors.append(f"{unit_id}: code source clip aspect ratio changed.")
+        source_text = re.sub(r"\s+", "", str(unit.get("source_text") or ""))
+        if record["source_modality"] in {"image", "nontext-vector"}:
+            if not source_text:
+                unit_errors.append(f"{unit_id}: reviewed image code has no source transcription.")
+            if not unit_errors:
+                size = (source_box.width, source_box.height)
+                source_pixels = _normalized_code_pixels(
+                    source_document, source_page_index, source_box, size)
+                output_pixels = _normalized_code_pixels(document, page_index, target_box, size)
+                source_samples, output_samples = source_pixels.samples, output_pixels.samples
+                record.update(pixel_profile="source-clip-pixels-v1", normalized_dpi=288,
+                              pixel_dimensions=[source_pixels.width, source_pixels.height],
+                              source_pixel_sha256=hashlib.sha256(source_samples).hexdigest(),
+                              output_pixel_sha256=hashlib.sha256(output_samples).hexdigest(),
+                              pixels_identical=source_samples == output_samples)
+                if not any(value < 250 for value in source_samples):
+                    unit_errors.append(f"{unit_id}: image code source crop contains no visible content.")
+                if source_samples != output_samples:
+                    noise = _source_clip_bitmap_noise_evidence(
+                        source_document, document, source_page_index, page_index,
+                        source_box, target_box, unit_id, layout)
+                    record.update(noise)
+                    if noise["noise_eligible"]:
+                        # The production stub is rounded independently of the
+                        # graphics affine. Normalize the actual retained bitmap
+                        # crop using its measured affine, only after that affine
+                        # has passed the tight placement geometry check above.
+                        output_pixels = _normalized_code_pixels(
+                            document, page_index, pymupdf.Rect(noise["measured_output_bbox"]), size)
+                        output_samples = output_pixels.samples
+                        record.update(normalized_output_pixel_sha256=hashlib.sha256(output_samples).hexdigest(),
+                                      geometry_normalized_pixels_identical=source_samples == output_samples)
+                        size_px = (source_pixels.width, source_pixels.height)
+                        source_image = Image.frombytes("RGB", size_px, source_samples)
+                        output_image = Image.frombytes("RGB", size_px, output_samples)
+                        difference = ImageChops.difference(
+                            source_image.filter(ImageFilter.GaussianBlur(1)),
+                            output_image.filter(ImageFilter.GaussianBlur(1)))
+                        differences = difference.tobytes()
+                        source_ink = sum(255 - value for value in source_samples)
+                        output_ink = sum(255 - value for value in output_samples)
+                        mass_delta = abs(source_ink - output_ink) / max(source_ink, 1)
+                        edge_error = sum(differences) / max(source_ink, 1)
+                        maximum = max(differences)
+                        accepted = maximum <= 64 and mass_delta <= 0.01 and edge_error <= 0.25
+                        record.update(antialias_radius_px=1, maximum_blurred_channel_difference=maximum,
+                                      maximum_blurred_channel_difference_limit=64,
+                                      ink_mass_delta_ratio=mass_delta, ink_mass_delta_limit=0.01,
+                                      blurred_difference_per_source_ink=edge_error,
+                                      blurred_difference_per_source_ink_limit=0.25,
+                                      accepted_antialias_noise=accepted)
+                    else:
+                        accepted = False
+                    if not accepted:
+                        unit_errors.append(f"{unit_id}: image code pixels differ in its actual output clip.")
+        else:
+            actual_text = (document[page_index].get_text("text", clip=target_box)
+                           if 0 <= page_index < len(document) and not target_box.is_empty else "")
+            if (source_clip_text is not None
+                    and source_text != re.sub(r"\s+", "", source_clip_text)):
+                unit_errors.append(f"{unit_id}: reviewed code text differs from its actual source clip.")
+            if not source_text or source_text not in re.sub(r"\s+", "", actual_text):
+                unit_errors.append(f"{unit_id}: code text is missing or changed in its output clip.")
+        record["status"] = "fail" if unit_errors else "pass"
+        if evidence is not None:
+            evidence.append(record)
+        errors.extend(unit_errors)
+    return errors
+
+
+def _direct_bitmap_clip_identity(
+    source: pymupdf.Document, output: pymupdf.Document,
+    source_index: int, output_index: int, source_box: pymupdf.Rect,
+    bitmap_evidence: dict[str, Any],
+) -> dict[str, Any]:
+    """Compare actual page renders without adding another rounded PDF Form.
+
+    Only unchanged bitmap instances at tightly matched reviewed transforms may
+    select this coordinate system. Real output clipping and overlays remain in
+    the page display list and must produce exactly the source RGB samples.
+    Texttrace bounds are not visibility evidence: text can be clipped by a Form.
+    """
+    if not (bitmap_evidence.get("bitmap_multisets_identical")
+            and bitmap_evidence.get("bitmap_transforms_match")
+            and bitmap_evidence.get("no_vector_overlays")
+            and bitmap_evidence.get("output_to_source_transform")):
+        return {"direct_affine_pixels_identical": False}
+    source_matrix = pymupdf.Matrix(4, 0, 0, 4, -4 * source_box.x0, -4 * source_box.y0)
+    output_to_source = pymupdf.Matrix(bitmap_evidence["output_to_source_transform"])
+    original = source[source_index].get_pixmap(
+        matrix=source_matrix, clip=source_box, alpha=False, colorspace=pymupdf.csRGB)
+    rendered = output[output_index].get_pixmap(
+        matrix=output_to_source * source_matrix,
+        clip=source_box * ~output_to_source, alpha=False, colorspace=pymupdf.csRGB)
+    return {
+        "direct_affine_source_pixel_sha256": hashlib.sha256(original.samples).hexdigest(),
+        "direct_affine_output_pixel_sha256": hashlib.sha256(rendered.samples).hexdigest(),
+        "direct_affine_pixel_rects": [list(original.irect), list(rendered.irect)],
+        "direct_affine_pixels_identical": (original.irect == rendered.irect
+                                            and original.samples == rendered.samples),
+    }
+
+
+def validate_image_caption_preservation(
+    source: pymupdf.Document, output: pymupdf.Document,
+    units: list[dict[str, Any]], layout: dict[str, Any] | None,
+    evidence: list[dict[str, Any]],
+) -> list[str]:
+    """Verify image captions through their actual owned figure/caption envelope."""
+    errors: list[str] = []
+    by_id = {str(unit["id"]): unit for unit in units}
+    for caption in units:
+        if (caption.get("kind") != "caption" or caption.get("translatable")
+                or caption.get("render_suppressed")):
+            continue
+        unit_id = str(caption["id"])
+        placements = [item for item in (layout or {}).get("placements") or []
+                      if unit_id == str(item.get("id") or "")
+                      or unit_id in (item.get("ids") or [])]
+        if not any(item.get("render_mode") == "source_clip" for item in placements):
+            continue  # Native captions retain the ordinary text invariant.
+        record: dict[str, Any] = {"id": unit_id, "status": "fail"}
+        evidence.append(record)
+        failures: list[str] = []
+        if len(placements) != 1:
+            errors.append(f"{unit_id}: caption requires exactly one source-clip owner.")
+            continue
+        placement = placements[0]
+        ids = list(placement.get("ids") or [placement.get("id")])
+        members = [by_id[value] for value in ids if value in by_id]
+        source_box = pymupdf.Rect(placement.get("source_bbox") or [])
+        caption_box = pymupdf.Rect(caption.get("bbox") or [])
+        target_box = pymupdf.Rect(placement.get("bbox") or [])
+        source_index = int(placement.get("source_page") or 0) - 1
+        output_index = int(placement.get("output_page") or 0) - 1
+        canonical = pymupdf.Rect()
+        for member in members:
+            canonical |= pymupdf.Rect(member.get("bbox") or [])
+        if (len(set(ids)) != len(ids) or len(members) != len(ids)
+                or unit_id not in ids or placement.get("render_mode") != "source_clip"
+                or placement.get("caption_id", unit_id) != unit_id
+                or any(member.get("translatable") or member.get("render_suppressed")
+                       or int(member.get("page") or 0) != source_index + 1
+                       or (member is not caption and member.get("render_mode") != "source_clip")
+                       or (caption.get("visual_id") and member.get("visual_id") != caption.get("visual_id"))
+                       for member in members)
+                or canonical.is_empty or source_box.is_empty or caption_box.is_empty
+                or max(abs(a - b) for a, b in zip(canonical, source_box)) > 0.002
+                or not rectangle_covered_by_regions(caption_box, [source_box])):
+            failures.append(f"{unit_id}: caption source clip differs from reviewed group bounds/ownership.")
+        if (not 0 <= source_index < len(source) or not 0 <= output_index < len(output)
+                or target_box.is_empty or source_box.is_empty
+                or (0 <= source_index < len(source) and not source[source_index].rect.contains(source_box))
+                or (0 <= output_index < len(output) and not output[output_index].rect.contains(target_box))):
+            failures.append(f"{unit_id}: caption source/output clip is empty or outside its actual page.")
+        if failures:
+            errors.extend(failures)
+            continue
+        source_text = source[source_index].get_text("text", clip=caption_box)
+        has_bitmap = any(pymupdf.Rect(image["bbox"]).intersects(caption_box)
+                         for image in source[source_index].get_image_info())
+        record.update(source_page=source_index + 1, source_bbox=list(source_box),
+                      source_caption_bbox=list(caption_box), source_ids=ids,
+                      output_page=output_index + 1, output_bbox=list(target_box),
+                      source_modality=("text" if source_text.strip() else
+                                       "image" if has_bitmap else "nontext-vector"))
+        if source_text.strip():
+            record["status"] = "text-invariant-required"
+            continue
+        caption_pixels = _normalized_code_pixels(
+            source, source_index, caption_box, (caption_box.width, caption_box.height))
+        if not any(value < 250 for value in caption_pixels.samples):
+            errors.append(f"{unit_id}: reviewed caption source region contains no visible content.")
+            continue
+        if (source_box.get_area() >= source[source_index].rect.get_area() * 0.9
+                or abs((target_box.width / target_box.height)
+                       / (source_box.width / source_box.height) - 1) > 0.002):
+            failures.append(f"{unit_id}: image caption crop is page-sized or its aspect ratio changed.")
+        envelope_errors, _ = validate_source_clip_envelopes(
+            {"placements": [placement]}, units, source_document=source)
+        failures.extend(envelope_errors)
+        if failures:
+            errors.extend(failures)
+            continue
+        size = (source_box.width, source_box.height)
+        original = _normalized_code_pixels(source, source_index, source_box, size)
+        rendered = _normalized_code_pixels(output, output_index, target_box, size)
+        record.update(normalized_dpi=288, pixel_dimensions=[original.width, original.height],
+                      source_pixel_sha256=hashlib.sha256(original.samples).hexdigest(),
+                      output_pixel_sha256=hashlib.sha256(rendered.samples).hexdigest(),
+                      pixels_identical=original.samples == rendered.samples)
+        accepted = original.samples == rendered.samples and any(value < 250 for value in original.samples)
+        if original.samples != rendered.samples:
+            # This is an envelope identity check, not standalone-code ownership.
+            # The full group ID identifies its marker; each caption keeps its own ID.
+            noise = _source_clip_bitmap_noise_evidence(
+                source, output, source_index, output_index, source_box, target_box,
+                str(placement["id"]), layout, combined_caption=len(ids) > 1)
+            record.update(noise)
+            if noise["noise_eligible"]:
+                rendered = _normalized_code_pixels(
+                    output, output_index, pymupdf.Rect(noise["measured_output_bbox"]), size)
+                accepted = original.samples == rendered.samples
+                record.update(normalized_output_pixel_sha256=hashlib.sha256(rendered.samples).hexdigest(),
+                              geometry_normalized_pixels_identical=accepted)
+            if not accepted:
+                direct = _direct_bitmap_clip_identity(
+                    source, output, source_index, output_index, source_box, noise)
+                record.update(direct)
+                accepted = direct["direct_affine_pixels_identical"]
+        record["status"] = "pass" if accepted else "fail"
+        if not accepted:
+            errors.append(f"{unit_id}: image caption differs in its actual output group clip.")
+    return errors
+
+
+def validate_native_display_invariants(
+    document: pymupdf.Document, manifest: dict[str, Any], units: list[dict[str, Any]],
+    layout: dict[str, Any] | None, review_payload: dict[str, Any],
+    evidence: list[dict[str, Any]],
+) -> list[str]:
+    """Native display source ownership uses native glyph evidence, not raw Unicode equality."""
+    if not layout or layout.get("render_backend") != "native-lualatex-v1":
+        return []
+    reviews = dict(review_payload.get("entries") or {})
+    errors = validate_display_ownership(manifest, units, layout, reviews)
+    if review_payload.get("source_sha256") != manifest.get("source_sha256"):
+        errors.append("Native display invariant review does not match the source PDF.")
+    rich = layout.get("rich_text") or {}
+    strategies = rich.get("math_render_strategies") or {}
+    summary = rich.get("math_review") or {}
+    if (int(summary.get("unresolved") or 0) or int(summary.get("image_fallbacks") or 0)
+            or any(int(strategies.get(name) or 0) for name in
+                   ("tex-vector", "source-vector", "font-vector", "image"))):
+        errors.append("Native display invariants require resolved native mathematics without fallbacks.")
+    for placement in layout.get("placements") or []:
+        if placement.get("render_mode") != "native-math":
+            continue
+        review_id = str(placement.get("math_review_id") or "")
+        entry = reviews.get(review_id) or {}
+        record: dict[str, Any] = {"id": review_id, "source_ids": list(placement.get("ids") or []),
+                                  "status": "fail", "output_page": placement.get("output_page")}
+        evidence.append(record)
+        page_index = int(placement.get("output_page") or 0) - 1
+        if (placement.get("text_embedding") != "native-lualatex"
+                or entry.get("review_status") not in {"manually_reviewed", "auto_validated"}
+                or not str(entry.get("tex") or "").strip()
+                or not 0 <= page_index < len(document)):
+            errors.append(f"{review_id}: native display review/embedding is incomplete.")
+            continue
+        box = pymupdf.Rect(placement.get("bbox") or [])
+        math_spans = [span for block in document[page_index].get_text("dict", clip=box).get("blocks", [])
+                      for line in block.get("lines", []) for span in line.get("spans", [])
+                      if "math" in str(span.get("font") or "").casefold() and str(span.get("text") or "").strip()]
+        embedded = [font[3] for font in document[page_index].get_fonts()
+                    if "math" in font[3].casefold() and document.extract_font(font[0])[3]]
+        record.update(actual_math_fonts=sorted(set(embedded)), actual_math_glyph_spans=len(math_spans))
+        if not math_spans or not embedded:
+            errors.append(f"{review_id}: actual display page lacks embedded native mathematical glyphs.")
+    if not errors:
+        for record in evidence:
+            record["status"] = "pass"
+    return errors
 
 
 def make_contact_sheet(images: list[Path], output: Path) -> None:
@@ -647,9 +1241,16 @@ def validate_typography(
         body_sizes: list[float] = []
         for page_index in range(translation_start - 1, translation_end):
             page = document[page_index]
+            code_boxes = [pymupdf.Rect(item["bbox"]) for item in placements
+                          if item.get("kind") == "code" and item.get("render_mode") == "source_clip"
+                          and int(item.get("output_page") or 0) == page_index + 1]
             for block in page.get_text("dict", sort=True).get("blocks", []):
                 for line in block.get("lines", []):
                     for span in line.get("spans", []):
+                        span_box = pymupdf.Rect(span["bbox"])
+                        center = (span_box.tl + span_box.br) / 2
+                        if any(box.contains(center) for box in code_boxes):
+                            continue
                         text = str(span.get("text") or "")
                         font = str(span.get("font") or "")
                         if HAN_RE.search(text):
@@ -1497,7 +2098,7 @@ def main() -> int:
             errors.append(f"{unit['id']}: long body unit has no Chinese text")
         if normalize_text(translated_text) == normalize_text(
             unit.get("protected_text", "")
-        ):
+        ) and not is_preserved_formal_heading(unit, translated_text):
             errors.append(f"{unit['id']}: translation is unchanged from source")
         total_han = len(HAN_RE.findall(translated_text))
         bold_han = 0
@@ -1519,11 +2120,16 @@ def main() -> int:
     rendered_paths: list[Path] = []
     output_text = ""
     boundary_invariant_text = ""
+    code_invariant_text = ""
     output_page_count = 0
     typography_metrics: dict[str, Any] = {}
     boundary_metrics: dict[str, Any] = {}
     visual_metrics: dict[str, Any] = {}
     source_clip_metrics: dict[str, Any] = {}
+    code_preservation_evidence: list[dict[str, Any]] = []
+    caption_preservation_evidence: list[dict[str, Any]] = []
+    native_display_evidence: list[dict[str, Any]] = []
+    review_payload: dict[str, Any] = {}
     layout_path = translated.with_suffix(".layout.json")
     layout: dict[str, Any] | None = None
     if layout_path.exists():
@@ -1537,6 +2143,7 @@ def main() -> int:
             errors.append(f"Typography layout report could not be read: {error}")
     if layout is not None and int(manifest.get("schema_version") or 1) >= 2:
         if layout.get("render_backend") == "native-lualatex-v1":
+            errors.extend(validate_reviewed_flow(manifest, units, layout))
             try:
                 review_name = str((manifest.get("paths") or {}).get("math_review") or "math-review.json")
                 review_payload = json.loads((manifest_path.parent / review_name).read_text(encoding="utf-8"))
@@ -1699,9 +2306,19 @@ def main() -> int:
                 errors.extend(visual_errors)
                 warnings.extend(visual_warnings)
                 source_clip_errors, source_clip_metrics = (
-                    validate_source_clip_envelopes(layout, units)
+                    validate_source_clip_envelopes(layout, units, source_document=source_document)
                 )
                 errors.extend(source_clip_errors)
+                errors.extend(validate_code_preservation(
+                    output_document, select_body_units(units, manifest), layout,
+                    source_document=source_document, evidence=code_preservation_evidence))
+                errors.extend(validate_image_caption_preservation(
+                    source_document, output_document, select_body_units(units, manifest),
+                    layout, caption_preservation_evidence))
+                errors.extend(validate_native_display_invariants(
+                    output_document, manifest, units, layout, review_payload,
+                    native_display_evidence))
+                code_invariant_text = original_code_output_text(output_document, layout)
             finally:
                 source_document.close()
             output_document.close()
@@ -1731,8 +2348,23 @@ def main() -> int:
     for marker in suspicious_glyphs(output_text, source_glyph_text, reviewed_squares):
         errors.append(f"Rendered PDF text contains suspicious glyph {marker!r}")
 
-    normalized_output = normalize_text(output_text + "\n" + boundary_invariant_text)
-    invariant_missing = missing_invariant_ids(units, normalized_output, layout)
+    normalized_output = normalize_text(output_text + "\n" + boundary_invariant_text + "\n" + code_invariant_text)
+    validated_image_code_ids = {
+        entry["id"] for entry in code_preservation_evidence
+        if entry["status"] == "pass" and entry["source_modality"] in {"image", "nontext-vector"}
+    }
+    validated_image_caption_ids = {
+        entry["id"] for entry in caption_preservation_evidence
+        if entry["status"] == "pass" and entry.get("source_modality") in {"image", "nontext-vector"}
+    }
+    validated_native_display_ids = {
+        unit_id for entry in native_display_evidence if entry["status"] == "pass"
+        for unit_id in entry["source_ids"]
+    }
+    invariant_missing = missing_invariant_ids(
+        units, normalized_output, layout, validated_image_code_ids=validated_image_code_ids,
+        validated_image_caption_ids=validated_image_caption_ids,
+        validated_native_display_ids=validated_native_display_ids)
     if invariant_missing:
         message = (
             "Invariant source text was not found verbatim in extracted output: "
@@ -1759,6 +2391,9 @@ def main() -> int:
             "boundary_layout": boundary_metrics,
             "visual_layout": visual_metrics,
             "source_clip_envelopes": source_clip_metrics,
+            "code_preservation": code_preservation_evidence,
+            "caption_preservation": caption_preservation_evidence,
+            "native_display_invariants": native_display_evidence,
             "rich_text": {
                 "inline_fragments": dict(expected_inline),
                 "styles": dict(expected_styles),

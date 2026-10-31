@@ -8,9 +8,31 @@ import pymupdf
 
 from render_translation import partition_translation_body, is_logical_continuation
 from check_translation import validate_boundary_layout
+from prepare_paper import apply_reviewed_boundary
 
 
 class IncludedTailTests(unittest.TestCase):
+    def test_suppressed_running_heading_does_not_change_reviewed_section(self):
+        elements = [
+            {"id": "intro", "order": 1, "kind": "heading", "render_mode": "text",
+             "source_text": "1 Introduction"},
+            {"id": "before", "order": 2, "kind": "body", "render_mode": "text",
+             "source_text": "The original paragraph begins."},
+            {"id": "running", "order": 3, "kind": "heading", "render_mode": "text",
+             "source_text": "2 Introduction", "render_suppressed": True},
+            {"id": "after", "order": 4, "kind": "body", "render_mode": "text",
+             "source_text": "The paragraph continues on the next page."},
+            {"id": "stop", "order": 5, "kind": "heading", "render_mode": "text",
+             "source_text": "References"},
+        ]
+        apply_reviewed_boundary(elements, {
+            "source_sha256": "source", "reviewed": True,
+            "start_id": "intro", "stop_before_id": "stop",
+            "allow_missing_conclusion": True, "reason": "Reviewed complete body.",
+        }, "source")
+        self.assertEqual(elements[1]["section"], elements[3]["section"])
+        self.assertFalse(elements[2]["translatable"])
+
     def test_boundary_rounding_tolerance_rejects_real_overflow(self):
         with pymupdf.open() as source, pymupdf.open() as output:
             source.new_page(width=595.2755737, height=841.8897705)

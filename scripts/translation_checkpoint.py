@@ -19,9 +19,10 @@ from source_structure import FLOW_FIELDS, flow_metadata
 
 TOKEN_RE = re.compile(r"\[\[[^\[\]\r\n]+\]\]")
 HAN_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
+FORMAL_LABEL_RE = re.compile(r"(?:[A-Z][A-Z0-9]+|[0-9]+|[\s.,:;()\[\]/+\-–—])+")
 SOURCE_FIELDS = (
     "source_text", "protected_text", "protected_tokens", "inline_fragments",
-    "style_tokens", "flow_role", "list_id", "list_level", "source_marker", "flow_reviewed",
+    "style_tokens", "flow_role", "list_id", "list_level", "source_marker", "flow_reviewed", "continuation_of",
 )
 
 
@@ -47,6 +48,34 @@ def read_records(path: Path) -> list[dict]:
     return records
 
 
+def is_preserved_formal_heading(unit: dict, text: str) -> bool:
+    """Allow exact notation headings; uppercase prose alone is not evidence."""
+    protected = str(unit.get("protected_text") or "")
+    if unit.get("kind") != "heading" or text.strip() != protected.strip():
+        return False
+    literal = TOKEN_RE.sub(" ", protected)
+    if literal.strip() and not FORMAL_LABEL_RE.fullmatch(literal):
+        return False
+    has_notation = False
+    for token in TOKEN_RE.findall(protected):
+        fragment = (unit.get("inline_fragments") or {}).get(token)
+        if fragment is not None:
+            if fragment.get("kind") != "math":
+                return False
+            notation = str(fragment.get("text") or fragment.get("tex") or "")
+            if re.search(r"[A-Za-zΑ-ω]", notation):
+                has_notation = True
+        elif token in (unit.get("protected_tokens") or {}):
+            value = str(unit["protected_tokens"][token])
+            if not FORMAL_LABEL_RE.fullmatch(value) or not re.search(r"[A-Z0-9]", value):
+                return False
+        else:
+            match = re.fullmatch(r"\[\[(.+)_(OPEN|CLOSE)\]\]", token)
+            if not match or match.group(1) not in (unit.get("style_tokens") or {}):
+                return False
+    return has_notation
+
+
 def validate_text(unit: dict, text: str) -> None:
     if not isinstance(text, str):
         raise ValueError(f"{unit['id']}: translated_text must be a string")
@@ -59,7 +88,8 @@ def validate_text(unit: dict, text: str) -> None:
             f"{unit['id']}: protected/style token sequence differs; "
             f"expected {expected}, got {actual}"
         )
-    if not HAN_RE.search(TOKEN_RE.sub("", text)):
+    if (not HAN_RE.search(TOKEN_RE.sub("", text))
+            and not is_preserved_formal_heading(unit, text)):
         raise ValueError(
             f"{unit['id']}: no Chinese prose; review formula-only source units "
             "instead of adding filler"

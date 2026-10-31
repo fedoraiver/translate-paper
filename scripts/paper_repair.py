@@ -12,6 +12,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+from functools import partial
 from pathlib import Path
 
 from assignment_identity import digest
@@ -41,12 +42,12 @@ def input_paths(manifest_path: Path) -> dict[str, Path]:
     return {key: path.resolve() for key, path in result.items() if path.is_file()}
 
 
-def prepare_candidate(work: Path) -> None:
+def prepare_candidate(work: Path, *, ocr: str = "auto") -> None:
     manifest = json.loads((work / "manifest.json").read_text(encoding="utf-8-sig"))
     command = ["uv", "run", "--script", str(Path(__file__).with_name("prepare_paper.py")),
                "--input", manifest["source_pdf"], "--work-dir", str(work),
                "--source-review", str(work / "source-review.json"),
-               "--boundary-review", str(work / "boundary-review.json"), "--ocr", "auto"]
+               "--boundary-review", str(work / "boundary-review.json"), "--ocr", ocr]
     with (work / "repair-prepare.log").open("w", encoding="utf-8") as stream:
         result = subprocess.run(command, stdout=stream, stderr=subprocess.STDOUT,
                                 env={**os.environ, "PYTHONUTF8": "1"}, check=False)
@@ -178,6 +179,7 @@ def main() -> int:
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--report", type=Path)
+    parser.add_argument("--ocr", choices=("auto", "off", "force"), default="auto")
     args = parser.parse_args()
     try:
         if args.report:
@@ -188,7 +190,8 @@ def main() -> int:
             if args.output_dir and (args.report.resolve() == args.output_dir.resolve()
                                     or args.output_dir.resolve() in args.report.resolve().parents):
                 raise ValueError("Use the revision's generated repair-plan.json; report must be outside the revision")
-        result = repair(args.manifest, args.source_review, output_dir=args.output_dir, apply=args.apply)
+        result = repair(args.manifest, args.source_review, output_dir=args.output_dir, apply=args.apply,
+                        builder=partial(prepare_candidate, ocr=args.ocr))
         if args.report:
             atomic_json(args.report, result)
         print(json.dumps(result, ensure_ascii=False, indent=2))

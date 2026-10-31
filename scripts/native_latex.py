@@ -465,6 +465,12 @@ def latex_escape_text(value: str) -> str:
             output.append(r"\(\vec{" + character + r"}\)")
             index += 2
             continue
+        if (character == "’" and 0 < index < len(value) - 1
+                and re.fullmatch(r"[A-Za-z]", value[index - 1])
+                and re.fullmatch(r"[A-Za-z]", value[index + 1])):
+            output.append(r'\ltjalchar"2019\relax{}')
+            index += 1
+            continue
         if character == "‣" or "①" <= character <= "⑳" or "\u25a0" <= character <= "\u25ff":
             output.append(r"\TPTextSymbol{" + character + "}")
             index += 1
@@ -565,10 +571,6 @@ def rich_text_to_latex(
         else node.get("element", {}).get("block_style")
     ) or "normal")
     fragments, styles = node_rich_metadata(node)
-    allow_auto_math = any(
-        str(fragment.get("kind") or "") == "math"
-        for fragment in fragments.values()
-    )
     text = str(node.get("text") or "")
     if node.get("flow_role") == "list-item" and not node.get("source_flow_role"):
         def list_boundary(match: re.Match[str]) -> str:
@@ -617,10 +619,7 @@ def rich_text_to_latex(
     cursor = 0
     for match in CONTROL_TOKEN_RE.finditer(text):
         output.append(
-            prose_to_latex(
-                text[cursor : match.start()],
-                allow_auto_math=allow_auto_math,
-            )
+            prose_to_latex(text[cursor : match.start()])
         )
         token = match.group(0)
         if token == "[[BR]]":
@@ -685,7 +684,7 @@ def rich_text_to_latex(
                 output.append(r"{\itshape " if edge == "OPEN" else "}")
         cursor = match.end()
     output.append(
-        prose_to_latex(text[cursor:], allow_auto_math=allow_auto_math)
+        prose_to_latex(text[cursor:])
     )
     rendered = "".join(output)
     return r"{\itshape " + rendered + "}" if block_style == "italic" else rendered
@@ -780,11 +779,24 @@ def preserve_reviewed_caption_nodes(
         parts = list(caption.get("elements") or [caption["element"]])
         if (
             caption_index in consumed
-            or abs(caption_index - index) != 1
             or any(part.get("kind") != "caption" for part in parts)
             or any(int(part["page"]) != int(node["element"]["page"]) for part in parts)
         ):
             raise ValueError(f"{node['id']}: reviewed caption requires a contiguous same-page source crop")
+        bounds = pymupdf.Rect(node["element"]["bbox"])
+        for part in parts:
+            bounds |= pymupdf.Rect(part["bbox"])
+        if abs(caption_index - index) != 1:
+            crop = bounds | pymupdf.Rect(visual.get("source_bbox") or bounds)
+            for between in nodes[min(index, caption_index) + 1:max(index, caption_index)]:
+                for part in between.get("elements") or [between["element"]]:
+                    if part.get("render_suppressed"):
+                        continue
+                    rectangle = pymupdf.Rect(part["bbox"]) if part.get("bbox") else pymupdf.Rect()
+                    if (int(part.get("page") or 0) != int(node["element"]["page"])
+                            or rectangle.is_empty
+                            or (crop & rectangle).get_area() > 0.5):
+                        raise ValueError(f"{node['id']}: reviewed caption requires a contiguous same-page source crop")
         # Keep source classifications intact; only the rendering node is combined.
         combined = {**node, "element": dict(node["element"])}
         combined["elements"] = list(node.get("elements") or [node["element"]]) + parts
@@ -792,9 +804,6 @@ def preserve_reviewed_caption_nodes(
             caption.get("ids") or [caption["id"]])
         combined["composite_parts"] = len(combined["elements"])
         combined["source_caption_ids"] = [part["id"] for part in parts]
-        bounds = pymupdf.Rect(node["element"]["bbox"])
-        for part in parts:
-            bounds |= pymupdf.Rect(part["bbox"])
         combined["element"]["bbox"] = list(bounds)
         replacements[index] = combined
         consumed.add(caption_index)
@@ -972,7 +981,8 @@ def _caption_clip_needspace(
 
 
 def _document_preamble(profile: Any) -> str:
-    return rf"""\documentclass[a4paper,UTF8,fontset=none]{{ctexart}}
+    # Profile leading is absolute, so disable ctex's default 1.3 multiplier.
+    return rf"""\documentclass[a4paper,UTF8,fontset=none,linespread=1]{{ctexart}}
 \usepackage{{fontspec}}
 \usepackage{{unicode-math}}
 \usepackage{{amsmath,mathtools}}
@@ -1017,9 +1027,11 @@ def _document_preamble(profile: Any) -> str:
   {{\sffamily\bfseries\fontsize{{{profile.heading_lower_size}pt}}{{{profile.heading_lower_line_pitch}pt}}\selectfont #1\par}}%
   \nobreak\vspace{{{profile.heading_lower_after}pt}}%
 }}
-\newcommand{{\TPDisplayMath}}[1]{{%
+\newcommand{{\TPDisplayMath}}[2][]{{%
   \par\smallskip
-  \begin{{center}}\adjustbox{{max width=\linewidth}}{{$\displaystyle #1$}}\end{{center}}%
+  \begin{{center}}\adjustbox{{max width=\linewidth}}{{%
+    \makebox[0pt][l]{{\fontsize{{0.1pt}}{{0.1pt}}\selectfont\detokenize{{#1}}}}%
+    $\displaystyle #2$}}\end{{center}}%
   \smallskip
 }}
 \newcommand{{\TPFootnote}}[1]{{%
@@ -1046,7 +1058,8 @@ def _node_to_latex(
     if _node_is_display_math(node):
         tex = resolve_display_math(node, reviews)
         math_statuses["manually_reviewed_display"] += 1
-        return rf"\TPDisplayMath{{{tex}}}", "native-math"
+        placement_marker = "TPMATH" + _sanitize_id(str(node["id"]))
+        return rf"\TPDisplayMath[{placement_marker}]{{{tex}}}", "native-math"
     if _node_is_nonmath_clip(node):
         asset = _create_source_clip_asset(source, node, asset_dir)
         relative = asset.relative_to(asset_dir.parent).as_posix()
@@ -1085,7 +1098,9 @@ def _node_to_latex(
         footnotes_by_id=footnotes_by_id,
     )
     if role == "heading":
-        level_text = re.match(r"^\s*(\d+(?:\.\d+)*)", str(node.get("text") or ""))
+        source_text = str(node.get("element", {}).get("source_text")
+                          or node.get("text") or "")
+        level_text = re.match(r"^\s*(\d+(?:\.\d+)*)", source_text)
         level = 1 if not level_text else level_text.group(1).count(".") + 1
         command = "TPHeadingOne" if level == 1 else "TPHeadingLower"
         return rf"\{command}{{{content}}}", "text"
@@ -1213,6 +1228,8 @@ def build_body_tex(
             }
         if render_mode == "native-math":
             placement["math_review_id"] = str(node.get("math_review_id") or node["id"])
+        if node.get("reviewed_continuations"):
+            placement["reviewed_continuations"] = node["reviewed_continuations"]
         if node.get("source_flow_role"):
             placement.update({key: node.get(key) for key in
                               ("source_flow_role", "flow_reviewed", "list_id", "list_level", "source_marker")})
@@ -1224,7 +1241,10 @@ def build_body_tex(
         if node.get("continuation_of"):
             placement.update({
                 "continuation_of": node["continuation_of"],
-                "continuation_across_visual_ids": node["continuation_across_visual_ids"],
+                **{key: list(node[key]) for key in
+                   ("continuation_across_visual_ids", "continuation_across_display_ids") if key in node},
+                **({"continuation_paragraph_id": node["continuation_paragraph_id"]}
+                   if "continuation_paragraph_id" in node else {}),
                 "text_indent": 0,
             })
         if _node_is_nonmath_clip(node):
@@ -1274,14 +1294,17 @@ def visual_placement_report(placement: dict[str, Any]) -> dict[str, Any]:
         crop = pymupdf.Rect(placement["source_bbox"])
         target = pymupdf.Rect(placement["bbox"])
         scale = float(placement["actual_scale"])
-        left = target.x0 + (visual.x0 - crop.x0) * scale
-        top = target.y0 + (visual.y0 - crop.y0) * scale
+        # Calibration uses TeX pt; the located target uses PDF points.
+        pdf_scale = target.width / max(crop.width, 1.0)
+        left = target.x0 + (visual.x0 - crop.x0) * pdf_scale
+        top = target.y0 + (visual.y0 - crop.y0) * pdf_scale
         width, height = visual.width * scale, visual.height * scale
         report.update({
             "source_bbox": list(visual),
             "target_width_pt": round(width, 3),
             "target_height_pt": round(height, 3),
-            "bbox": [left, top, left + width, top + height],
+            "bbox": [left, top, left + visual.width * pdf_scale,
+                     top + visual.height * pdf_scale],
         })
     return report
 
@@ -1490,6 +1513,14 @@ def locate_placements(
         page_number: document[page_number - 1].get_text("text", sort=True)
         for page_number in range(translation_start, translation_end + 1)
     }
+    placement_markers: dict[str, list[tuple[int, dict[str, Any]]]] = {}
+    for page_number in range(translation_start, translation_end + 1):
+        for block in document[page_number - 1].get_text("dict").get("blocks", []):
+            for line in block.get("lines", []):
+                for span in line.get("spans", []):
+                    marker = str(span.get("text") or "")
+                    if marker.startswith(("TPVIS", "TPMATH")):
+                        placement_markers.setdefault(marker, []).append((page_number, span))
     content_box = [
         profile.margin_left,
         profile.margin_top,
@@ -1500,8 +1531,18 @@ def locate_placements(
     located: list[dict[str, Any]] = []
     for stub, node in zip(placement_stubs, nodes):
         plain = _replace_control_tokens_with_text(node)
-        if stub.get("render_mode") == "source_clip":
-            anchor = "TPVIS" + _sanitize_id(str(stub["id"]))
+        marker_run = None
+        if stub.get("render_mode") in {"source_clip", "native-math"}:
+            prefix = "TPVIS" if stub["render_mode"] == "source_clip" else "TPMATH"
+            anchor = prefix + _sanitize_id(str(stub["id"]))
+            matches = placement_markers.get(anchor, [])
+            if len(matches) != 1:
+                document.close()
+                raise ValueError(
+                    f"{stub['id']}: expected exactly one actual {stub['render_mode']} marker, "
+                    f"found {len(matches)}."
+                )
+            page_number, marker_run = matches[0]
         else:
             candidates = re.findall(
                 r"[\u3400-\u9fffA-Za-z0-9]"
@@ -1509,8 +1550,9 @@ def locate_placements(
                 plain,
             )
             anchor = candidates[0].strip() if candidates else ""
-        page_number = last_page
-        if anchor:
+        if marker_run is None:
+            page_number = last_page
+        if anchor and marker_run is None:
             normalized_anchor = _normalize(anchor[:20])
             for candidate_page in range(last_page, translation_end + 1):
                 if normalized_anchor in _normalize(page_texts[candidate_page]):
@@ -1541,6 +1583,13 @@ def locate_placements(
                     left + target_width,
                     content_box[1] + target_height,
                 ]
+                if marker_run is not None:
+                    # The marker shares the included graphic's lower-left baseline.
+                    # TeX pt and PDF points differ by 72/72.27.
+                    actual_width = target_width * 72 / 72.27
+                    actual_height = target_height * 72 / 72.27
+                    x, bottom = marker_run["origin"]
+                    bbox = [x, bottom - actual_height, x + actual_width, bottom]
         located.append(
             {
                 **stub,

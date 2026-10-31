@@ -11,7 +11,7 @@ from source_structure import flow_metadata
 UNIT_FIELDS = (
     "id", "page", "kind", "section", "source_text", "protected_text",
     "protected_tokens", "inline_fragments", "style_tokens", "block_style",
-    "flow_role", "list_id", "list_level", "source_marker", "flow_reviewed",
+    "flow_role", "list_id", "list_level", "source_marker", "flow_reviewed", "continuation_of",
 )
 
 

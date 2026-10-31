@@ -74,6 +74,37 @@ class CaptionVectorTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'contiguous same-page'):
                 renderer.prepare_native_clip_nodes(nodes, elements, ZH_ACADEMIC_V1)
 
+    def test_caption_can_cross_reading_order_prose_in_a_separate_column(self):
+        nodes, elements = self.fixture()
+        body = {'id': 'body', 'page': 1, 'bbox': [300, 110, 500, 230],
+                'kind': 'body', 'render_mode': 'text', 'translatable': True,
+                'source_text': 'UNRELATED LEFT COLUMN'}
+        nodes.insert(1, {'id': 'body', 'ids': ['body'], 'element': body,
+                         'elements': [body], 'render_mode': 'text'})
+        elements.insert(1, body)
+        prepared = renderer.prepare_native_clip_nodes(nodes, elements, ZH_ACADEMIC_V1)
+        self.assertEqual([node['id'] for node in prepared], ['figure', 'body'])
+        self.assertEqual(set(prepared[0]['ids']), {'figure', 'caption'})
+        with tempfile.TemporaryDirectory() as temporary, pymupdf.open() as source:
+            page = source.new_page(width=612, height=792)
+            page.insert_text((60, 140), 'FIGURE CONTENT')
+            page.insert_text((45, 228), 'Figure 1. CAPTION')
+            page.insert_text((310, 150), 'UNRELATED LEFT COLUMN')
+            renderer.build_body_tex(prepared, {}, ZH_ACADEMIC_V1, source, Path(temporary))
+            asset = next((Path(temporary) / 'assets').glob('*.pdf'))
+            with pymupdf.open(asset) as clipped:
+                self.assertIn('CAPTION', clipped[0].get_text())
+                self.assertNotIn('UNRELATED', clipped[0].get_text())
+
+    def test_nonadjacent_caption_cannot_swallow_prose_inside_its_crop(self):
+        nodes, elements = self.fixture()
+        body = {'id': 'body', 'page': 1, 'bbox': [60, 201, 240, 209],
+                'kind': 'body', 'render_mode': 'text', 'translatable': True}
+        nodes.insert(1, {'id': 'body', 'element': body, 'elements': [body],
+                         'render_mode': 'text'})
+        with self.assertRaisesRegex(ValueError, 'contiguous same-page'):
+            renderer.prepare_native_clip_nodes(nodes, elements, ZH_ACADEMIC_V1)
+
 
 
 if __name__ == '__main__':

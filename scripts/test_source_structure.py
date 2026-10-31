@@ -114,6 +114,39 @@ class SourceFlowTests(unittest.TestCase):
             )
             self.assertIn(fragments[0]["token"], record["protected_text"])
 
+    def test_parenthetical_values_are_not_additional_list_items(self):
+        text = (
+            "1. A dead cell (i.e., binary value at a given location is 0) with exactly three "
+            "live neighbors becomes a live cell (i.e., its value set to 1)."
+        )
+        record = unit(text, [span(text)])
+        self.assertEqual(
+            [marker["marker"] for marker in source_structure.source_markers(record)],
+            ["1."],
+        )
+        source_structure.annotate_source_flow([record])
+        self.assertEqual(record["flow_role"], "list_item")
+        self.assertNotIn("flow_review_required", record)
+        self.assertEqual(source_review.structured_source_issues([record]), [])
+
+    def test_parenthetical_values_do_not_hide_genuine_inline_list_items(self):
+        for lines in (
+            ["1. First item (value is 0) with detail. 2. Second item."],
+            ["1. First item (value is", "0) with detail. 2. Second item."],
+            ["1. First item [value is 0) with detail]. 2. Second item."],
+        ):
+            with self.subTest(lines=lines):
+                record = unit(
+                    "\n".join(lines),
+                    [span(text, line=i) for i, text in enumerate(lines)],
+                )
+                self.assertEqual(
+                    [marker["marker"] for marker in source_structure.source_markers(record)],
+                    ["1.", "2."],
+                )
+                source_structure.annotate_source_flow([record])
+                self.assertIn("flow_review_required", record)
+
     def test_numeric_expression_and_section_heading_are_not_lists(self):
         records = [
             unit("1. + x", [span("1. + x", style="math")]),
@@ -297,6 +330,35 @@ class SourceMathDiagnosticsTests(unittest.TestCase):
         )
         self.assertEqual(len(located), 3)
         self.assertEqual(issues, [])
+
+    def test_dehyphenated_lines_keep_every_span_and_exact_clean_text_offsets(self):
+        cases = [
+            ("manipulate images.", [span("ma-", line=0, style="italic"),
+                                    span("nipulate images.", line=1)]),
+            ("Input/output sends information between the parts.", [
+                span("Input/out-", line=0), span("put sen-", line=1),
+                span("ds information be-", line=2), span("tween the parts.", line=3)]),
+            ("manipulate images.", [span("ma-\nnipulate images.")]),
+            ("input/out-put remains hyphenated.", [span("input/out-", line=0),
+                                                   span("put remains hyphenated.", line=1)]),
+        ]
+        for text, runs in cases:
+            with self.subTest(text=text):
+                before = copy.deepcopy(runs)
+                located, issues = source_structure.locate_source_spans(text, runs)
+                self.assertEqual(issues, [])
+                self.assertEqual(len(located), len(runs))
+                self.assertEqual(runs, before)
+                self.assertEqual([run["_source_run_index"] for run in located], list(range(len(runs))))
+                for run in located:
+                    self.assertEqual(run["text"], text[run["start"]:run["end"]])
+                self.assertEqual(self.codes(text, runs), set())
+
+    def test_same_line_hyphen_is_not_silently_removed(self):
+        located, issues = source_structure.locate_source_spans(
+            "manipulate images.", [span("ma-", line=0), span("nipulate images.", line=0)])
+        self.assertEqual(len(located), 1)
+        self.assertIn("unmatched_source_span", {issue["code"] for issue in issues})
 
     def test_uncovered_math_is_generic_and_respects_reviewed_prose(self):
         for symbol in ("z", "ν", "𝑟"):

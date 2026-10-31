@@ -62,6 +62,26 @@ class RepairTests(unittest.TestCase):
         self.assert_baseline_unchanged()
         self.assertFalse((self.work / "run-state.json").exists())
 
+    def test_off_policy_reaches_actual_prepare_subprocess(self):
+        with patch("paper_repair.subprocess.run") as execute:
+            execute.return_value.returncode = 0
+            paper_repair.prepare_candidate(self.work, ocr="off")
+        command = execute.call_args.args[0]
+        self.assertEqual(command[command.index("--ocr") + 1], "off")
+
+    def test_cli_off_policy_reaches_repair_builder(self):
+        argv = ["paper_repair.py", "--manifest", str(self.manifest),
+                "--source-review", str(self.proposal), "--ocr", "off"]
+        with patch("sys.argv", argv), patch("paper_repair.repair", return_value={}) as execute, \
+                patch("builtins.print"):
+            self.assertEqual(paper_repair.main(), 0)
+        builder = execute.call_args.kwargs["builder"]
+        with patch("paper_repair.subprocess.run") as prepare:
+            prepare.return_value.returncode = 0
+            builder(self.work)
+        command = prepare.call_args.args[0]
+        self.assertEqual(command[command.index("--ocr") + 1], "off")
+
     def test_apply_only_reopens_changed_anchors_and_updates_one_pointer(self):
         destination = Path(self.temp.name) / "revision-1"
         report = repair(self.manifest, self.proposal, output_dir=destination,
