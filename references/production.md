@@ -128,6 +128,7 @@ the default directory. Chapter source provenance is defined in
 
 - byte-identical `原文 PDF.pdf`;
 - `中文翻译.pdf`, `中文翻译正文.md`, `中文论文总结.md`, `zotero-item.json`;
+- `LaTeX源码包.zip`, the editable source of the exact accepted PDF;
 - `中文翻译.layout.json`, `translation-validation.json`;
 - `quick-validation.json` and `summary-validation.json`;
 - `visual-review.json` with final PDF hash and complete page coverage;
@@ -138,6 +139,40 @@ report. If a final bundle already exists, identify its owned files from its
 checkpoint or manifest before replacement; do not recursively delete a guessed
 directory. Keep unrelated files. A fresh translation uses separate staging until
 all gates pass.
+
+### Rebuildable LaTeX source
+
+After acceptance, export from the actual `native-latex` production inputs, without
+rerendering or replacing the accepted PDF:
+
+```powershell
+uv run --script <skill-dir>\scripts\export_latex_project.py `
+  --manifest <work-dir>\manifest.json `
+  --translations <work-dir>\translations.jsonl `
+  --translated <staging-dir>\中文翻译.pdf `
+  --layout <staging-dir>\中文翻译.layout.json `
+  --output <staging-dir>\LaTeX源码包.zip
+```
+
+The exporter packages editable `body.tex`, every referenced image/code asset,
+only the accepted original front/tail PDF pages, and standalone `build.py`.
+`body.tex` alone compiles the Chinese body; `build.py` runs LuaLaTeX twice and
+assembles the complete PDF with PyMuPDF. It copies the canonical translation
+snapshot for provenance; editing this independent TeX project never writes back
+to canonical `translations.jsonl`, which remains the translation authority.
+
+The exporter builds in a separate temporary directory and requires identical
+page count, extracted text and 96dpi rendered pixels to the accepted PDF.
+`source-manifest.json` records source/accepted-PDF/canonical-input hashes, each
+package member's hash, and per-page rebuild evidence. Packaging and ingestion
+reject source/output identity mismatches, unsafe relative paths, and changed
+members. The source ZIP is required for complete local bundles as well as Zotero.
+
+Include build instructions and font dependencies, normally SimSun, SimHei,
+Segoe UI Symbol and Latin Modern fonts. Do not distribute unlicensed system
+fonts, credentials, caches, or the whole source book. Fonts and the LuaLaTeX
+environment must be installed separately; changing them can change pagination.
+A lone `.tex` file without its dependencies is not a complete deliverable.
 
 Complete requested/project-required course or index links only after the final
 PDF passes validation. Check every matching entry, use paths to the actual final

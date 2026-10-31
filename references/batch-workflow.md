@@ -58,7 +58,7 @@ terminal local stage be `packaged`.
 
 Each paper must have a stable order, slug, title, source PDF, work directory,
 and DOI, arXiv ID, or title plus year. Use an `artifacts` object to override
-staging paths for `translated_pdf`, `translated_markdown`, `summary`,
+staging paths for `translated_pdf`, `translated_markdown`, `summary`, `latex_source_archive`,
 `metadata`, `layout_report`, `strict_validation`, `quick_validation`,
 `summary_validation`, `visual_review`, or `source_review_report`.
 
@@ -72,7 +72,7 @@ python <skill-dir>\scripts\batch_workflow.py audit-zotero `
   --ledger <project>\batch-run.json
 ```
 
-Items with exactly one complete parent and four required children become
+Items with exactly one complete parent and five required children become
 `skipped_existing`. Missing items remain queued. Multiple exact parents or an
 incomplete matched parent are blocking results.
 
@@ -105,6 +105,10 @@ python <skill-dir>\scripts\batch_workflow.py package `
 
 Packaging writes only the standard artifact names. It refuses to replace a
 different source PDF and verifies the copied bundle.
+The required `latex_source_archive` defaults to `<work-dir>/LaTeX源码包.zip`;
+override it when using a staging directory. Generate the rebuildable source ZIP
+using [production.md](production.md#rebuildable-latex-source). Package and final
+audit validate every ZIP member hash and match its source/accepted-PDF identity.
 
 After `zotero_ingest.py verify` succeeds, record the exact parent:
 
@@ -116,7 +120,8 @@ python <skill-dir>\scripts\batch_workflow.py record-zotero `
 ```
 
 This command repeats live local verification and records the key only when the
-parent has exactly the four required children.
+parent has exactly the five required children, including the stored source ZIP
+whose manifest matches the stored source and accepted translation PDFs.
 
 Finish with a full audit:
 

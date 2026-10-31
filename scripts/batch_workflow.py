@@ -18,6 +18,7 @@ from typing import Any
 import zotero_ingest
 from check_visual_review import check_review_bundle
 from paper_preflight import assert_source_ready
+from export_latex_project import validate_archive
 
 SCHEMA_VERSION = 1
 STAGES = (
@@ -36,6 +37,7 @@ FINAL_NAMES = {
     "translated_pdf": "中文翻译.pdf",
     "translated_markdown": "中文翻译正文.md",
     "summary": "中文论文总结.md",
+    "latex_source_archive": "LaTeX源码包.zip",
     "metadata": "zotero-item.json",
     "layout_report": "中文翻译.layout.json",
     "strict_validation": "translation-validation.json",
@@ -168,6 +170,7 @@ def _paper_paths(
         "translated_pdf": work_dir / "中文翻译.pdf",
         "translated_markdown": work_dir / "中文翻译正文.md",
         "summary": work_dir / "中文论文总结.md",
+        "latex_source_archive": work_dir / "LaTeX源码包.zip",
         "metadata": work_dir / "zotero-item.json",
         "layout_report": work_dir / "中文翻译.layout.json",
         "strict_validation": work_dir / "translated-preview" / "validation-report.json",
@@ -259,11 +262,21 @@ def _strict_validation_passes(paths: dict[str, Path]) -> bool:
         and int(strict_metrics.get("invariant_text_misses") or 0) == 0
         and quick_metrics.get("source_sha256") == sha256_file(paths["source_pdf"])
         and all(paths[key].is_file() for key in REQUIRED_ARTIFACTS)
+        and _latex_archive_matches(paths)
         and not check_review_bundle(
             _read_json(paths["visual_review"]), paths["source_pdf"],
             paths["translated_pdf"], strict, quick,
         )
     )
+
+
+def _latex_archive_matches(paths: dict[str, Path]) -> bool:
+    try:
+        validate_archive(paths["latex_source_archive"], source_pdf=paths["source_pdf"],
+                         translated_pdf=paths["translated_pdf"])
+    except ValueError:
+        return False
+    return True
 
 
 def _requires_source_review_report(work_dir: Path) -> bool:
@@ -282,6 +295,9 @@ def _final_bundle_complete(paths: dict[str, Path]) -> bool:
     if _requires_source_review_report(paths["work_dir"]):
         required.append(final_dir / FINAL_NAMES["source_review_report"])
     if not all(path.is_file() for path in required):
+        return False
+    if not _latex_archive_matches({key: final_dir / FINAL_NAMES[key]
+                                  for key in ("latex_source_archive", "source_pdf", "translated_pdf")}):
         return False
     if sha256_file(final_dir / FINAL_NAMES["source_pdf"]) != sha256_file(
         paths["source_pdf"]
@@ -416,7 +432,7 @@ def audit_paper_zotero(
         return {"ok": True, "translated": False, "matches": []}
     parent_key = str(matches[0]["key"])
     verification = zotero_ingest.verify_generated_children(
-        zotero_ingest.fetch_local_children(parent_key)
+        zotero_ingest.fetch_local_children(parent_key), verify_archive_identity=True
     )
     return {
         "ok": verification["ok"],
@@ -656,7 +672,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     record = commands.add_parser(
         "record-zotero",
-        help="Record a parent key only after live four-child verification.",
+        help="Record a parent key only after live five-attachment verification.",
     )
     record.add_argument("--ledger", required=True, type=Path)
     record.add_argument("--slug", required=True)

@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest import mock
 
 import batch_workflow
+from test_export_latex_project import make_archive
 from test_paper_preflight import add_readiness_inputs, write_ready_report
 
 
@@ -84,6 +85,7 @@ class BatchWorkflowTests(unittest.TestCase):
             encoding="utf-8",
         )
         (work / "中文翻译.pdf").write_bytes(b"%PDF translated")
+        make_archive(work / "LaTeX源码包.zip", source, work / "中文翻译.pdf")
         (work / "中文翻译正文.md").write_text("# 译文\n", encoding="utf-8")
         (work / "中文论文总结.md").write_text("# 总结\n", encoding="utf-8")
         write_json(
@@ -219,6 +221,27 @@ class BatchWorkflowTests(unittest.TestCase):
             batch_workflow.refresh_ledger(ledger, path)
         self.assertEqual(ledger["papers"][0]["stage"], "translated")
 
+    def test_source_archive_must_match_packaged_source_and_accepted_pdf(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            ledger_path = self.make_batch(root)
+            self.make_validated_artifacts(root)
+            args = argparse.Namespace(ledger=ledger_path, slug="01-paper")
+            archive = root / "work/LaTeX源码包.zip"
+            valid = archive.read_bytes()
+            archive.unlink()
+            with self.assertRaises(batch_workflow.BatchWorkflowError):
+                batch_workflow.cmd_package(args)
+            archive.write_bytes(valid)
+            with mock.patch("builtins.print"):
+                batch_workflow.cmd_package(args)
+            ledger, path = batch_workflow.load_ledger(ledger_path)
+            paths = batch_workflow._paper_paths(ledger, path, ledger["papers"][0])
+            wrong = root / "wrong.pdf"
+            wrong.write_bytes(b"different accepted PDF")
+            make_archive(paths["final_dir"] / "LaTeX源码包.zip", root / "source.pdf", wrong)
+            self.assertFalse(batch_workflow._final_bundle_complete(paths))
+
     def test_source_hash_change_invalidates_only_that_paper(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -268,7 +291,7 @@ class BatchWorkflowTests(unittest.TestCase):
         self.assertEqual(ledger["papers"][0]["stage"], "skipped_existing")
         self.assertEqual(ledger["papers"][0]["zotero_parent_key"], "PARENT1")
 
-    def test_record_zotero_requires_live_four_child_verification(self) -> None:
+    def test_record_zotero_requires_live_five_child_verification(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             ledger_path = self.make_batch(root)
@@ -281,7 +304,7 @@ class BatchWorkflowTests(unittest.TestCase):
                 "ok": True,
                 "translated": True,
                 "parent_key": "PARENT1",
-                "verification": {"ok": True, "children": [{}, {}, {}, {}]},
+                "verification": {"ok": True, "children": [{}, {}, {}, {}, {}]},
             }
             with (
                 mock.patch.object(

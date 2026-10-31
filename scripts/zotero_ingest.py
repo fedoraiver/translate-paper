@@ -2,7 +2,7 @@
 """Safely replace and ingest translated papers in Zotero.
 
 Reads/deletes use the Zotero Web API and a key stored by
-``zotero_credentials.py``. Creation, stored PDF/Markdown attachment uploads,
+``zotero_credentials.py``. Creation, stored PDF/Markdown/LaTeX ZIP uploads,
 and collection placement use Zotero Desktop's Connector server.
 The script never edits zotero.sqlite or Zotero's storage directory.
 """
@@ -12,20 +12,23 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 import http.client
+import hashlib
 import json
 import os
 from pathlib import Path
 import re
 import sys
+import tempfile
 import time
 import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
-from typing import Any
+from typing import Any, Callable
 
 from zotero_credentials import DEFAULT_TARGET, read_credential, verify_credential
+from export_latex_project import validate_archive
 
 
 for _stream in (sys.stdout, sys.stderr):
@@ -42,6 +45,14 @@ SUMMARY_ATTACHMENT_TITLE = "中文论文总结"
 SOURCE_ATTACHMENT_TITLE = "原文 PDF"
 TRANSLATION_ATTACHMENT_TITLE = "中文翻译 PDF"
 TRANSLATION_MARKDOWN_TITLE = "中文翻译 Markdown"
+LATEX_SOURCE_TITLE = "LaTeX 源码包"
+FINAL_FILENAMES = {
+    SOURCE_ATTACHMENT_TITLE: "原文 PDF.pdf",
+    TRANSLATION_ATTACHMENT_TITLE: "中文翻译.pdf",
+    TRANSLATION_MARKDOWN_TITLE: "中文翻译正文.md",
+    SUMMARY_ATTACHMENT_TITLE: "中文论文总结.md",
+    LATEX_SOURCE_TITLE: "LaTeX源码包.zip",
+}
 
 
 class ZoteroError(RuntimeError):
@@ -65,6 +76,31 @@ class HttpResponse:
 
 def dump_json(value: Any, *, stream: Any = sys.stdout) -> None:
     print(json.dumps(value, ensure_ascii=False, indent=2), file=stream)
+
+
+def _write_upload_receipt(path: Path | None, receipt: dict[str, Any], *, create: bool = False) -> None:
+    if path is None:
+        return
+    temporary = None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        text = json.dumps(receipt, ensure_ascii=False, indent=2) + "\n"
+        if create:
+            with path.open("x", encoding="utf-8") as stream:
+                stream.write(text)
+            return
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
+                                         delete=False) as stream:
+            temporary = Path(stream.name)
+            stream.write(text)
+        temporary.replace(path)
+    except FileExistsError:
+        raise ZoteroError("Upload receipt already exists; inspect it and live items before retrying.") from None
+    except OSError as error:
+        raise ZoteroError(f"Cannot save upload receipt: {error}") from error
+    finally:
+        if temporary is not None and temporary.exists():
+            temporary.unlink()
 
 
 def request(
@@ -605,26 +641,50 @@ def validate_pdf(path: Path, label: str) -> None:
         raise ZoteroError(f"{label} is not a valid PDF: {path}")
 
 
+def _fetch_children_pages(
+    fetch_page: Callable[[int], HttpResponse], label: str
+) -> list[dict[str, Any]]:
+    children: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    offset = 0
+    while True:
+        page = fetch_page(offset).json()
+        if not isinstance(page, list) or len(page) > 100:
+            raise ZoteroError(f"{label} returned invalid child items.")
+        keys = []
+        for child in page:
+            if not isinstance(child, dict):
+                raise ZoteroError(f"{label} returned an invalid child item.")
+            key = child.get("key") or item_data(child).get("key")
+            if not isinstance(key, str) or not key:
+                raise ZoteroError(f"{label} returned a child without a key.")
+            keys.append(key)
+        if len(set(keys)) != len(keys) or seen.intersection(keys):
+            raise ZoteroError(f"{label} returned duplicate child keys or a repeated page.")
+        children.extend(page)
+        seen.update(keys)
+        if len(page) < 100:
+            return children
+        offset += len(page)
+
+
 def fetch_web_children(
     parent_key: str, *, user_id: str, api_key: str
 ) -> list[dict[str, Any]]:
-    payload = web_request(
-        f"/users/{user_id}/items/{urllib.parse.quote(parent_key)}/children?limit=100",
-        user_id=user_id,
-        api_key=api_key,
-    ).json()
-    if not isinstance(payload, list):
-        raise ZoteroError("Web API returned invalid child items.")
-    return payload
+    return _fetch_children_pages(
+        lambda start: web_request(
+            f"/users/{user_id}/items/{urllib.parse.quote(parent_key)}/children?limit=100&start={start}",
+            user_id=user_id, api_key=api_key,
+        ), "Web API",
+    )
 
 
 def fetch_local_children(parent_key: str) -> list[dict[str, Any]]:
-    payload = local_request(
-        f"/api/users/0/items/{urllib.parse.quote(parent_key)}/children?limit=100"
-    ).json()
-    if not isinstance(payload, list):
-        raise ZoteroError("Local API returned invalid child items.")
-    return payload
+    return _fetch_children_pages(
+        lambda start: local_request(
+            f"/api/users/0/items/{urllib.parse.quote(parent_key)}/children?limit=100&start={start}"
+        ), "Local API",
+    )
 
 
 def wait_for_local_absence(parent_key: str, timeout: int) -> bool:
@@ -664,7 +724,32 @@ def latest_library_version(*, user_id: str, api_key: str) -> str:
     return version
 
 
-def verify_generated_children(children: list[dict[str, Any]]) -> dict[str, Any]:
+def stored_child_path(child: dict[str, Any]) -> Path:
+    key = str(child.get("key") or item_data(child).get("key") or "")
+    if not re.fullmatch(r"[A-Z0-9]{8}", key):
+        raise ValueError("Invalid stored attachment key")
+    response = local_request(f"/api/users/0/items/{key}/file/view/url")
+    url = urllib.parse.urlsplit(response.text.strip())
+    if url.scheme != "file" or url.netloc not in {"", "localhost"}:
+        raise ValueError("Expected local stored-attachment file URL")
+    return Path(urllib.request.url2pathname(url.path))
+
+
+def file_identity(path: Path) -> dict[str, Any]:
+    sha256, md5, size = hashlib.sha256(), hashlib.md5(), 0
+    with path.open("rb") as stream:
+        while chunk := stream.read(1024 * 1024):
+            sha256.update(chunk)
+            md5.update(chunk)
+            size += len(chunk)
+    return {"sha256": sha256.hexdigest(), "md5": md5.hexdigest(), "size": size}
+
+
+def verify_generated_children(
+    children: list[dict[str, Any]], *, verify_archive_identity: bool = False,
+    expected_hashes: dict[str, dict[str, Any]] | None = None,
+    expected_parent_key: str | None = None,
+) -> dict[str, Any]:
     summarized = [summarize_child(child) for child in children]
     source = [
         child
@@ -690,9 +775,20 @@ def verify_generated_children(children: list[dict[str, Any]]) -> dict[str, Any]:
         if item_data(child).get("itemType") == "attachment"
         and item_data(child).get("title") == SUMMARY_ATTACHMENT_TITLE
     ]
+    archives = [child for child in children
+                if item_data(child).get("itemType") == "attachment"
+                and item_data(child).get("title") == LATEX_SOURCE_TITLE]
     errors: list[str] = []
-    if len(children) != 4:
-        errors.append(f"expected exactly four child items, found {len(children)}")
+    if expected_hashes is not None and set(expected_hashes) != set(FINAL_FILENAMES):
+        errors.append("expected hashes must describe exactly the five required files")
+    if expected_parent_key is not None:
+        for child in children:
+            if item_data(child).get("parentItem") != expected_parent_key:
+                errors.append("child belongs to a different parent")
+    if len(children) != 5:
+        errors.append(f"expected exactly five child items, found {len(children)}")
+    if len(archives) != 1:
+        errors.append(f"expected one {LATEX_SOURCE_TITLE}, found {len(archives)}")
     if len(source) != 1:
         errors.append(f"expected one {SOURCE_ATTACHMENT_TITLE}, found {len(source)}")
     if len(translation) != 1:
@@ -710,13 +806,13 @@ def verify_generated_children(children: list[dict[str, Any]]) -> dict[str, Any]:
         )
     for attachment in source + translation:
         data = item_data(attachment)
-        if not str(data.get("linkMode") or "").startswith("imported_"):
+        if data.get("linkMode") not in {"imported_file", "imported_url"}:
             errors.append(f"attachment {data.get('title')} is not stored")
         if data.get("contentType") != "application/pdf":
             errors.append(f"attachment {data.get('title')} is not a PDF")
     for attachment in markdown + summaries:
         data = item_data(attachment)
-        if not str(data.get("linkMode") or "").startswith("imported_"):
+        if data.get("linkMode") not in {"imported_file", "imported_url"}:
             errors.append(f"attachment {data.get('title')} is not stored")
         if data.get("contentType") not in {"text/markdown", "text/plain"}:
             errors.append(
@@ -725,7 +821,38 @@ def verify_generated_children(children: list[dict[str, Any]]) -> dict[str, Any]:
     for attachment in summaries:
         if Path(str(item_data(attachment).get("filename") or "")).suffix.lower() != ".md":
             errors.append("summary attachment filename must end in .md")
-    return {"ok": not errors, "errors": errors, "children": summarized}
+    for attachment in archives:
+        data = item_data(attachment)
+        if data.get("linkMode") not in {"imported_file", "imported_url"}:
+            errors.append("LaTeX source archive is not stored")
+        if data.get("contentType") != "application/zip" or Path(str(data.get("filename") or "")).suffix.lower() != ".zip":
+            errors.append("LaTeX source archive must have .zip filename and application/zip MIME")
+    stored_paths: dict[str, Path] = {}
+    verified_files = []
+    if (verify_archive_identity or expected_hashes is not None) and not errors:
+        for child in children:
+            data = item_data(child)
+            title = data["title"]
+            try:
+                path = stored_child_path(child)
+                actual = file_identity(path)
+                stored_paths[title] = path
+                if expected_hashes is not None and actual != expected_hashes[title]:
+                    errors.append(f"stored file bytes differ from accepted input: {title}")
+                else:
+                    verified_files.append({"key": child.get("key") or data.get("key"),
+                                           "title": title, **actual})
+            except (ValueError, OSError, ZoteroError) as error:
+                errors.append(f"Stored file verification failed for {title}: {error}")
+    if verify_archive_identity and not errors:
+        try:
+            validate_archive(stored_paths[LATEX_SOURCE_TITLE],
+                             source_pdf=stored_paths[SOURCE_ATTACHMENT_TITLE],
+                             translated_pdf=stored_paths[TRANSLATION_ATTACHMENT_TITLE])
+        except (ValueError, OSError, ZoteroError) as error:
+            errors.append(f"LaTeX source archive verification failed: {error}")
+    return {"ok": not errors, "errors": errors, "children": summarized,
+            "verified_files": verified_files}
 
 
 def cmd_status(args: argparse.Namespace) -> int:
@@ -886,8 +1013,13 @@ def cmd_ingest(args: argparse.Namespace) -> int:
         Path(args.translated_markdown).expanduser().resolve()
     )
     summary_path = Path(args.summary).expanduser().resolve()
+    latex_archive = Path(args.latex_source_archive).expanduser().resolve()
     validate_pdf(source_pdf, "Source PDF")
     validate_pdf(translated_pdf, "Translated PDF")
+    try:
+        validate_archive(latex_archive, source_pdf=source_pdf, translated_pdf=translated_pdf)
+    except ValueError as error:
+        raise ZoteroError(str(error)) from error
     if not translated_markdown.is_file():
         raise ZoteroError(
             f"Translated Markdown does not exist: {translated_markdown}"
@@ -903,6 +1035,14 @@ def cmd_ingest(args: argparse.Namespace) -> int:
     if not normalize_space(summary):
         raise ZoteroError("Summary is empty.")
 
+    accepted_paths = {
+        SOURCE_ATTACHMENT_TITLE: source_pdf,
+        TRANSLATION_ATTACHMENT_TITLE: translated_pdf,
+        TRANSLATION_MARKDOWN_TITLE: translated_markdown,
+        SUMMARY_ATTACHMENT_TITLE: summary_path,
+        LATEX_SOURCE_TITLE: latex_archive,
+    }
+    expected_hashes = {title: file_identity(path) for title, path in accepted_paths.items()}
     target = resolve_target(args.target_id, args.target_name)
     user_id, api_key = read_api_credentials(args.credential_target)
     local = local_matches(metadata)
@@ -923,6 +1063,8 @@ def cmd_ingest(args: argparse.Namespace) -> int:
                 "translated_pdf": str(translated_pdf),
                 "translated_markdown": str(translated_markdown),
                 "summary": str(summary_path),
+                "latex_source_archive": str(latex_archive),
+                "expected_hashes": expected_hashes,
             }
         )
         return 0
@@ -930,6 +1072,13 @@ def cmd_ingest(args: argparse.Namespace) -> int:
     session_id = f"codex-{uuid.uuid4().hex}"
     connector_id = f"paper-{uuid.uuid4().hex}"
     base_url = source_url(metadata)
+    receipt_path = Path(args.receipt).expanduser().resolve() if args.receipt else None
+    receipt = {"schema_version": 1, "route": "connector-new-parent", "status": "creating-parent",
+               "session_id": session_id, "connector_item_id": connector_id,
+               "identity": identity(metadata), "target": target, "expected_hashes": expected_hashes,
+               "files": [{"title": title, "path": str(path), "status": "pending"}
+                         for title, path in accepted_paths.items()]}
+    _write_upload_receipt(receipt_path, receipt, create=True)
     try:
         connector_request(
             "/connector/saveItems",
@@ -949,38 +1098,26 @@ def cmd_ingest(args: argparse.Namespace) -> int:
             },
         )
 
-        for path, title, url in (
-            (source_pdf, SOURCE_ATTACHMENT_TITLE, base_url),
-            (
-                translated_pdf,
-                TRANSLATION_ATTACHMENT_TITLE,
-                base_url + "#codex-chinese-translation",
-            ),
-        ):
-            connector_upload_pdf(
-                path,
-                session_id=session_id,
-                parent_item_id=connector_id,
-                title=title,
-                url=url,
-            )
-        connector_upload_file(
-            translated_markdown,
-            session_id=session_id,
-            parent_item_id=connector_id,
-            title=TRANSLATION_MARKDOWN_TITLE,
-            url=markdown_attachment_url(base_url, translated_markdown.name),
-            content_type="text/markdown",
-        )
-
-        connector_upload_file(
-            summary_path,
-            session_id=session_id,
-            parent_item_id=connector_id,
-            title=SUMMARY_ATTACHMENT_TITLE,
-            url=markdown_attachment_url(base_url, summary_path.name),
-            content_type="text/markdown",
-        )
+        matches = wait_for_unique_local_match(metadata)
+        if len(matches) != 1:
+            raise ZoteroError(f"Cannot resolve the created parent ({len(matches)} matches).")
+        receipt["parent_key"] = str(matches[0]["key"])
+        _write_upload_receipt(receipt_path, receipt)
+        for record in receipt["files"]:
+            path, title = Path(record["path"]), record["title"]
+            if title == SOURCE_ATTACHMENT_TITLE:
+                url, mime = base_url, "application/pdf"
+            elif title == TRANSLATION_ATTACHMENT_TITLE:
+                url, mime = base_url + "#codex-chinese-translation", "application/pdf"
+            else:
+                url = markdown_attachment_url(base_url, path.name)
+                mime = "application/zip" if title == LATEX_SOURCE_TITLE else "text/markdown"
+            receipt["status"], record["status"] = "uploading-files", "uploading"
+            _write_upload_receipt(receipt_path, receipt)
+            connector_upload_file(path, session_id=session_id, parent_item_id=connector_id,
+                                  title=title, url=url, content_type=mime)
+            record["status"] = "uploaded"
+            _write_upload_receipt(receipt_path, receipt)
 
         matches = wait_for_unique_local_match(metadata)
         if len(matches) != 1:
@@ -988,8 +1125,16 @@ def cmd_ingest(args: argparse.Namespace) -> int:
                 f"Ingestion created an ambiguous local result ({len(matches)} matches)."
             )
         parent_key = str(matches[0]["key"])
+        if parent_key != receipt["parent_key"]:
+            raise ZoteroError("The created parent identity changed during upload.")
+        receipt["parent_key"] = parent_key
+        receipt["status"] = "verifying-files"
+        _write_upload_receipt(receipt_path, receipt)
         children = fetch_local_children(parent_key)
-        verification = verify_generated_children(children)
+        verification = verify_generated_children(
+            children, verify_archive_identity=True, expected_hashes=expected_hashes,
+            expected_parent_key=parent_key,
+        )
         current_target = selected_target()
         target_exists = any(
             entry.get("id") == args.target_id
@@ -1013,15 +1158,26 @@ def cmd_ingest(args: argparse.Namespace) -> int:
                 "Ingestion completed but verification failed: "
                 + "; ".join(verification.get("errors") or ["target mismatch"])
             )
-    except ZoteroError as exc:
+        keys = {file["title"]: file["key"] for file in verification["verified_files"]}
+        for record in receipt["files"]:
+            record.update(key=keys[record["title"]], status="verified")
+        receipt["status"] = "files-verified"
+        receipt["verification"] = verification
+        _write_upload_receipt(receipt_path, receipt)
+    except (ZoteroError, OSError, ValueError) as exc:
+        receipt["status"] = "interrupted"
+        receipt["error"] = "Inspect live records and stored bytes before resuming; do not repeat new-parent import."
+        _write_upload_receipt(receipt_path, receipt)
         raise ZoteroError(
-            f"{exc} Connector session: {session_id}. Search the parent and "
+            f"{exc} Connector session: {session_id}; client item alias: {connector_id}. Search the parent and "
             "inspect its children before retrying."
         ) from exc
     dump_json(
         {
             "executed": True,
             "session_id": session_id,
+            "connector_item_id": connector_id,
+            "receipt": str(receipt_path) if receipt_path is not None else None,
             "parent": public_matches(matches)[0],
             "verification": verification,
         }
@@ -1031,6 +1187,14 @@ def cmd_ingest(args: argparse.Namespace) -> int:
 
 def cmd_verify(args: argparse.Namespace) -> int:
     metadata = load_metadata(args.metadata)
+    expected_hashes = None
+    if args.expected_dir:
+        directory = Path(args.expected_dir).expanduser().resolve()
+        try:
+            expected_hashes = {title: file_identity(directory / name)
+                               for title, name in FINAL_FILENAMES.items()}
+        except OSError as error:
+            raise ZoteroError(f"Cannot read accepted bundle: {error}") from error
     matches = local_matches(metadata)
     if len(matches) != 1:
         dump_json(
@@ -1042,7 +1206,10 @@ def cmd_verify(args: argparse.Namespace) -> int:
         )
         return 1
     parent_key = str(matches[0]["key"])
-    verification = verify_generated_children(fetch_local_children(parent_key))
+    verification = verify_generated_children(
+        fetch_local_children(parent_key), verify_archive_identity=True,
+        expected_hashes=expected_hashes, expected_parent_key=parent_key,
+    )
     verification["parent"] = public_matches(matches)[0]
     dump_json(verification)
     return 0 if verification["ok"] else 1
@@ -1084,7 +1251,7 @@ def build_parser() -> argparse.ArgumentParser:
         "ingest",
         help=(
             "Preview or create a parent, two stored PDFs, one stored "
-            "translation Markdown attachment, and one stored summary Markdown attachment"
+            "translation Markdown attachment, one stored summary Markdown attachment, and a LaTeX source ZIP"
         ),
     )
     ingest.add_argument("--metadata", required=True)
@@ -1092,15 +1259,18 @@ def build_parser() -> argparse.ArgumentParser:
     ingest.add_argument("--translated-pdf", required=True)
     ingest.add_argument("--translated-markdown", required=True)
     ingest.add_argument("--summary", required=True)
+    ingest.add_argument("--latex-source-archive", required=True)
     ingest.add_argument("--target-id", required=True)
     ingest.add_argument("--target-name")
     ingest.add_argument("--yes-ingest", action="store_true")
+    ingest.add_argument("--receipt", help="Persist session, client alias and per-file state for recovery; refuses an existing file.")
     ingest.set_defaults(func=cmd_ingest)
 
     verify = commands.add_parser(
         "verify", help="Verify the final local Zotero structure"
     )
     verify.add_argument("--metadata", required=True)
+    verify.add_argument("--expected-dir", help="Compare all five stored files to this accepted standard bundle.")
     verify.set_defaults(func=cmd_verify)
     return parser
 
